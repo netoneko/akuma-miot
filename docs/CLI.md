@@ -21,11 +21,20 @@ What exists:
   the resolution logic didn't need to. **Multi-tag and explicit broadcast
   added 2026-09-22** — see the resolution to §8's open question, below.
 - **§2/§0-adjacent, interactive:** `--rpc <url> --chat` reuses the in-process
-  `--chat` REPL (`chat.rs`) verbatim — same prompt, same `/quit`, same
+  `--chat` REPL (`chat.rs`) verbatim — same prompt, same `/quit`/`/exit`, same
   `@name` handling — but every line is a real signed extrinsic and replies
   come from whatever cats are actually running against that node. Not a
-  composer (§1): still a plain blocking `stdin().lines()` prompt, same as the
-  in-process version always was.
+  composer (§1), but **no longer blocking either, as of 2026-09-22**: reading
+  the next line uses async stdin (`tokio::io::stdin`) and replies print from
+  a background poller, so the prompt is free to accept input the instant a
+  line is submitted rather than sitting inside a fixed wait-and-give-up call.
+  A live run against real cats (30-150+ s per turn, `BLOCK_MS=6000` in
+  `miot-node`) is what surfaced this: the old blocking wait made a working
+  reply indistinguishable from a hung client.
+- **§5, `/tasks`:** built 2026-09-22 — `GET /tasks` on `miot-node` returns
+  `Litter::table().tasks()` verbatim (id, status, assignee, holder,
+  lease_until, opened_by/at, text); `--rpc --chat`'s `/tasks` prints one line
+  per row. Not yet exposed as a non-interactive `miot tasks` subcommand.
 - **§3, observation, informally:** the scripted demo's `block/who/what`
   printer already reads as this doc's `[obs]` view; `--rpc --chat`'s reply
   printer is the same shape. No `/obs` toggle exists — everything currently
@@ -43,11 +52,11 @@ What exists:
   human phrasing (`"chain → mimi: [plan-needed: t1]"`, `"claimed t1.1"`).
   Worth reusing that renderer here instead of a second, uglier one.
 
-Not built: `/peers`, `/tasks`, `/plan`, `/artifact` as flags or commands,
-`/obs`, `/history [n]` as an on-demand command (only the automatic start-up
-replay exists), and everything about §0/§1/§6's actual terminal UI (composer,
+Not built: `/peers`, `/plan`, `/artifact` as flags or commands, `/obs`,
+`/history [n]` as an on-demand command (only the automatic start-up replay
+exists), and everything about §0/§1/§6's actual terminal UI (composer,
 avatars, colour-per-sender persistence across a session). This remains the
-contract for all of that.
+contract for all of that. (`/tasks` moved to "what exists," above.)
 
 ## `--clear` / `/clear` — not in the original design, added 2026-09-22
 

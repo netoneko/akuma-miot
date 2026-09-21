@@ -25,6 +25,7 @@
 //! | `GET /events?since=N` | everything the chain emitted after cursor `N` |
 //! | `GET /head` | height, leader, and whether the parent is closed |
 //! | `GET /artifact/:id` | a closed parent's report, out of chain state |
+//! | `GET /tasks` | one row per live task: id, status, assignee, holder, lease |
 //!
 //! # What changed
 //!
@@ -332,6 +333,7 @@ async fn main() {
         .route("/meta", get(meta))
         .route("/account/{id}", get(account))
         .route("/artifact/{id}", get(artifact))
+        .route("/tasks", get(tasks))
         .with_state(node);
 
     let addr = format!("0.0.0.0:{port}");
@@ -358,6 +360,33 @@ async fn head(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
 async fn events(AxState(n): AxState<Shared>, Query(q): Query<Since>) -> Json<Vec<Entry>> {
     let n = n.lock().await;
     Json(n.log.iter().filter(|e| e.seq > q.since).cloned().collect())
+}
+
+/// One row per live task — `docs/CLI.md` §5's `/tasks`: "id, status,
+/// assignee, lease." Reads `Litter::table()` fresh off storage rather than
+/// reconstructing state from the event log, since the pallet already is the
+/// authoritative view and a client has no business re-deriving it.
+async fn tasks(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
+    let mut n = n.lock().await;
+    let rows = n.ext.execute_with(|| {
+        Litter::table()
+            .tasks()
+            .iter()
+            .map(|t| {
+                serde_json::json!({
+                    "id": t.id.to_string(),
+                    "status": format!("{:?}", t.status),
+                    "assignee": t.assignee.as_ref().map(miot_keys::to_hex),
+                    "holder": t.holder.as_ref().map(miot_keys::to_hex),
+                    "lease_until": t.lease_until,
+                    "opened_by": miot_keys::to_hex(&t.opened_by),
+                    "opened_at": t.opened_at,
+                    "text": t.text,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    Json(rows)
 }
 
 /// What a signer needs to build a valid `SignedExtra` without trusting

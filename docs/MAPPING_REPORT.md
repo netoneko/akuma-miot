@@ -852,6 +852,26 @@ have required.
 6. **What replaces WAYWARD?** "I can't reach a node / I'm not synced" is the
    same condition. Keep the answer verbatim: **fail fast with a clear message,
    never hang the turn.**
+6a. **Wayward should also cover the LLM link, not just the chain — noted
+    2026-09-22, not built.** Today `miot-cat` prints `[name] llm error: ...`
+    when a turn's model call fails (`crates/miot-cat/src/main.rs`, the `Err(e)`
+    arm of the `cat.llm.turn(...)` match) and just moves on to the next poll —
+    nothing tells the rest of the litter anything changed, so a human watching
+    only the chain log sees silence, not a diagnosis, and an assignment sits
+    un-worked with no visible reason. Proposed: a cat whose LLM call fails
+    marks itself **Wayward** — distinct from a normal turn failure, since the
+    assignment/directive itself is still valid, the cat just can't currently
+    reach the model that would work it — and reverts to **Active**
+    automatically the moment a call to that same LLM succeeds again, no
+    operator action needed (mirrors #6's "fail fast," but paired with a
+    healable, observable recovery rather than just an error line). Open
+    before building it: (a) where the status lives — a real extrinsic
+    (`Act::Wayward`/`Act::Rejoin`?) so the rest of the litter and the operator
+    can see it on chain, or a purely local flag if #6's answer keeps
+    connectivity state off-chain entirely; (b) whether a wayward worker's
+    in-flight claim/lease keeps ticking or pauses — `miot-tasks`' existing
+    `claim_window` machinery is the likely thing to re-arm on rejoin rather
+    than a new mechanism.
 7. **Does `miot-llm` wrap `genai` or define its own trait?** genai normalizes
    14 providers including Ollama, with tool calls, streaming and reasoning
    controls — which is most of `miot-llm`'s job. A thin local trait over it

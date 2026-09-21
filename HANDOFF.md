@@ -251,6 +251,11 @@ rather than asserted.
 - `docs/RESULTS.md` — **what actually ran, with numbers.** Evidence, not
   intentions. Read this before trusting any claim elsewhere.
 - `docs/CLI.md` — `miot-cli` requirements. Scrollback is sacred.
+- `docs/runbooks/run-local-swarm.md` — the everyday loop: bring the local
+  litter up, talk to it, rebuild/redeploy after a code change (the compose
+  file does not build the image), restart `kuro` on Lima after a node
+  restart, and where to look before assuming "a cat isn't responding" is an
+  application bug.
 - `docs/references/storage.md` — the two stores, with measured binary costs
 - `docs/references/README.md` — **three event loops, four orders of magnitude
   apart, and none may await another.** Both of meow's deadlocks were that

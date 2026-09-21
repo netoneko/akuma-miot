@@ -55,7 +55,7 @@ fn parse_targets(line: &str) -> (Vec<AccountId>, Vec<String>) {
 
 pub async fn run(host: &str, model: &str, models: &str) {
     let bench = Bench::new(host, model, models);
-    println!("  {DIM}chat — type to the litter, /clear to fail every open task, blank line or /quit to leave{OFF}");
+    println!("  {DIM}chat — type to the litter, /clear to fail every open task, blank line, /quit, or /exit to leave{OFF}");
     for who in CATS {
         println!(
             "    {}{:>5}{OFF} {DIM}{}{OFF}",
@@ -75,7 +75,7 @@ pub async fn run(host: &str, model: &str, models: &str) {
         out(&format!("\n{}root{OFF} ▸ ", colour(ROOT)));
         let Some(Ok(line)) = lines.next() else { break };
         let line = line.trim().to_string();
-        if line.is_empty() || line == "/quit" {
+        if line.is_empty() || line == "/quit" || line == "/exit" {
             break;
         }
         if line == "/clear" {

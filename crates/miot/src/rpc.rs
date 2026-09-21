@@ -24,7 +24,8 @@ use miot_keys::Identity;
 use miot_runtime::{client, AccountId, RuntimeCall};
 use polkadot_sdk::*;
 use sp_core::H256;
-use std::io::{BufRead, Write};
+use std::io::Write;
+use tokio::io::AsyncBufReadExt;
 
 use crate::{DIM, OFF};
 
@@ -200,7 +201,18 @@ async fn submit(http: &reqwest::Client, node: &str, identity: &Identity, call: R
         println!("  submitted, signed as {}", miot_keys::short(&identity.account()));
     } else {
         let e: serde_json::Value = r.json().await.unwrap_or_default();
-        println!("  refused: {}", e.get("error").unwrap_or(&e));
+        let msg = e.get("error").unwrap_or(&e).to_string();
+        if msg.contains("Payment") {
+            println!(
+                "  refused: {msg} — {} isn't a member of this chain yet (no `providers`, \
+                 see HANDOFF.md's \"catnip\" note). Pass --identity-seed matching one of \
+                 MIOT_MEMBERS (e.g. --identity-seed 1), or add this account's pubkey to \
+                 MIOT_MEMBERS/MIOT_ROOT_PUBKEY on the node.",
+                miot_keys::short(&identity.account()),
+            );
+        } else {
+            println!("  refused: {msg}");
+        }
     }
 }
 
@@ -235,50 +247,71 @@ fn prompt(label: &str) {
     let _ = std::io::stdout().flush();
 }
 
-/// Print each `said` addressed back to us or to the litter, from `since`,
-/// stopping once things go quiet rather than on a fixed clock — a real
-/// cat's turn is 30-150 s and there may be more than one of them replying.
-/// Hard-capped at `max_seconds` so a litter that never answers doesn't trap
-/// the prompt forever.
-async fn wait_for_replies(
-    http: &reqwest::Client,
-    node: &str,
-    since: u64,
-    roster: &[(String, AccountId)],
-    me: &AccountId,
-    max_seconds: u64,
-) -> u64 {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(max_seconds);
+/// Poll `/events` forever from `since`, printing every `said` not from `me`
+/// the moment it lands. Runs for the life of the chat session as a
+/// background task rather than something the composer waits on — a real
+/// cat's turn is 30-150 s (BLOCK_MS=6000 in `miot-node` alone makes a dozen
+/// blocks a minute), and blocking the prompt for that was the bug: nothing
+/// printed and nothing could be typed until a reply arrived or a fixed
+/// timeout gave up. Printing here just interleaves with whatever the
+/// operator is mid-typing, same as any other chat client without a
+/// composer (see docs/CLI.md §0/§1 — no repainting, so this is the honest
+/// version of that until a real composer exists).
+async fn print_replies(http: reqwest::Client, node: String, roster: Vec<(String, AccountId)>, me: AccountId, since: u64) {
     let mut cursor = since;
-    let mut last_seen = tokio::time::Instant::now();
-    let mut got_one = false;
     loop {
-        let now = tokio::time::Instant::now();
-        if now >= deadline || (got_one && now.duration_since(last_seen) > std::time::Duration::from_secs(3)) {
-            break;
-        }
         let batch: Vec<serde_json::Value> = match http.get(format!("{node}/events?since={cursor}")).send().await {
             Ok(r) => r.json().await.unwrap_or_default(),
             Err(_) => Vec::new(),
         };
         for e in &batch {
             cursor = cursor.max(e["seq"].as_u64().unwrap_or(cursor));
-            last_seen = tokio::time::Instant::now();
             let eff = &e["effect"];
             if eff["t"] != "said" {
                 continue;
             }
             let Some(from) = eff["from"].as_str().and_then(|s| miot_keys::from_hex(s).ok()) else { continue };
-            if from == *me {
+            if from == me {
                 continue; // our own line, echoed back through the log
             }
-            got_one = true;
             let body = eff["body"].as_str().unwrap_or("");
-            println!("{DIM}  {}{OFF}  {body}", name_of(roster, &from));
+            println!("{DIM}  {}{OFF}  {body}", name_of(&roster, &from));
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    cursor
+}
+
+/// `/tasks` — one line per live task, `docs/CLI.md` §5. `miot-node`'s
+/// `/tasks` already hands back the pallet's own view, so this is print-only.
+async fn print_tasks(http: &reqwest::Client, node: &str, roster: &[(String, AccountId)]) {
+    let rows: Vec<serde_json::Value> = match http.get(format!("{node}/tasks")).send().await {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(e) => {
+            println!("  node unreachable: {e}");
+            return;
+        }
+    };
+    if rows.is_empty() {
+        println!("{DIM}  no tasks{OFF}");
+        return;
+    }
+    for t in &rows {
+        let id = t["id"].as_str().unwrap_or("?");
+        let status = t["status"].as_str().unwrap_or("?");
+        let who = t["holder"]
+            .as_str()
+            .or_else(|| t["assignee"].as_str())
+            .and_then(|s| miot_keys::from_hex(s).ok())
+            .map(|a| name_of(roster, &a));
+        let lease = t["lease_until"].as_u64().map(|b| format!(" lease→{b}")).unwrap_or_default();
+        println!(
+            "  {DIM}{:<6}{OFF} {:<12} {}{}",
+            id,
+            status,
+            who.unwrap_or_default(),
+            lease,
+        );
+    }
 }
 
 /// On start, print what the node still holds — `docs/CLI.md` §4's "replay of
@@ -331,26 +364,33 @@ pub async fn chat(node: &str, seed: Option<&str>, roster: &str) {
     let me = identity.account();
     let map = roster_map(roster);
 
-    println!("  {DIM}chat (remote) — {node}, /clear to fail every open task, blank line or /quit to leave{OFF}");
+    println!("  {DIM}chat (remote) — {node}, /clear to fail every open task, blank line, /quit, or /exit to leave{OFF}");
     for (n, a) in &map {
         if *a != me {
             println!("    {n}  {DIM}{}{OFF}", miot_keys::short(a));
         }
     }
 
-    let mut cursor = replay(&http, node, &map, 30).await;
+    let cursor = replay(&http, node, &map, 30).await;
 
-    let stdin = std::io::stdin();
-    let mut lines = stdin.lock().lines();
+    // Replies print as they land, independent of the prompt — see
+    // `print_replies`'s doc comment for why this used to block instead.
+    tokio::spawn(print_replies(http.clone(), node.to_string(), map.clone(), me.clone(), cursor));
+
+    let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     loop {
         prompt(&name_of(&map, &me));
-        let Some(Ok(line)) = lines.next() else { break };
+        let Ok(Some(line)) = lines.next_line().await else { break };
         let line = line.trim().to_string();
-        if line.is_empty() || line == "/quit" {
+        if line.is_empty() || line == "/quit" || line == "/exit" {
             break;
         }
         if line == "/clear" {
             submit(&http, node, &identity, RuntimeCall::Litter(pallet_litter::Call::clear_all {})).await;
+            continue;
+        }
+        if line == "/tasks" {
+            print_tasks(&http, node, &map).await;
             continue;
         }
 
@@ -371,7 +411,6 @@ pub async fn chat(node: &str, seed: Option<&str>, roster: &str) {
                 .await;
             }
         }
-        cursor = wait_for_replies(&http, node, cursor, &map, &me, 200).await;
     }
     println!("\n{DIM}  bye.{OFF}");
 }
