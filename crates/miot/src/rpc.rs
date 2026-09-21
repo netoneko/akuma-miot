@@ -310,10 +310,7 @@ pub async fn chat(node: &str, seed: Option<&str>, roster: &str) {
         }
     }
 
-    let mut cursor = match http.get(format!("{node}/head")).send().await {
-        Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|h| h["seq"].as_u64()).unwrap_or(0),
-        Err(_) => 0,
-    };
+    let mut cursor = replay(&http, node, &map, 30).await;
 
     let stdin = std::io::stdin();
     let mut lines = stdin.lock().lines();

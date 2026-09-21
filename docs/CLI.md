@@ -1,16 +1,64 @@
 # `miot-cli` — requirements
 
-Design of record. The interactive shell below (§0-§4, §6-§8) is not built yet
-(Phase 3+). A slice of §5's non-interactive surface **is** built, 2026-09-21 —
-not as a separate `miot-cli` binary but as `miot --rpc <url>` — the crate
-used to be named `miot-sim` and was renamed once `--rpc` made it more than a
-simulator. It already ships as `dist/miot` and already had the REPL (`--chat`)
-and the effect-printer (the scripted mode) this needed reusing rather than
-reinventing. It signs and submits (`--open "<text>"`, `--say "<body>" [--to
-<name>]`), against real endpoints (`/meta`, `/account/:id`, `/submit`) that
-did not exist before either. Not built: `/peers`, `/tasks`, `/plan`,
-`/artifact` as flags, and everything about §0-§4's actual terminal UI. This is
-still the contract for all of that.
+Design of record. The terminal UI proper (§0, §1, §6, §7, §8 — the composer,
+avatars, colour rules) is not built yet (Phase 3+; there is no alt-screen, no
+composer, nothing here contradicts §0's non-negotiable, because none of it
+exists to violate it). Slices of §2, §3, §4 and §5 **are** built, 2026-09-21
+through 22 — not as a separate `miot-cli` binary but as `miot --rpc <url>`.
+The crate used to be named `miot-sim` and was renamed once `--rpc` made it
+more than a simulator; it ships as `dist/miot`.
+
+What exists:
+
+- **§5, non-interactive:** `--open "<text>"`, `--say "<body>" [--to <name>]`,
+  `--clear` (§ below — not in the original doc, added once a live run showed
+  the need). Each signs and submits against real endpoints (`/meta`,
+  `/account/:id`, `/submit`) that did not exist before this either.
+- **§2, addressing:** `@name` tagging, resolved client-side against a
+  `name=seed` roster — never on the wire — exactly as this doc anticipated
+  ("Implemented today against placeholder u64 accounts; becomes a key lookup
+  unchanged when the runtime's `AccountId` switches"). That switch happened;
+  the resolution logic didn't need to.
+- **§2/§0-adjacent, interactive:** `--rpc <url> --chat` reuses the in-process
+  `--chat` REPL (`chat.rs`) verbatim — same prompt, same `/quit`, same
+  `@name` handling — but every line is a real signed extrinsic and replies
+  come from whatever cats are actually running against that node. Not a
+  composer (§1): still a plain blocking `stdin().lines()` prompt, same as the
+  in-process version always was.
+- **§3, observation, informally:** the scripted demo's `block/who/what`
+  printer already reads as this doc's `[obs]` view; `--rpc --chat`'s reply
+  printer is the same shape. No `/obs` toggle exists — everything currently
+  printed is what `/obs all` would show, unconditionally.
+- **§4, history:** `--rpc --chat` replays on start — bounded (last 30
+  events) — matching this doc's "bounded (`--history N`, default small) so a
+  fresh start is not a wall of text." The boundary it replays *since* is
+  `since=0` (everything `miot-node`'s in-memory ring still holds, `LOG_CAP`
+  4096), not "since last compaction" — that boundary doesn't exist yet
+  (`miot-store` isn't wired into the node). Once it is, this call site is
+  where the real boundary lands; nothing about the client changes.
+  **Rendering is rough** — `said` effects print as `name  body`, but every
+  other effect (`assigned`, `nudge`, `directed`, `record`, `failed`, …)
+  prints as the raw `{DIM}block N  <json>{OFF}` blob, not the scripted demo's
+  human phrasing (`"chain → mimi: [plan-needed: t1]"`, `"claimed t1.1"`).
+  Worth reusing that renderer here instead of a second, uglier one.
+
+Not built: `/peers`, `/tasks`, `/plan`, `/artifact` as flags or commands,
+`/obs`, `/history [n]` as an on-demand command (only the automatic start-up
+replay exists), and everything about §0/§1/§6's actual terminal UI (composer,
+avatars, colour-per-sender persistence across a session). This remains the
+contract for all of that.
+
+## `--clear` / `/clear` — not in the original design, added 2026-09-22
+
+A session boundary: fails every currently-open parent at once
+(`pallet_litter::Call::clear_all`, operator-only), so an operator can move to
+a fresh task without old stalled ones still nagging. `/clear` in `--chat`
+(both in-process and `--rpc`); `--clear` as a `--rpc` flag. Task ids keep
+incrementing — this is not a new genesis, just old parents going quiet.
+Reuses `TaskStatus::Failed`/`Effect::Failed`, the same outcome
+`DirectiveNag`'s new budget produces when a leader never resolves a directive
+— see `HANDOFF.md` "Decisions" for why those two are deliberately not
+distinguished in the type.
 
 ---
 

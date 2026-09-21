@@ -1,6 +1,6 @@
 # Handoff
 
-State of Akuma Miot as of 2026-09-21. What runs, what doesn't, what to do next,
+State of Akuma Miot as of 2026-09-22. What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
@@ -29,6 +29,8 @@ curl -s localhost:9944/meta                          # genesis hash + spec/tx ve
 # node instead of driving an in-process chain:
 cargo run -p miot -- --rpc http://localhost:9944 --identity-seed 1 \
   --open "your question here"
+cargo run -p miot -- --rpc http://localhost:9944 --chat   # same REPL as in-process --chat, real signed lines
+cargo run -p miot -- --rpc http://localhost:9944 --clear  # fail every open task — new session, same chain
 docker compose -f overlays/local/docker-compose.yml logs -f
 curl -s localhost:9944/artifact/t1 | python3 -m json.tool
 ```
@@ -54,15 +56,15 @@ overlays/local/build-akuma.sh          # dist/miot (5.1 MB), dist/storeprobe (0.
 | crate | what | tests |
 |---|---|---|
 | `miot-primitives` | vocabulary: `TaskId`, `Act`, `Effect`, `Limits`, `Timers`. `no_std`. | 5 |
-| `miot-tasks` | **the lifecycle, as a pure state machine.** No clock, no I/O. | 38 |
+| `miot-tasks` | **the lifecycle, as a pure state machine.** No clock, no I/O. | 40 |
 | `pallet-litter` | thin FRAME wrapper: `ensure_signed` → load → apply → store → emit | 16 |
 | `miot-runtime` | `construct_runtime!`; `AccountId32`/`MultiSignature`, real `UncheckedExtrinsic` + `Executive`, **executed natively — no wasm** | 2 |
 | `miot-store` | block log on ParityDB, compaction-boundary rewind, leader-wins | 14 |
 | `miot-keys` | ed25519 identity: seeds for cats, the operator's SSH *public* key → `AccountId32`, hex wire encoding | 14 |
 | `miot-llm` | provider layer on `genai` (15 providers, GLM included) | — |
 | `miot-node` | the chain as a process: HTTP, real block lifecycle (`Executive`) on its own clock, `/submit` verifies before it dispatches | — |
-| `miot-cat` | one cat, one container, signs its own extrinsics and talks to the node | — |
-| `miot` | one binary (ships as `dist/miot`), four modes: scripted / `--live` / `--chat` (in-process) / `--rpc` (a real node, signed) | — |
+| `miot-cat` | one cat, signs its own extrinsics and talks to the node — a container today, or any process that can reach it (running on a Lima VM as of 2026-09-22, see below) | — |
+| `miot` | one binary (ships as `dist/miot`), five modes: scripted / `--live` / `--chat` (in-process) / `--rpc` (one-shot: open/say/clear against a real node) / `--rpc --chat` (the same REPL, real signed lines, replays history on start) | — |
 
 **`miot-tasks` is the real thing.** Everything else hosts it. That is why the
 pallet is thin and why the same machine runs with or without a chain.
@@ -152,7 +154,14 @@ and checks a real `UncheckedExtrinsic` (signature, nonce, mortality, genesis
 and spec/tx version) before anything dispatches; artifacts stored and read
 back from chain state; five containers on a network with the chain ticking in
 its own process; four llama-servers; ParityDB (built, tested, still not wired
-into the node — see below).
+into the node — see below); **a cat running somewhere that isn't a container**
+— `kuro` moved from its docker container to the Lima VM (`fc`, aarch64 Linux)
+as of 2026-09-22: cross-compiled with the same `aarch64-unknown-linux-musl`
+toolchain `build-akuma.sh` already used, copied onto the VM's own disk with
+`limactl copy`, and it picked up an in-flight sub-task the moment it
+connected. The node never noticed it moved — which is the actual point of
+`docs/CLI.md` §5a and `overlays/local/README.md` Stage 1, now demonstrated
+rather than asserted.
 
 **Not yet real:**
 
@@ -194,6 +203,18 @@ into the node — see below).
 - **Timers are ~50× too conservative.** `claim_window` 100 blocks was sized for
   a 120–200 s turn; turns here are 3–60 s. Nothing is broken, but a live litter
   wants single-digit windows.
+- **`DirectiveNag` had no cap, and a live run hit it for real** (mimi mis-fired
+  `TaskUpdate` a few times on the same directive). Fixed —
+  `Timers::max_directive_nudges` — see "Decisions" above. Watch for this again
+  anywhere else a nag/retry loop is added without an explicit budget.
+- **`limactl shell fc -- ls ~/foo` resolves `~` on the host shell, not the
+  guest**, because tilde expansion happens client-side before `limactl` ever
+  sees the argument — so it silently becomes the *host's* home directory path,
+  which then gets treated as a guest path and (usually) fails to resolve.
+  Use an absolute guest path, or `limactl shell fc -- bash -lc 'echo $HOME'`
+  to get the real one (`/home/<user>.guest`, also aliased at
+  `/home/<user>.linux` — same inode, either name works once you're inside).
+  `limactl copy` itself has no such problem; it takes real guest paths.
 
 ---
 
