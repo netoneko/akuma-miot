@@ -35,6 +35,12 @@ cargo test --workspace              # 61 tests, host-native
 cargo run -p miot-sim               # scripted litter: shows the recovery path
 cargo run -p miot-sim -- --live     # real models, via ollama
 
+# a swarm of four llama-servers, one per cat
+overlays/local/llama-swarm.sh up
+cargo run -p miot-sim -- --live \
+  --models "$(overlays/local/llama-swarm.sh spec)" \
+  --brief path/to/document.md --task "the question"
+
 docker build -t akuma-miot:sim .    # 1m39s, three apt packages, 1.6 MB binary
 docker run --rm --add-host=host.docker.internal:host-gateway \
   -e OLLAMA_HOST=http://host.docker.internal:11434 \
@@ -285,8 +291,10 @@ is a compile-time fact rather than a convention: operator mode links no agent.
 | `miot-node` | ✗ | planned | `sc-*` node, AURA + GRANDPA. |
 | `miot-coord` | ✗ | planned | The same state machine in one tokio task, no chain. |
 | `miot-chain` | ✗ | planned | `subxt`: submit, stream events. |
+| `miot-store` | ✗ | **built** | The block log on ParityDB. Compaction-boundary rewind, leader-wins. |
+| `miot-keys` | ✗ | **built** | ed25519 identity. An account **is** a public key; the sender is recovered, never claimed. |
 | `miot-bodies` | ✗ | planned | Agent-**local** store, on Turso. Tool call results and transcripts, queryable. Never networked. |
-| `miot-llm` | ✗ | **built** | Ollama, native tool calls. |
+| `miot-llm` | ✗ | **built** | Provider layer on `genai` — 15 providers incl. GLM (`zai`), one OpenAI-compatible path for ollama and `llama-server` alike. |
 | `miot-tools` | ✗ | planned | Async tool registry + aggregator. |
 | `miot-agent` | ✗ | planned | The loop. A library, no I/O of its own. |
 | `miot-cli` | ✗ | planned | The binary. Both modes above. |

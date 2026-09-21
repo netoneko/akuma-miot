@@ -364,6 +364,34 @@ impl<A: Clone + Eq> TaskTable<A> {
         Ok(effects)
     }
 
+    /// Say something — to one cat, or to the whole litter.
+    ///
+    /// Not a task act, so not a value in [`Act`]: it changes no task state and
+    /// touches no table. It exists because a litter that can only exchange
+    /// task transitions cannot be *asked* anything, and the operator needs to
+    /// be able to talk to it.
+    ///
+    /// Anyone may speak. The only thing the table decides is whether the
+    /// remark wakes anybody, and that is [`Effect::wakes`]: addressed, or from
+    /// the operator.
+    pub fn say(
+        &mut self,
+        who: &A,
+        auth: Authority,
+        to: Option<A>,
+        body: &str,
+    ) -> Result<Vec<Effect<A>>, Error> {
+        if body.len() > self.cfg.limits.max_message {
+            return Err(Error::TooLong);
+        }
+        Ok(alloc::vec![Effect::Said {
+            from: who.clone(),
+            to,
+            body: body.to_string(),
+            from_root: auth == Authority::Root,
+        }])
+    }
+
     /// Move a sub-task to a different cat. Leader only.
     ///
     /// The missing half of "root is not a worker". `LITTER_WORKFLOW.md` spells

@@ -23,13 +23,13 @@ use frame_support::traits::OnInitialize;
 
 use crate::{colour, drain, name, new_ext, DIM, OFF};
 
-const ROOT: u64 = 1;
+pub const ROOT: u64 = 1;
 const MIMI: u64 = 2;
 const TAMA: u64 = 3;
 const KURO: u64 = 4;
 const SORA: u64 = 5;
 
-fn account(n: &str) -> Option<u64> {
+pub fn account(n: &str) -> Option<u64> {
     match n.trim().trim_start_matches('@').to_ascii_lowercase().as_str() {
         "mimi" => Some(MIMI),
         "tama" => Some(TAMA),
@@ -132,6 +132,12 @@ fn banner(block: u64, who: u64, t: &Turn, what: &str) {
 /// `--models mimi=gemma4-yolo-4b:latest,tama=gemma3:4b,...`, or one `--model`
 /// for all of them. A heterogeneous litter is the interesting case: the cats
 /// disagree for reasons other than sampling noise.
+pub const CATS: [u64; 4] = [MIMI, TAMA, KURO, SORA];
+
+pub fn cat_name(a: u64) -> &'static str { name(a) }
+
+pub fn personas(who: u64, is_leader: bool, brief: &str) -> String { persona(who, is_leader, brief) }
+
 pub struct Bench {
     by_cat: Vec<(u64, Llm)>,
     fallback: Llm,
@@ -165,7 +171,7 @@ impl Bench {
         Bench { by_cat, fallback: Llm::local(host, default_model) }
     }
 
-    fn for_cat(&self, who: u64) -> &Llm {
+    pub fn for_cat(&self, who: u64) -> &Llm {
         self.by_cat
             .iter()
             .find(|(a, _)| *a == who)

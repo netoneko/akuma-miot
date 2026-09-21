@@ -161,3 +161,154 @@ fn root_authority_is_possession_of_the_operator_key() {
         "an unprivileged cat can say what it likes; it cannot BE the operator"
     );
 }
+
+// ---- the envelope: one test per way this goes wrong -----------------------
+
+const CHAIN: [u8; 32] = [0x11; 32];
+const OTHER_CHAIN: [u8; 32] = [0x22; 32];
+
+fn call(s: &str) -> Vec<u8> {
+    s.as_bytes().to_vec()
+}
+
+fn signed(id: &Identity, nonce: u64, c: &str) -> SignedEnvelope {
+    SignedEnvelope::new(id, Envelope::new(CHAIN, nonce, call(c)))
+}
+
+#[test]
+fn an_honest_call_recovers_its_sender() {
+    let tama = Identity::generate();
+    let env = signed(&tama, 0, "clear t1.1");
+    assert_eq!(env.check(&CHAIN, 0).unwrap(), tama.account());
+}
+
+/// Without a nonce, `clear t1.1` signed once is replayable by anyone who saw
+/// it, forever.
+#[test]
+fn a_replayed_call_is_refused_by_its_nonce() {
+    let tama = Identity::generate();
+    let env = signed(&tama, 7, "done t1.1");
+
+    assert!(env.check(&CHAIN, 7).is_ok(), "accepted once");
+    // The same bytes, offered again after the account moved on.
+    assert_eq!(
+        env.check(&CHAIN, 8).unwrap_err(),
+        CallError::BadNonce { expected: 8, got: 7 },
+        "and never again"
+    );
+}
+
+/// A signature from a dev chain must not be authority on a real one.
+#[test]
+fn a_call_signed_for_another_chain_is_refused() {
+    let tama = Identity::generate();
+    let env = signed(&tama, 0, "open t1");
+    assert_eq!(env.check(&OTHER_CHAIN, 0).unwrap_err(), CallError::WrongChain);
+}
+
+/// The signature is checked before anything else: answering "wrong chain" for
+/// bytes nobody proved they authored would be discussing a message that does
+/// not exist.
+#[test]
+fn a_forgery_is_reported_as_a_forgery_not_as_a_stale_nonce() {
+    let kuro = Identity::generate();
+    let mimi = Identity::generate();
+    let honest = signed(&kuro, 3, "clear t1.1");
+    let forged = SignedEnvelope::from_parts(
+        mimi.account(),
+        honest.envelope().clone(),
+        *honest.signature(),
+    );
+    // Wrong chain AND wrong nonce AND a forged sender — it is the forgery that
+    // is reported.
+    assert_eq!(
+        forged.check(&OTHER_CHAIN, 99).unwrap_err(),
+        CallError::BadSignature
+    );
+}
+
+#[test]
+fn tampering_with_any_field_breaks_the_signature() {
+    let tama = Identity::generate();
+    let orig = signed(&tama, 5, "clear t1.1");
+
+    for tampered in [
+        Envelope::new(CHAIN, 5, call("clear t1.2")), // the call
+        Envelope::new(CHAIN, 6, call("clear t1.1")), // the nonce
+        Envelope::new(OTHER_CHAIN, 5, call("clear t1.1")), // the chain
+    ] {
+        let e = SignedEnvelope::from_parts(tama.account(), tampered, *orig.signature());
+        assert_eq!(
+            e.check(&CHAIN, 5).unwrap_err(),
+            CallError::BadSignature,
+            "every field is covered by the signature"
+        );
+    }
+}
+
+/// Length-prefixing is what stops two different envelopes producing identical
+/// signing bytes by sliding a boundary.
+#[test]
+fn field_boundaries_cannot_be_slid() {
+    let a = Envelope::new(CHAIN, 0, call("ab"));
+    let b = Envelope::new(CHAIN, 0, call("a"));
+    assert_ne!(a.signing_bytes(), b.signing_bytes());
+
+    // A call that starts with what looks like a length prefix must not be
+    // reinterpretable as a shorter call plus trailing data.
+    let c = Envelope::new(CHAIN, 0, call("\u{0}\u{0}\u{0}\u{1}x"));
+    let d = Envelope::new(CHAIN, 0, call("x"));
+    assert_ne!(c.signing_bytes(), d.signing_bytes());
+}
+
+/// The domain string is in the signed bytes, so a signature made here can
+/// never verify as some other kind of message this project signs later.
+#[test]
+fn the_domain_is_covered_by_the_signature() {
+    let env = Envelope::new(CHAIN, 0, call("x"));
+    let bytes = env.signing_bytes();
+    assert!(
+        bytes.windows(DOMAIN.len()).any(|w| w == DOMAIN),
+        "the context string is part of what gets signed"
+    );
+    assert_eq!(&bytes[0..4], &(DOMAIN.len() as u32).to_be_bytes());
+}
+
+/// The call bytes are only reachable through a successful check.
+#[test]
+fn the_call_is_unavailable_until_the_signature_passes() {
+    let kuro = Identity::generate();
+    let mimi = Identity::generate();
+    let honest = signed(&kuro, 0, "artifact t1");
+    let forged =
+        SignedEnvelope::from_parts(mimi.account(), honest.envelope().clone(), *honest.signature());
+
+    assert!(forged.into_call(&CHAIN, 0).is_err());
+    let (who, c) = signed(&kuro, 0, "artifact t1").into_call(&CHAIN, 0).unwrap();
+    assert_eq!(who, kuro.account());
+    assert_eq!(c, call("artifact t1"));
+}
+
+/// Two cats at the same nonce is normal — nonces are per account, not global.
+#[test]
+fn nonces_are_per_account() {
+    let tama = Identity::generate();
+    let kuro = Identity::generate();
+    assert!(signed(&tama, 0, "claim t1.1").check(&CHAIN, 0).is_ok());
+    assert!(signed(&kuro, 0, "claim t1.2").check(&CHAIN, 0).is_ok());
+}
+
+/// After a rewind a cat resubmits work the chain discarded. That must still
+/// verify — the signature is over the call, not over a block — and it is the
+/// nonce, not the signature, that decides whether it is fresh.
+#[test]
+fn a_resubmission_after_a_rewind_still_verifies() {
+    let tama = Identity::generate();
+    let env = signed(&tama, 4, "done t1.1");
+    assert!(env.check(&CHAIN, 4).is_ok());
+    // The block holding it was discarded; the account's nonce went back to 4.
+    assert!(
+        signed(&tama, 4, "done t1.1").check(&CHAIN, 4).is_ok(),
+        "losing a record must not cost a cat its ability to say the thing again"
+    );
+}

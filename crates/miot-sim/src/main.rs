@@ -91,15 +91,17 @@ pub fn drain() -> Vec<Effect<u64>> {
     out
 }
 
+mod chat;
 mod live;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let is_live = args.iter().any(|a| a == "--live");
+    let is_chat = args.iter().any(|a| a == "--chat");
     println!("{}", include_str!("../../../assets/akuma_40.txt"));
     println!("  {DIM}akuma miot — a litter, against the real runtime, no wasm{OFF}\n");
-    if is_live {
+    if is_chat || is_live {
         let host = std::env::var("OLLAMA_HOST")
             .unwrap_or_else(|_| "http://localhost:11434".into());
         let model = args
@@ -125,7 +127,11 @@ async fn main() {
         if !brief.is_empty() {
             println!("  {DIM}brief: {} chars mounted{OFF}", brief.len());
         }
-        live::run(&host, &model, &models, &task, &brief).await;
+        if is_chat {
+            chat::run(&host, &model, &models).await;
+        } else {
+            live::run(&host, &model, &models, &task, &brief).await;
+        }
         return;
     }
     println!("{DIM}block  who    what{OFF}");

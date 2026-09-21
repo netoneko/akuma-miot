@@ -261,6 +261,15 @@ pub enum Effect<A> {
         remaining: u8,
         last: bool,
     },
+    /// Somebody said something.
+    ///
+    /// `to` is `None` for the whole litter. Waking is decided by
+    /// [`Effect::wakes`]: a message addressed to one cat wakes it, and so does
+    /// anything from the operator — root speaking is an instruction, not
+    /// chatter. A peer talking to the litter at large is **not** waking, for
+    /// the same reason a record is not: waking four cats per broadcast turns
+    /// one remark into four LLM turns.
+    Said { from: A, to: Option<A>, body: String, from_root: bool },
     /// Broadcast, non-waking: a parent task was opened.
     Opened { who: A, task: TaskId },
     /// Broadcast, non-waking: a parent was split, atomically, into `count`
@@ -287,10 +296,12 @@ pub enum Effect<A> {
 impl<A> Effect<A> {
     /// Whether this effect should assemble an LLM turn for its recipient.
     pub const fn wakes(&self) -> bool {
-        matches!(
-            self,
-            Effect::Assigned { .. } | Effect::Directed { .. } | Effect::Nudge { .. }
-        )
+        match self {
+            Effect::Assigned { .. } | Effect::Directed { .. } | Effect::Nudge { .. } => true,
+            // Directed at somebody, or spoken by the operator.
+            Effect::Said { to, from_root, .. } => to.is_some() || *from_root,
+            _ => false,
+        }
     }
 
     /// Who this is addressed to, if anyone. `None` is a broadcast.
@@ -299,6 +310,7 @@ impl<A> Effect<A> {
             Effect::Assigned { to, .. }
             | Effect::Directed { to, .. }
             | Effect::Nudge { to, .. } => Some(to),
+            Effect::Said { to, .. } => to.as_ref(),
             _ => None,
         }
     }
@@ -407,6 +419,9 @@ pub struct Limits {
     /// machine destined for runtime storage has to bound its own growth, and
     /// [`Error::TooManyTasks`] plus GC of closed parents is how.
     pub max_tasks: usize,
+    /// Cap on one message. Same forcing function as `max_result`: say it, do
+    /// not paste it.
+    pub max_message: usize,
 }
 
 impl Default for Limits {
@@ -418,6 +433,7 @@ impl Default for Limits {
             max_title: 128,
             max_subtasks: 8,
             max_tasks: 512,
+            max_message: 2048,
         }
     }
 }

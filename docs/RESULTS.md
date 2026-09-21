@@ -106,6 +106,43 @@ Nothing is broken by it — the scripted run's 306 blocks were almost entirely
 kuro's offer budget draining — but a live litter should use single-digit block
 windows.
 
+## The four-server swarm
+
+`overlays/local/llama-swarm.sh` runs one `llama-server` per cat on 8081–8084,
+all qwen3:4b. Since llama.cpp mmaps the GGUF, four instances share the weight
+pages — the per-instance cost is KV cache, not 2.3 GB each. (Observed
+directly: the first server to start took minutes to load cold; restarting it
+after the other three were up took **4 seconds**.)
+
+### Threads: one is enough, and that is measured
+
+| config | 4 concurrent requests |
+|---|---|
+| `-t 3` — 12 threads on 12 physical cores | 16.54 s / 16.55 s |
+| `-t 1` — 4 threads | 16.28 s / 16.61 s |
+
+Identical. With `-ngl 99` the GPU does the matmuls and CPU threads only handle
+sampling, so one thread per server is enough and leaves 8 cores free.
+`llama-server` otherwise defaults to ~8 threads regardless of how many copies
+are running, which puts 32 threads on a 12-core box for no gain.
+
+### Four servers on one machine buy no throughput
+
+The number that matters:
+
+| | latency |
+|---|---|
+| one server, alone | **4.1 s** |
+| four servers, concurrently | **16.5 s** |
+
+Exactly 4×. They **fully serialize on the single GPU**. Running four servers on
+one Mac buys independent endpoints and per-cat model choice — which is the
+deployment shape we want to develop against — and *not* parallelism. Real
+concurrency needs separate machines.
+
+This also means the earlier single-ollama timings are not directly comparable:
+a lone cat on a quiet machine is fast; four cats sharing a GPU are not.
+
 ## Findings this produced
 
 1. **`gemma3:4b` cannot be a cat.** Ollama refuses the request outright:
@@ -127,6 +164,64 @@ windows.
 4. **Heterogeneous personas are worth having.** Lifted from
    `meow/litter/personas/`. Four identical cats give four identical answers and
    the leader learns nothing from having asked twice.
+5. **A stateless turn means the chain is the only memory — and the prompts have
+   to use it.** Two consecutive live runs on a mounted document produced
+   confident, well-formed reports about *the wrong topic*. Causes, both real:
+   - a leftover prompt from an earlier experiment still told workers to report
+     "what you found about the host you run on"; with a different document
+     mounted the cats resolved "the host" to something in *that* text;
+   - more importantly, **the parent question never reached the workers or the
+     artifact stage**. Each stage saw only its immediate input: a worker got
+     its sub-task text, and the leader synthesised the report from sub-task
+     *results* alone. The question was in chain storage the entire time and
+     nothing read it.
+
+   The fix is to refetch the parent's text per effect and carry it into the
+   assignment, the nudge, the clearance and the artifact prompt. Worth stating
+   as a rule: **a turn carries no history, so anything the model must not lose
+   has to be re-read from the chain and restated every single time.**
+6. **The protocol was not at fault either time.** Both failures produced a
+   clean parent → plan → claim → done → clear → artifact run with zero refused
+   calls and zero malformed ids. The litter did exactly what it was told; it
+   was told the wrong thing. That is worth noticing, because it is the failure
+   mode a protocol cannot catch for you.
+
+## Chat: talking to the litter
+
+`miot-sim --chat` sends a line as a root-signed `say` extrinsic; every cat it
+wakes takes a turn and replies with `SendMessage`, which is another extrinsic.
+Everything on screen went through the chain.
+
+```
+root ▸ introduce yourselves
+
+ mimi  Hello, I'm Mimi, the leader of Akuma Miot. We are a coordinated team of
+       AI agents that split tasks…                             (3044 tok, 173s)
+ tama  I am Tama, a worker… I execute tasks as extrinsics.        (576 tok, 35s)
+ kuro  I am Kuro… I deduce actions from evidence to ensure tasks are executed
+       with precision and skepticism.                            (484 tok, 28s)
+ sora  Hello, I am Sora… I pick up dropped work and redo tasks from evidence.
+                                                                 (803 tok, 45s)
+```
+
+The personas are doing real work here: kuro is skeptical, sora describes itself
+as the one who picks up dropped work. Four identical cats would have produced
+four identical sentences.
+
+**The spread is the notable number.** mimi spent 3044 tokens and 173 s on the
+same question tama answered in 576 tokens and 35 s — 5× the tokens, 5× the wall
+clock, for a sentence. Partly cold-start (mimi went first), partly that a
+reasoning model given a vague prompt reasons about the vagueness.
+
+### Waking is decided by the protocol, not the CLI
+
+`Effect::wakes()` is the only rule the chat loop consults:
+
+| | wakes |
+|---|---|
+| addressed to one cat (`@tama`) | yes |
+| from the operator, to the litter | yes — root speaking is an instruction |
+| a peer talking to the litter at large | **no** — else one remark becomes four turns |
 
 ## Honest gaps
 
@@ -136,6 +231,12 @@ windows.
   the key to the cat house" is notional.
 - **No networking, no block production, no persistence.** One in-process state
   machine stepping blocks in a loop. See `MAPPING_REPORT.md` §6.
+- **Two live debate runs on a mounted document did not finish.** The first two
+  answered the wrong question (see finding 5). The third, with the question
+  carried into every prompt, was still running at 20 minutes and was killed: a
+  12 KB README in every system prompt is ~3 000 tokens of prompt processing per
+  turn, times four cats sharing one GPU. Mounting a document is cheap to
+  implement and **not** cheap to run.
 - **The cats are told which verb to use.** That is by design and it is what
   makes a 4B model viable — but it means the protocol has not yet been tested
   against a model choosing *wrongly* rather than choosing badly.

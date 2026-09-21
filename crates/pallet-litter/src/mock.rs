@@ -35,6 +35,7 @@ parameter_types! {
     pub const MaxTitle: u32 = 128;
     pub const MaxSubtasks: u32 = 8;
     pub const MaxTasks: u32 = 512;
+    pub const MaxMessage: u32 = 2048;
 }
 
 impl crate::Config for Test {
@@ -51,6 +52,7 @@ impl crate::Config for Test {
     type MaxTitle = MaxTitle;
     type MaxSubtasks = MaxSubtasks;
     type MaxTasks = MaxTasks;
+    type MaxMessage = MaxMessage;
 }
 
 pub const ROOT: u64 = 1;

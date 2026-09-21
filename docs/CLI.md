@@ -99,6 +99,14 @@ Rules:
   refusal** — the message still sends. Refusing to send because a name was
   misspelled is worse than sending it.
 - Tab-completes from the on-chain roster.
+- **`@name` resolves to a key, not a name.** Once identities are public keys
+  (`miot-keys`: an account *is* a 32-byte ed25519 key), a tag is just the
+  local, human-facing spelling of an `Option<AccountId>` — the `to` field of
+  the `say` extrinsic. The name never goes on the wire; it is resolved
+  client-side against the roster before the call is signed, which is why a
+  misspelled tag is a local warning rather than a chain-level anything.
+  *Implemented today against placeholder u64 accounts; becomes a key lookup
+  unchanged when the runtime's `AccountId` switches.*
 - The composer shows the resolved target on its prompt: `litter ▸`,
   `→ tama ▸`, `→ tama,kuro ▸`.
 

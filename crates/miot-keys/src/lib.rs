@@ -158,6 +158,140 @@ impl Identity {
     }
 }
 
+/// What a signature is *over*.
+///
+/// Never the bare call. Four fields, and each one closes a specific hole:
+///
+/// - `DOMAIN` — a context string, so bytes signed here can never verify as
+///   some other message type this project signs later. Cheap now, impossible
+///   to retrofit once keys are in use.
+/// - `genesis` — the chain this call is for. Without it a signature from a
+///   test chain is valid on the real one, and a cat that ever touched a dev
+///   chain has handed over replayable authority.
+/// - `nonce` — per-account, monotonic. Without it, `clear t1.1` signed once is
+///   replayable by anyone who saw it, forever.
+/// - `call` — the SCALE-encoded call itself.
+///
+/// Both sides build the bytes through [`Envelope::signing_bytes`] and nowhere
+/// else. A second encoder is how signer and verifier drift into intermittent
+/// failures, and length-prefixing every variable field is how two different
+/// calls avoid encoding to the same bytes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Envelope {
+    pub genesis: [u8; 32],
+    pub nonce: u64,
+    pub call: Vec<u8>,
+}
+
+/// Context string. Changing it invalidates every signature ever made.
+const DOMAIN: &[u8] = b"akuma-miot/v1/call";
+
+impl Envelope {
+    pub fn new(genesis: [u8; 32], nonce: u64, call: Vec<u8>) -> Self {
+        Envelope { genesis, nonce, call }
+    }
+
+    /// The exact bytes that get signed. **The only place they are built.**
+    pub fn signing_bytes(&self) -> Vec<u8> {
+        let mut v = Vec::with_capacity(DOMAIN.len() + 48 + self.call.len());
+        // Length-prefixed so a domain and a call can never be concatenated
+        // into each other — the classic way two distinct messages end up with
+        // one signature.
+        v.extend_from_slice(&(DOMAIN.len() as u32).to_be_bytes());
+        v.extend_from_slice(DOMAIN);
+        v.extend_from_slice(&self.genesis);
+        v.extend_from_slice(&self.nonce.to_be_bytes());
+        v.extend_from_slice(&(self.call.len() as u32).to_be_bytes());
+        v.extend_from_slice(&self.call);
+        v
+    }
+}
+
+/// Why an envelope was rejected. Separate from [`KeyError`] so a caller can
+/// tell "this is not who it says" from "this is stale".
+#[derive(Debug, PartialEq, Eq)]
+pub enum CallError {
+    /// The signature does not verify for the claimed key.
+    BadSignature,
+    /// Signed for a different chain.
+    WrongChain,
+    /// Already used, or out of order.
+    BadNonce { expected: u64, got: u64 },
+}
+
+impl core::fmt::Display for CallError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            CallError::BadSignature => write!(f, "signature does not verify"),
+            CallError::WrongChain => write!(f, "signed for a different chain"),
+            CallError::BadNonce { expected, got } => {
+                write!(f, "nonce {got} is not {expected}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for CallError {}
+
+/// A call, its envelope, and a signature over both.
+pub struct SignedEnvelope {
+    who: Account,
+    env: Envelope,
+    sig: [u8; 64],
+}
+
+impl SignedEnvelope {
+    pub fn new(id: &Identity, env: Envelope) -> Self {
+        let sig = id.sign(&env.signing_bytes());
+        SignedEnvelope { who: id.account(), env, sig }
+    }
+
+    pub fn from_parts(who: Account, env: Envelope, sig: [u8; 64]) -> Self {
+        SignedEnvelope { who, env, sig }
+    }
+
+    pub fn envelope(&self) -> &Envelope {
+        &self.env
+    }
+
+    pub fn signature(&self) -> &[u8; 64] {
+        &self.sig
+    }
+
+    /// The claimed sender, unverified. Named so that using it without
+    /// [`SignedEnvelope::check`] reads as the mistake it is.
+    pub fn claimed_account(&self) -> Account {
+        self.who
+    }
+
+    /// Recover the sender, or say why not.
+    ///
+    /// Order matters: the **signature is checked first**. Reporting
+    /// `WrongChain` or `BadNonce` for bytes nobody proved they authored would
+    /// be answering questions about a message that does not exist.
+    pub fn check(&self, genesis: &[u8; 32], expected_nonce: u64) -> Result<Account, CallError> {
+        self.who
+            .verify(&self.env.signing_bytes(), &self.sig)
+            .map_err(|_| CallError::BadSignature)?;
+        if &self.env.genesis != genesis {
+            return Err(CallError::WrongChain);
+        }
+        if self.env.nonce != expected_nonce {
+            return Err(CallError::BadNonce {
+                expected: expected_nonce,
+                got: self.env.nonce,
+            });
+        }
+        Ok(self.who)
+    }
+
+    /// The call bytes — available **only** once `check` has passed.
+    pub fn into_call(self, genesis: &[u8; 32], nonce: u64) -> Result<(Account, Vec<u8>), CallError> {
+        let who = self.check(genesis, nonce)?;
+        Ok((who, self.env.call))
+    }
+}
+
 /// One act, with its signature.
 ///
 /// `who` is **not** trusted: it is the key the signature is checked against,

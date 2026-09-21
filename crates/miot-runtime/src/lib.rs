@@ -77,6 +77,7 @@ impl pallet_litter::Config for Runtime {
     type MaxTitle = ConstU32<128>;
     type MaxSubtasks = ConstU32<8>;
     type MaxTasks = ConstU32<512>;
+    type MaxMessage = ConstU32<2048>;
 }
 
 const _: Option<ConstU64<0>> = None;

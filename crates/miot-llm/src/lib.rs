@@ -122,6 +122,25 @@ impl Llm {
     }
 }
 
+/// The tool a cat uses to talk.
+///
+/// Separate from [`task_tools`] because a cat that is being *spoken to* has no
+/// task to act on, and offering it six task verbs it cannot use is how a small
+/// model ends up calling one of them anyway.
+pub fn chat_tools() -> Vec<Tool> {
+    vec![Tool::new("SendMessage")
+        .with_description("Say something. Use this to reply.")
+        .with_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "to": {"type": "string",
+                       "description": "a cat's name, or 'litter' for everyone"},
+                "body": {"type": "string"}
+            },
+            "required": ["body"]
+        }))]
+}
+
 /// The public tool surface, as the model sees it.
 ///
 /// Three tools, not eight. `TaskUpdate` carries a `status` enum rather than

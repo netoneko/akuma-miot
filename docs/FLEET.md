@@ -9,7 +9,7 @@ compatible endpoint, `--jinja` for tool-call parsing), one model per cat.
 |---|---|---|---|---|
 | **mac** (this box) | 48 GB unified | **15 GB** — nearly full, no external volume | Metal | leader + one worker, once disk is sorted |
 | **ryzen** | 13 GB | 24 GB | Radeon 780M iGPU, shares system RAM (no dedicated VRAM carve-out seen) | two workers, + a GLM experiment |
-| **akuma** (trashcan) | 16 GB | — | — | **not local inference.** Calls z.ai's GLM API for feature-writing / kernel-compile work. Running GLM weights on it locally is a someday-maybe, not planned. |
+| **akuma** (trashcan) | 16 GB physical, **~10 GB planned budget** — reserved for the Rust toolchain (`rustc`'s LLVM codegen spikes hard, multiplied by `cargo`'s parallelism, during kernel builds) | — | — | **not local inference.** Calls z.ai's GLM API for feature-writing / kernel-compile work. |
 
 ## Cats → host → model
 
@@ -57,6 +57,14 @@ GGUF sources (verified against the HF API before download, not guessed):
   wants akuma to reread history and resume after the reboots its own kernel
   builds cause. No mechanism for that exists yet — this doc only covers the
   local inference split, not that persistence design.
+- **akuma isn't a normal Linux userland — checked, not assumed.** `uname -a`:
+  `Akuma akuma 0.0.8 d565985c-release-smp-shared x86_64 GNU/Linux`. This is
+  Kirill's own kernel, not stock Linux. `whoami` fails (`unknown uid 0`, no
+  `/etc/passwd`) — the userland is minimal. Whether it has the pthread/mmap/
+  socket surface `llama-server` needs is **unverified**, on top of the ~10 GB
+  budget already being spoken for by the Rust toolchain during kernel builds.
+  Another reason local inference on akuma stays a someday-maybe, not that RAM
+  size was ever the only blocker.
 - **`--jinja` tool-call parsing with Qwen3/GLM on `llama-server` is unverified
   live.** RESULTS.md's zero-malformed-calls finding is against Ollama +
   gemma4-yolo-4b/qwen3:4b, not against `llama-server`'s parser.

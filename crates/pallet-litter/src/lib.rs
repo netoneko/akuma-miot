@@ -128,6 +128,8 @@ pub mod pallet {
         type MaxSubtasks: Get<u32>;
         #[pallet::constant]
         type MaxTasks: Get<u32>;
+        #[pallet::constant]
+        type MaxMessage: Get<u32>;
     }
 
     /// The whole table, as one value.
@@ -290,6 +292,21 @@ pub mod pallet {
             Ok(())
         }
 
+        /// Say something to one cat, or to the whole litter.
+        ///
+        /// The operator's way in. A litter that can only exchange task
+        /// transitions cannot be asked anything.
+        #[pallet::call_index(6)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn say(
+            origin: OriginFor<T>,
+            to: Option<T::AccountId>,
+            body: String,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            Self::apply(|t, auth, _now| t.say(&who, auth, to.clone(), &body), &who)
+        }
+
         /// Move a sub-task to a different cat. Leader only.
         ///
         /// How a litter recovers from a member that cannot do the job — it
@@ -346,6 +363,7 @@ pub mod pallet {
                     max_title: T::MaxTitle::get() as usize,
                     max_subtasks: T::MaxSubtasks::get() as usize,
                     max_tasks: T::MaxTasks::get() as usize,
+                    max_message: T::MaxMessage::get() as usize,
                 },
             }
         }
