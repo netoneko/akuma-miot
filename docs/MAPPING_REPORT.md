@@ -641,25 +641,61 @@ independent.
 
 ### 5.2 The node on Akuma is an experiment, not a dependency
 
-A `sc-*` node wants tokio's multi-threaded runtime, rust-libp2p, a database and
-a wasm executor. Akuma provides `pipe2`, `eventfd2`, `futex`, `pselect6`,
-`ppoll`, `CLONE_VM` threads, demand paging and `mmap`, and has run
+A `sc-*` node wants tokio's multi-threaded runtime, rust-libp2p, a **wasm
+executor** and a **database**. Akuma provides `pipe2`, `eventfd2`, `futex`,
+`pselect6`, `ppoll`, `CLONE_VM` threads, demand paging and `mmap`, and has run
 tokio/hyper/rustls programs — so tokio and libp2p are plausible on paper. The
-two real risks:
+other two are the real questions, and they are not equally hard.
 
-1. **The database.** RocksDB is a C++ build with heavy mmap and file locking;
-   ParityDB is pure Rust but still mmap-heavy. *Mitigation:* an in-memory
-   backend **[verify availability]** — and note that this is not a compromise
-   here. `LITTER_STATE_MACHINE.md` already says *"State dies with the process
-   — by design."* Ephemeral is the matching semantics.
-2. **The wasm executor.** wasmtime wants a JIT and `PROT_EXEC` churn.
-   *Mitigation:* `wasmi`, an interpreter **[verify it is still supported in
-   the pinned polkadot-sdk]**.
+#### Wasm — the solvable half
 
-Run the node on Linux. Akuma hosts run agents, which are clients. A node inside
-Akuma is a great headline and a separate, fundable experiment.
+The runtime *is* a wasm blob, stored on chain as `:code`. That is the forkless
+upgrade mechanism, and it is why native runtime execution was deprecated and
+then removed: "run the STF natively" is not a supported configuration. So the
+node needs an executor.
 
----
+| | `wasmtime` | `wasmi` |
+|---|---|---|
+| Kind | JIT/AOT | interpreter, pure Rust |
+| Speed | fast | 10–100× slower |
+| Host demands | `mmap` + `PROT_EXEC` churn, trap signal handlers, sometimes hugepages | essentially none — a decode-dispatch loop |
+
+At ~10 extrinsics per block on a private litter chain, 100× slower than a JIT
+is still nothing. `wasmi` is therefore the right answer here, and it asks
+almost nothing of the kernel.
+
+**[verify]:** the Phase 1 dependency fetch pulled `polkavm-common v0.9.0`, so
+polkadot-sdk is moving toward PolkaVM/RISC-V. Confirm `wasmi` is still a
+first-class executor in the pinned version before betting on it.
+
+#### The database — the actual blocker
+
+A node stores headers, bodies and the **state trie** (a Merkle-Patricia trie
+over all storage — the thing each header's state root commits to).
+
+- **RocksDB** — C++. A C++ toolchain to build, LZ4/snappy, heavy mmap, file
+  locking, background compaction threads.
+- **ParityDB** — pure Rust, purpose-built, easier to cross-compile. Still
+  mmaps large files and leans on sparse-file support.
+
+**Correction to an earlier draft of this document.** It claimed an in-memory
+backend would make this a non-issue, on the grounds that
+`LITTER_STATE_MACHINE.md` already says *"State dies with the process — by
+design"*, so ephemerality is the matching semantics. That was rhetorically neat
+and technically wrong: `--tmp` gives a throwaway **directory**, not a
+memory-only store. There is still a real database underneath, so the mmap,
+sparse-file and fsync requirements all remain.
+
+Large mmap plus sparse files on Akuma's ext2-over-virtio-blk is the genuine
+risk, and unlike the executor there is no `wasmi`-shaped escape hatch. It would
+be real filesystem work, or a storage backend written for it.
+
+#### Net
+
+**The database is the blocker; wasm is not.** Which is exactly why the split
+holds: run the node on Linux, run agents on Akuma. An agent needs neither an
+executor nor a trie — it is an RPC client with a local file store, which is a
+class of program Akuma already runs.
 
 ## 6. Roadmap
 
@@ -689,8 +725,9 @@ have required.
 
 1. `sp-std` deprecated — plain `core`/`alloc` in pallets?
 2. Current wasm runtime target (`wasm32v1-none` vs `wasm32-unknown-unknown`).
-3. `wasmi` still supported; in-memory/tmp DB backend suitable for a
-   permanently-ephemeral chain.
+3. Is `wasmi` still a first-class executor? The Phase 1 fetch pulled
+   `polkavm-common v0.9.0`, so the executor lineup may have moved. (The
+   in-memory-DB question is **settled and the answer is no** — see §5.2.)
 4. `frame-benchmarking` worth the setup for a private litter, or are
    hand-assigned constant weights fine?
 

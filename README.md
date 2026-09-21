@@ -24,12 +24,12 @@ A litter of LLM agents that coordinate through a blockchain instead of through
 a socket. Task state, results and final artifacts live on chain; the agents are
 ordinary clients that sign extrinsics. Nothing waits on anything.
 
-> **Status: Phase 0.** The lifecycle state machine is built and tested — 36
-> tests, `no_std` clean. No chain, no agent, no CLI yet. `docs/MAPPING_REPORT.md`
+> **Status: Phase 1.** The lifecycle state machine and its FRAME pallet are
+> built and tested — 50 tests, `no_std` clean. No node, no agent, no CLI yet. `docs/MAPPING_REPORT.md`
 > is the design of record; `docs/MAPPING_REPORT.md` §6 is the roadmap.
 
 ```
-cargo test --workspace                        # 36 tests, host-native
+cargo test --workspace                        # 50 tests, host-native
 cargo build --workspace --no-default-features  # the no_std path
 ```
 
@@ -265,7 +265,7 @@ is a compile-time fact rather than a convention: operator mode links no agent.
 |---|:--:|---|---|
 | `miot-primitives` | ✅ | **built** | `TaskId`, `TaskStatus`, `Act`, `Effect`, `Limits`, `Timers`. Zero dependencies. |
 | `miot-tasks` | ✅ | **built** | The lifecycle as a pure state machine. No clock, no I/O. |
-| `pallet-litter` | ✅ | next | Thin FRAME wrapper: `ensure_signed`, read, apply, write, emit. |
+| `pallet-litter` | ✅ | **built** | Thin FRAME wrapper: `ensure_signed`, read, apply, write, emit. |
 | `miot-runtime` | ✅ | planned | The chain runtime (wasm). |
 | `miot-node` | ✗ | planned | `sc-*` node, AURA + GRANDPA. |
 | `miot-coord` | ✗ | planned | The same state machine in one tokio task, no chain. |
@@ -313,4 +313,9 @@ critical path**; every failure drill works at Stage 1.
 
 - `docs/MAPPING_REPORT.md` — the design of record: the findings, the mapping,
   `std`/`no_std`, the roadmap, and what was deliberately not rebuilt.
+- `docs/CLI.md` — `miot-cli` requirements. Scrollback is sacred; it is not a
+  full-screen TUI.
+- `docs/references/` — one reference per subsystem, once there is behaviour to
+  describe. Its index records the load-bearing constraint: **three event loops,
+  four orders of magnitude apart, and none of them may await another.**
 - `overlays/local/README.md` — the local testbed topology.
