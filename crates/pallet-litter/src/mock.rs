@@ -27,6 +27,7 @@ parameter_types! {
     pub const WorkNag: u32 = 5;
     pub const DirectiveNag: u32 = 8;
     pub const MaxNudges: u8 = 3;
+    pub const MaxReoffers: u8 = 3;
     pub const GcKeepFor: u32 = 50;
     pub const MaxText: u32 = 4096;
     pub const MaxResult: u32 = 16 * 1024;
@@ -42,6 +43,7 @@ impl crate::Config for Test {
     type WorkNag = WorkNag;
     type DirectiveNag = DirectiveNag;
     type MaxNudges = MaxNudges;
+    type MaxReoffers = MaxReoffers;
     type GcKeepFor = GcKeepFor;
     type MaxText = MaxText;
     type MaxResult = MaxResult;

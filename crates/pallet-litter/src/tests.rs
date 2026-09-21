@@ -283,3 +283,61 @@ fn the_waking_rule_survives_the_trip_through_events() {
         assert!(!planned.wakes(), "a broadcast record wakes nobody");
     });
 }
+
+/// The recovery path, on chain: a cat reports it cannot do the job and the
+/// leader hands the work to one that can. Without this a parent stalls
+/// forever on a member that will never answer.
+#[test]
+fn a_leader_can_re_home_work_away_from_a_cat_that_cannot() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Litter::open(RuntimeOrigin::signed(ROOT), "debate & report".into()));
+        let p = TaskId::parent(1);
+        plan_two(p);
+        let s = TaskId::sub(1, 1); // tama's
+
+        assert_ok!(Litter::update(
+            RuntimeOrigin::signed(TAMA),
+            s,
+            Act::Failed,
+            "no toolchain on this box".into()
+        ));
+
+        // A peer cannot re-home; only the leader decides where work goes.
+        assert_noop!(
+            Litter::reassign(RuntimeOrigin::signed(KURO), s, KURO),
+            Error::<Test>::NotAuthorized
+        );
+        // And never onto the operator, which has no agent behind it.
+        assert_noop!(
+            Litter::reassign(RuntimeOrigin::signed(LEAD), s, ROOT),
+            Error::<Test>::RootNotAssignable
+        );
+
+        assert_ok!(Litter::reassign(RuntimeOrigin::signed(LEAD), s, KURO));
+        let t = Litter::task(s).unwrap();
+        assert_eq!(t.assignee, Some(KURO));
+        assert_eq!(t.status, TaskStatus::Pending);
+        assert_eq!(t.outcome, None, "the new holder starts clean");
+
+        // kuro can now actually take it — tama's grip is released.
+        assert_ok!(Litter::update(RuntimeOrigin::signed(KURO), s, Act::Claim, String::new()));
+    });
+}
+
+/// The tick asks for it by name rather than leaving a sub-task silently stuck.
+#[test]
+fn a_stuck_subtask_reaches_the_leader_as_reassign_needed() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Litter::open(RuntimeOrigin::signed(ROOT), "x".into()));
+        plan_two(TaskId::parent(1));
+        // Nobody ever claims. Only blocks pass.
+        roll_to(200);
+        assert!(
+            effects().iter().any(|e| matches!(
+                e,
+                Effect::Directed { directive: Directive::ReassignNeeded, .. }
+            )),
+            "an exhausted offer must become a named verb for the leader"
+        );
+    });
+}

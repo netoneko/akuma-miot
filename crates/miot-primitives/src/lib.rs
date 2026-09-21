@@ -201,6 +201,11 @@ pub enum Directive {
     ClearanceNeeded,
     /// Every sub-task is cleared; the parent wants its artifact.
     ArtifactNeeded,
+    /// A sub-task has been re-offered to its assignee as many times as the
+    /// budget allows and is still unclaimed. The assignee is dead, wedged, or
+    /// unable — and the table stops guessing which. Only the leader can decide
+    /// where the work goes instead, so it is asked.
+    ReassignNeeded,
     /// This account just became leader. Promotion is an instruction to act,
     /// not merely a fact to notice.
     LeaderElected,
@@ -212,6 +217,8 @@ pub enum Directive {
 pub enum Requeue {
     /// Nobody claimed the offer inside the claim window.
     Unclaimed,
+    /// The leader re-homed it to somebody else.
+    Rehomed,
     /// The holder's lease ran out.
     LeaseExpired,
     /// The leader rejected the result.
@@ -273,6 +280,8 @@ pub enum Effect<A> {
     NudgeBudgetSpent { holder: A, task: TaskId },
     /// Broadcast, non-waking: a parent closed with its artifact.
     Closed { task: TaskId, title: String },
+    /// Broadcast, non-waking: the leader moved a sub-task to a different cat.
+    Rehomed { task: TaskId, from: Option<A>, to: A },
 }
 
 impl<A> Effect<A> {
@@ -356,6 +365,13 @@ pub struct Timers {
     pub directive_nag: BlockNumber,
     /// How many consecutive unanswered reminders a holder gets.
     pub max_nudges: u8,
+    /// How many times an unclaimed offer is re-made before the table gives up
+    /// and asks the leader to re-home it.
+    ///
+    /// Bounded for the same reason nudges are: re-offering forever to an
+    /// assignee that will never answer is a loop that pays forever, and the
+    /// parent can never close while one sub-task is stuck in it.
+    pub max_reoffers: u8,
 }
 
 impl Default for Timers {
@@ -366,6 +382,7 @@ impl Default for Timers {
             work_nag: 25,
             directive_nag: 20,
             max_nudges: 3,
+            max_reoffers: 3,
         }
     }
 }

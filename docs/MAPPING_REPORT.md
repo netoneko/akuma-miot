@@ -56,13 +56,59 @@ carrying across a rewrite that keeps none of the code.
 | **Directives must name the exact verb.** A 0.8B model will not infer `[artifact: t1]` from a design document. The table delivers `[plan-needed:]`, `[clearance-needed:]`, `[artifact-needed:]`. | `tasks.rs` | pallet events → agent prompt |
 | **One tool with a status enum beats five similar tools.** A small model picks a *value* more reliably than it picks among near-identical tool names, and a new act costs a value rather than new surface. | `TaskUpdate` | one dispatchable, one enum |
 | **Root is not a worker.** A leader canvassing the litter split its task four ways and gave the fourth to the operator. That sub-task could never be claimed; an artifact requires every sub-task cleared; the parent could never close. | live, once | pallet invariant |
+| **Work must be able to change hands.** An assignee is not the owner of a sub-task for life. A cat dies, wedges, or reports `failed`, and the work has to reach one that can do it — otherwise the parent stalls forever on a member that will never answer. | §1.2 below | `reassign`, leader-only |
+| **Re-offering is bounded, like nudging.** An unclaimed offer is re-made `max_reoffers` times and then stops, and the table asks the leader to re-home it by name (`ReassignNeeded`). An unbounded re-offer is the same loop an unbounded nudge is: paying forever for an agent that was never going to answer. | §1.2 below | `on_initialize` |
 | **Accept a submit without a claim.** The handshake is in the protocol, but a small model that skips to the result should not have its work thrown away. Losing the ceremony is cheaper than losing the answer. | `tasks.rs` | pallet transition |
 | **Applied-vs-refused must be typed, never sniffed.** Three call sites re-derived acceptance by testing whether a note *began with the word "refused"*. The "already claimed" refusals said no such thing, so a no-op would have been replicated to the whole litter as though it had happened. | `tasks.rs` | `DispatchResult` |
 | **Broadcast is non-waking; targeted traffic wakes.** Waking four agents per record turns one task into sixteen LLM turns. | `serve.rs` | event filter in the agent |
 | **Fail fast when coordination goes silent.** WAYWARD's tools error with "hub unresponsive (last heartbeat Ns ago)" rather than hanging the turn in an undrained backlog. | `hub.rs` | same rule, chain-disconnected |
 | **Never hold a lock across I/O.** `serve::drain` held `PMutex<HubState>` across a deadline-bounded read; the deadline poll hook called `local_drain`; `local_drain` re-locked. Both threads parked in `FUTEX_WAIT` on the same word at the same PC. From outside it looked like three unrelated faults. | 2026-09-20 | unrepresentable — see §2.2 |
 
-### 1.2 The structure — what we are deliberately not rebuilding
+### 1.2 A misconception the port introduced, and how it surfaced
+
+Worth recording, because it is the exact failure mode this document's whole
+"carry the findings, not the code" premise is supposed to prevent.
+
+`LITTER_WORKFLOW.md` states the operator's exclusion as **four** things:
+
+> it is never assignable: not planned to, not offered to, not listed as
+> available, and **not a re-homing candidate**.
+
+The first port read that as one rule — *refuse `root` at plan time* — and
+implemented exactly that. But the fourth clause only means anything if
+**re-homing exists**, and it had been dropped on the way across. What survived
+was an exclusion from a mechanism that was no longer there.
+
+The consequence was not cosmetic. `assignee` is set once, at `plan`, and
+`Requeue` deliberately preserves it — the work is still *theirs*, merely
+unclaimed. So a sub-task was bound to its cat **for life**: a cat that died,
+wedged or simply could not do the job got the same offer re-made forever, the
+nudge budget bounded only nudges, and the parent could never close because an
+artifact requires every sub-task cleared. The identical stall the "root is not
+a worker" finding exists to prevent, reachable without involving `root` at all.
+
+**How it surfaced:** asking what it would take for one model to help another
+recover from a failed feature attempt. The answer required work to change
+hands, and nothing could move it.
+
+**The fix** is two bounded mechanisms, matching the shape the litter already
+uses everywhere else:
+
+- `max_reoffers` bounds re-offering exactly as `max_nudges` bounds nudging.
+  Past the budget the table stops and raises `Directive::ReassignNeeded` — a
+  named verb for the leader, not a silence.
+- `reassign(task, to)` is a **leader act**, alongside `plan`, not a value in
+  `Act`. That enum is what a worker does to its own task and every one of its
+  acts takes only text; this one takes another account.
+
+A failed result is discarded on re-home, so the new holder starts clean rather
+than inheriting a wrong answer as context. A `Cleared` sub-task cannot be
+re-homed — that would reopen settled work behind the leader's own clearance.
+
+The general lesson: **a finding stated as an exclusion is evidence of a
+mechanism.** When porting one, check the mechanism came too.
+
+### 1.3 The structure — what we are deliberately not rebuilding
 
 Diagnosed from the code, so the new thing does not re-earn any of it:
 
@@ -104,7 +150,7 @@ Diagnosed from the code, so the new thing does not re-earn any of it:
    (`live.rs:831`), reached only when the process won the bind race. Miot's
    agent is a client; the caller disappears and so does the file.
 
-### 1.3 Code we still read, but do not import
+### 1.4 Code we still read, but do not import
 
 | From meow | Lines | Why it is worth reading during the port |
 |---|---:|---|

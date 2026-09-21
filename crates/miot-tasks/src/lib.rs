@@ -67,6 +67,9 @@ pub struct Task<A> {
     pub next_nag: Option<BlockNumber>,
     /// Consecutive unanswered nudges. Resets whenever the holder acts.
     pub nudges_used: u8,
+    /// How many times this offer has been re-made to the same assignee.
+    /// Resets on a claim and on a re-home.
+    pub reoffers: u8,
     /// Whether "budget spent" has already been said for this holder. Said
     /// once, not once per tick.
     budget_announced: bool,
@@ -262,6 +265,7 @@ impl<A: Clone + Eq> TaskTable<A> {
             lease_until: None,
             next_nag: None,
             nudges_used: 0,
+            reoffers: 0,
             budget_announced: false,
             // Due immediately: the leader should be asked to plan on the very
             // next tick, not one nag interval from now.
@@ -341,6 +345,7 @@ impl<A: Clone + Eq> TaskTable<A> {
                 lease_until: None,
                 next_nag: None,
                 nudges_used: 0,
+                reoffers: 0,
                 budget_announced: false,
                 next_directive: now,
                 closed_at: None,
@@ -357,6 +362,66 @@ impl<A: Clone + Eq> TaskTable<A> {
         p.status = TaskStatus::Planned;
         p.next_directive = now.saturating_add(nag);
         Ok(effects)
+    }
+
+    /// Move a sub-task to a different cat. Leader only.
+    ///
+    /// The missing half of "root is not a worker". `LITTER_WORKFLOW.md` spells
+    /// the operator's exclusion as four things — *"not planned to, not offered
+    /// to, not listed as available, and **not a re-homing candidate**"* — which
+    /// only makes sense if re-homing exists. The first port implemented the
+    /// plan-time exclusion and dropped the mechanism it was an exclusion from.
+    ///
+    /// Without it an assignee holds its sub-task for life: `Requeue` preserves
+    /// `assignee` on purpose (the work is still *theirs*, merely unclaimed), so
+    /// a cat that dies, wedges or simply cannot do the job gets the same offer
+    /// re-made until the budget runs out and then forever after — with the
+    /// parent unable to close, because an artifact needs every sub-task
+    /// cleared.
+    ///
+    /// Accepted from `Pending` (nobody is working it) and from
+    /// `AwaitingClearance` (a result is in, and the leader would rather have
+    /// somebody else do it than accept this one). A failed result is discarded
+    /// on re-home: the new holder starts clean rather than inheriting a wrong
+    /// answer as context.
+    pub fn reassign(
+        &mut self,
+        who: &A,
+        auth: Authority,
+        id: TaskId,
+        to: A,
+        now: BlockNumber,
+    ) -> Result<Vec<Effect<A>>, Error> {
+        if auth != Authority::Leader {
+            return Err(Error::NotAuthorized);
+        }
+        if self.root.as_ref() == Some(&to) {
+            return Err(Error::RootNotAssignable);
+        }
+        let t = self.task_mut(id)?;
+        if t.is_parent() {
+            return Err(Error::WrongKind);
+        }
+        if !matches!(t.status, TaskStatus::Pending | TaskStatus::AwaitingClearance) {
+            return Err(Error::WrongStatus);
+        }
+        let from = t.assignee.replace(to.clone());
+        t.status = TaskStatus::Pending;
+        t.holder = None;
+        t.outcome = None;
+        t.offered_at = Some(now);
+        t.lease_until = None;
+        t.next_nag = None;
+        // A fresh holder gets fresh budgets — both of them.
+        t.nudges_used = 0;
+        t.reoffers = 0;
+        t.budget_announced = false;
+        let (what, expect) = (t.text.clone(), t.expect.clone());
+        Ok(alloc::vec![
+            Effect::Rehomed { task: id, from, to: to.clone() },
+            Effect::Requeued { task: id, from: None, why: Requeue::Rehomed },
+            Effect::Assigned { to, task: id, what, expect },
+        ])
     }
 
     /// Every per-task act: claim, done, failed, clear, reopen, artifact.
@@ -401,6 +466,7 @@ impl<A: Clone + Eq> TaskTable<A> {
         t.lease_until = Some(now.saturating_add(lease));
         t.next_nag = Some(now.saturating_add(work_nag));
         t.nudges_used = 0;
+        t.reoffers = 0;
         t.budget_announced = false;
         t.offered_at = None;
         // Nudged once immediately, then on the nag interval. Claiming ends a
@@ -679,11 +745,18 @@ impl<A: Clone + Eq> TaskTable<A> {
                         }
                     }
                 }
+                // Bounded, like the nudge budget and for the same reason:
+                // re-offering forever to an assignee that will never answer is
+                // a loop that pays forever, and the parent can never close
+                // while one sub-task is stuck in it. Past the budget the table
+                // stops re-offering and asks the leader to re-home it.
                 TaskStatus::Pending
-                    if t.offered_at
-                        .is_some_and(|o| now >= o.saturating_add(cfg.timers.claim_window)) =>
+                    if t.reoffers < cfg.timers.max_reoffers
+                        && t.offered_at
+                            .is_some_and(|o| now >= o.saturating_add(cfg.timers.claim_window)) =>
                 {
                     t.offered_at = Some(now);
+                    t.reoffers += 1;
                     effects.push(Effect::Requeued {
                         task: t.id,
                         from: None,
@@ -734,7 +807,16 @@ impl<A: Clone + Eq> TaskTable<A> {
             TaskStatus::Planned => {
                 let mut subs = self.subtasks(parent.id).peekable();
                 subs.peek()?;
-                if self
+                // Checked first: a sub-task whose offer budget is spent is the
+                // one thing that stalls a parent forever, and only the leader
+                // can move it. A clearance can wait a nag interval; this
+                // cannot.
+                if self.subtasks(parent.id).any(|t| {
+                    t.status == TaskStatus::Pending
+                        && t.reoffers >= self.cfg.timers.max_reoffers
+                }) {
+                    Some(Directive::ReassignNeeded)
+                } else if self
                     .subtasks(parent.id)
                     .any(|t| t.status == TaskStatus::AwaitingClearance)
                 {

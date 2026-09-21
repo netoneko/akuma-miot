@@ -101,6 +101,12 @@ pub mod pallet {
         /// because every nudge costs an LLM turn.
         #[pallet::constant]
         type MaxNudges: Get<u8>;
+        /// How many times an unclaimed offer is re-made to the same assignee
+        /// before the table stops and asks the leader to re-home it. Bounded
+        /// for the same reason nudges are: re-offering forever to a cat that
+        /// will never answer stalls the parent permanently.
+        #[pallet::constant]
+        type MaxReoffers: Get<u8>;
         /// How long a closed parent's rows linger before GC. Its artifact is
         /// kept forever regardless.
         #[pallet::constant]
@@ -284,6 +290,30 @@ pub mod pallet {
             Ok(())
         }
 
+        /// Move a sub-task to a different cat. Leader only.
+        ///
+        /// How a litter recovers from a member that cannot do the job — it
+        /// died, it wedged, or it reported `failed`. Without this an assignee
+        /// holds its sub-task for life, because a requeue deliberately keeps
+        /// `assignee` (the work is still *theirs*, merely unclaimed), and a
+        /// parent can never close while one sub-task is stuck with a cat that
+        /// will never answer.
+        ///
+        /// Not folded into [`Self::update`]'s act enum: that enum is what a
+        /// *worker* does to its own task, and every one of those acts takes
+        /// only text. This is a leader act that takes another account, like
+        /// [`Self::plan`].
+        #[pallet::call_index(5)]
+        #[pallet::weight(Weight::from_parts(15_000, 0))]
+        pub fn reassign(
+            origin: OriginFor<T>,
+            task: TaskId,
+            to: T::AccountId,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            Self::apply(|t, auth, now| t.reassign(&who, auth, task, to.clone(), now), &who)
+        }
+
         /// Install the operator account. Governance/sudo only — this is the
         /// key to the cat house, so it is not something a peer can hand
         /// itself.
@@ -307,6 +337,7 @@ pub mod pallet {
                     work_nag: T::WorkNag::get(),
                     directive_nag: T::DirectiveNag::get(),
                     max_nudges: T::MaxNudges::get(),
+                    max_reoffers: T::MaxReoffers::get(),
                 },
                 limits: Limits {
                     max_text: T::MaxText::get() as usize,

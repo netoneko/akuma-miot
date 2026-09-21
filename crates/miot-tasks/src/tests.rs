@@ -25,6 +25,7 @@ fn cfg() -> Config {
             work_nag: 5,
             directive_nag: 8,
             max_nudges: 3,
+            ..Timers::default()
         },
         limits: Limits::default(),
     }
@@ -393,12 +394,13 @@ fn the_nudge_budget_is_bounded_and_spent_exactly_once() {
     let mut t = TaskTable::new(
         Config {
             timers: Timers {
-                claim_window: 10,
-                lease: 1000,
-                work_nag: 5,
-                directive_nag: 8,
-                max_nudges: 3,
-            },
+            claim_window: 10,
+            lease: 1000,
+            work_nag: 5,
+            directive_nag: 8,
+            max_nudges: 3,
+            ..Timers::default()
+        },
             limits: Limits::default(),
         },
         Some(ROOT),
@@ -498,12 +500,13 @@ fn an_expired_lease_requeues_rather_than_nudging() {
     let mut t = TaskTable::new(
         Config {
             timers: Timers {
-                claim_window: 10,
-                lease: 5,
-                work_nag: 5,
-                directive_nag: 8,
-                max_nudges: 3,
-            },
+            claim_window: 10,
+            lease: 5,
+            work_nag: 5,
+            directive_nag: 8,
+            max_nudges: 3,
+            ..Timers::default()
+        },
             limits: Limits::default(),
         },
         Some(ROOT),
@@ -929,4 +932,140 @@ fn a_parent_task_runs_from_open_to_artifact() {
     assert_eq!(t.get(p).unwrap().status, TaskStatus::Closed);
     assert_eq!(t.artifact(p).unwrap().title, "Does this codebase work?");
     assert!(t.tick(100).is_empty(), "a closed litter goes quiet");
+}
+
+// ---- re-homing: how a litter recovers from a cat that cannot -------------
+
+/// Without a bound, `tick` re-offers to the same assignee forever. The parent
+/// can never close, because an artifact needs every sub-task cleared.
+#[test]
+fn an_offer_is_re_made_a_bounded_number_of_times() {
+    let (mut t, p) = planned();
+    let s = TaskId::sub(p.parent, 1);
+    let mut offers = 0;
+    // Well past max_reoffers worth of claim windows.
+    for n in 1..=20u32 {
+        let fx = t.tick(n * cfg().timers.claim_window);
+        offers += fx
+            .iter()
+            .filter(|e| matches!(e, Effect::Assigned { task, .. } if *task == s))
+            .count();
+    }
+    assert_eq!(
+        offers,
+        cfg().timers.max_reoffers as usize,
+        "the table stops re-offering instead of looping forever"
+    );
+}
+
+/// …and then it asks the leader, because only the leader can move the work.
+#[test]
+fn an_exhausted_offer_asks_the_leader_to_re_home_it() {
+    let (mut t, p) = planned();
+    let mut seen = alloc::vec![];
+    for n in 1..=20u32 {
+        seen.extend(directives(&t.tick(n * cfg().timers.claim_window)));
+    }
+    assert!(
+        seen.contains(&Directive::ReassignNeeded),
+        "a stuck sub-task must reach the leader as a named verb, not a silence"
+    );
+    let _ = p;
+}
+
+/// The missing half of "root is not a worker": `LITTER_WORKFLOW.md` excludes
+/// the operator from being a *re-homing candidate*, which only means anything
+/// if re-homing exists.
+#[test]
+fn a_leader_can_re_home_a_subtask_to_another_cat() {
+    let (mut t, p) = planned();
+    let s = TaskId::sub(p.parent, 1); // tama's
+    let fx = t.reassign(&LEAD, Authority::Leader, s, KURO, 5).unwrap();
+
+    assert!(fx
+        .iter()
+        .any(|e| matches!(e, Effect::Rehomed { from: Some(f), to, .. } if *f == TAMA && *to == KURO)));
+    assert_eq!(assigned_to(&fx, KURO), Some(s));
+    let task = t.get(s).unwrap();
+    assert_eq!(task.assignee, Some(KURO));
+    assert_eq!(task.status, TaskStatus::Pending);
+
+    // And the new cat can now actually claim it, which tama's grip prevented.
+    assert!(t.update(&KURO, Authority::Peer, s, Act::Claim, "", 6).is_ok());
+    assert_eq!(
+        t.update(&TAMA, Authority::Peer, s, Act::Claim, "", 6).unwrap_err(),
+        Error::AlreadyClaimed
+    );
+}
+
+/// The recovery case that matters: a cat reports it cannot do the job, and the
+/// leader hands the work to one that can.
+#[test]
+fn a_failed_result_can_be_re_homed_rather_than_reopened() {
+    let (mut t, p) = planned();
+    let s = TaskId::sub(p.parent, 1);
+    t.update(&TAMA, Authority::Peer, s, Act::Failed, "no toolchain here", 1).unwrap();
+    assert_eq!(t.get(s).unwrap().status, TaskStatus::AwaitingClearance);
+
+    t.reassign(&LEAD, Authority::Leader, s, KURO, 2).unwrap();
+    let task = t.get(s).unwrap();
+    assert_eq!(task.assignee, Some(KURO));
+    assert_eq!(
+        task.outcome, None,
+        "the new holder starts clean rather than inheriting a wrong answer as context"
+    );
+}
+
+#[test]
+fn re_homing_hands_the_new_cat_fresh_budgets() {
+    let (mut t, p) = planned();
+    let s = TaskId::sub(p.parent, 1);
+    for n in 1..=20u32 {
+        t.tick(n * cfg().timers.claim_window);
+    }
+    assert_eq!(t.get(s).unwrap().reoffers, cfg().timers.max_reoffers, "tama's budget is spent");
+
+    t.reassign(&LEAD, Authority::Leader, s, KURO, 500).unwrap();
+    assert_eq!(t.get(s).unwrap().reoffers, 0);
+
+    // kuro gets its own full round of offers.
+    let mut offers = 0;
+    for n in 1..=20u32 {
+        let fx = t.tick(500 + n * cfg().timers.claim_window);
+        offers += fx.iter().filter(|e| matches!(e, Effect::Assigned { to, .. } if *to == KURO)).count();
+    }
+    assert_eq!(offers, cfg().timers.max_reoffers as usize);
+}
+
+#[test]
+fn re_homing_is_leader_only_and_never_to_the_operator() {
+    let (mut t, p) = planned();
+    let s = TaskId::sub(p.parent, 1);
+    assert_eq!(
+        t.reassign(&TAMA, Authority::Peer, s, KURO, 1).unwrap_err(),
+        Error::NotAuthorized
+    );
+    assert_eq!(
+        t.reassign(&LEAD, Authority::Leader, s, ROOT, 1).unwrap_err(),
+        Error::RootNotAssignable
+    );
+    assert_eq!(
+        t.reassign(&LEAD, Authority::Leader, p, KURO, 1).unwrap_err(),
+        Error::WrongKind
+    );
+    assert_eq!(t.get(s).unwrap().assignee, Some(TAMA), "every refusal left it alone");
+}
+
+/// A cleared sub-task is finished. Re-homing one would reopen settled work
+/// behind the leader's own clearance.
+#[test]
+fn a_cleared_subtask_cannot_be_re_homed() {
+    let (mut t, p) = planned();
+    let s = TaskId::sub(p.parent, 1);
+    t.update(&TAMA, Authority::Peer, s, Act::Done, "r", 1).unwrap();
+    t.update(&LEAD, Authority::Leader, s, Act::Clear, "", 2).unwrap();
+    assert_eq!(
+        t.reassign(&LEAD, Authority::Leader, s, KURO, 3).unwrap_err(),
+        Error::WrongStatus
+    );
 }

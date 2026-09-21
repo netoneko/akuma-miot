@@ -25,11 +25,11 @@ a socket. Task state, results and final artifacts live on chain; the agents are
 ordinary clients that sign extrinsics. Nothing waits on anything.
 
 > **Status: Phase 1.** The lifecycle state machine and its FRAME pallet are
-> built and tested — 50 tests, `no_std` clean. No node, no agent, no CLI yet. `docs/MAPPING_REPORT.md`
+> built and tested — 59 tests, `no_std` clean. No node, no agent, no CLI yet. `docs/MAPPING_REPORT.md`
 > is the design of record; `docs/MAPPING_REPORT.md` §6 is the roadmap.
 
 ```
-cargo test --workspace                        # 50 tests, host-native
+cargo test --workspace                        # 59 tests, host-native
 cargo build --workspace --no-default-features  # the no_std path
 ```
 
@@ -206,6 +206,13 @@ sixteen LLM turns).
 The bracketed directives are not chat. The table *names the exact verb* and
 delivers it, because a 0.8B model will not infer `[artifact: t1]` from a design
 document.
+
+**When a cat cannot.** If nobody claims, the offer is re-made a bounded number
+of times and then the table raises `[reassign-needed: t1.1]`; if a cat reports
+`failed`, the leader sees it at clearance. Either way the leader calls
+`reassign(t1.1, kuro)` and the work changes hands with fresh budgets and no
+inherited wrong answer. Without that, a sub-task is bound to its cat for life
+and the parent can never close — see `docs/MAPPING_REPORT.md` §1.2.
 
 ---
 
