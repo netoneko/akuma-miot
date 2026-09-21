@@ -15,12 +15,12 @@ WORKDIR /src
 COPY Cargo.toml Cargo.lock ./
 COPY crates ./crates
 COPY assets ./assets
-RUN cargo build --release -p miot-node -p miot-cat -p miot-sim
+RUN cargo build --release -p miot-node -p miot-cat -p miot
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/miot-node /usr/local/bin/
 COPY --from=build /src/target/release/miot-cat  /usr/local/bin/
-COPY --from=build /src/target/release/miot-sim  /usr/local/bin/
-COPY crates/miot-sim/personas /personas
+COPY --from=build /src/target/release/miot      /usr/local/bin/
+COPY crates/miot/personas /personas

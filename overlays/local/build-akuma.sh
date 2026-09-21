@@ -23,13 +23,13 @@ command -v aarch64-linux-musl-gcc >/dev/null || {
 
 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc \
 CC_aarch64_unknown_linux_musl=aarch64-linux-musl-gcc \
-cargo build --release -p miot-sim --target "$TARGET"
+cargo build --release -p miot --target "$TARGET"
 # The ParityDB probe ships alongside: it answers whether a state database works
 # on the guest, which this project spent two documents speculating about.
 cargo build --release -p miot-store --bin storeprobe --target "$TARGET"
 
 mkdir -p "$(dirname "$OUT")"
-cp "target/$TARGET/release/miot-sim" "$OUT"
+cp "target/$TARGET/release/miot" "$OUT"
 cp "target/$TARGET/release/storeprobe" "$(dirname "$OUT")/storeprobe"
 aarch64-linux-musl-strip "$OUT" "$(dirname "$OUT")/storeprobe"
 

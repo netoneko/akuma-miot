@@ -204,10 +204,54 @@ impl Node {
     }
 }
 
+/// Give an account "provider" standing so [`frame_system::CheckNonce`] will
+/// even look at its nonce.
+///
+/// `CheckNonce::validate_nonce_for_account` refuses **every** account whose
+/// `providers`/`sufficients` are both zero with `InvalidTransaction::Payment`
+/// — that gate exists for `pallet-balances` to say "this account has been
+/// credited, it exists." We have no balances pallet and nothing pays for
+/// anything here, so nothing was ever going to bump those counters, and
+/// every signature — however correct — would be refused forever. Feeding it
+/// a name it does not deserve: an account that has not been given catnip
+/// cannot be nonce-checked, and a litter without balances still needs to
+/// mark who is actually in it.
+fn catnip(who: &AccountId) {
+    frame_system::Pallet::<Runtime>::inc_providers(who);
+}
+
+/// Membership is operator-decided, not open: `MIOT_MEMBERS` (default the
+/// same `1,2,3,4,5` seed convention `MIOT_ROSTER`/`MIOT_SEED` already use)
+/// lists every account that gets [`catnip`] at genesis. Root and leader are
+/// always included even if left out of the list — the operator and the
+/// leader are never accidentally unable to speak.
+fn members(root: &AccountId, leader: &AccountId) -> Vec<AccountId> {
+    let mut out: Vec<AccountId> = std::env::var("MIOT_MEMBERS")
+        .unwrap_or_else(|_| "1,2,3,4,5".to_string())
+        .split(',')
+        .filter_map(|spec| {
+            let spec = spec.trim();
+            if spec.is_empty() {
+                return None;
+            }
+            if let Ok(n) = spec.parse::<u8>() {
+                return Some(miot_keys::Identity::from_seed(&[n; 32]).account());
+            }
+            miot_keys::from_hex(spec).ok()
+        })
+        .collect();
+    for a in [root, leader] {
+        if !out.contains(a) {
+            out.push(a.clone());
+        }
+    }
+    out
+}
+
 fn genesis(root: AccountId, leader: AccountId) -> (sp_io::TestExternalities, H256) {
     use sp_runtime::BuildStorage;
     let mut t = frame_system::GenesisConfig::<Runtime>::default().build_storage().unwrap();
-    pallet_litter::GenesisConfig::<Runtime> { root: Some(root), leader: Some(leader) }
+    pallet_litter::GenesisConfig::<Runtime> { root: Some(root.clone()), leader: Some(leader.clone()) }
         .assimilate_storage(&mut t)
         .unwrap();
     let mut ext: sp_io::TestExternalities = t.into();
@@ -216,8 +260,12 @@ fn genesis(root: AccountId, leader: AccountId) -> (sp_io::TestExternalities, H25
     // `CheckGenesis` binds a signature to, and what `/meta` reports.
     let genesis_hash = H256::zero();
     let first = Header::new(1, Default::default(), Default::default(), genesis_hash, Default::default());
+    let member_list = members(&root, &leader);
     ext.execute_with(|| {
         Executive::initialize_block(&first);
+        for m in &member_list {
+            catnip(m);
+        }
     });
     (ext, genesis_hash)
 }

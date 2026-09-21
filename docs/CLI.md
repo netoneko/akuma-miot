@@ -1,8 +1,15 @@
 # `miot-cli` — requirements
 
-Design of record. Not built yet (Phase 3+). This is the contract the
-implementation has to meet, written before any of it exists so the constraints
-below are decisions rather than accidents.
+Design of record. The interactive shell below (§0-§4, §6-§8) is not built yet
+(Phase 3+). A slice of §5's non-interactive surface **is** built, 2026-09-21 —
+not as a separate `miot-cli` binary but as `miot-sim --rpc <url>`, since
+`miot-sim` already ships as `dist/miot` and already had the REPL (`--chat`)
+and the effect-printer (the scripted mode) this needed reusing rather than
+reinventing. It signs and submits (`--open "<text>"`, `--say "<body>" [--to
+<name>]`), against real endpoints (`/meta`, `/account/:id`, `/submit`) that
+did not exist before either. Not built: `/peers`, `/tasks`, `/plan`,
+`/artifact` as flags, and everything about §0-§4's actual terminal UI. This is
+still the contract for all of that.
 
 ---
 

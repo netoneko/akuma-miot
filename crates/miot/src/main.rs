@@ -98,14 +98,25 @@ pub fn drain() -> Vec<Effect<AccountId>> {
 
 mod chat;
 mod live;
+mod rpc;
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     let args: Vec<String> = std::env::args().collect();
     let is_live = args.iter().any(|a| a == "--live");
     let is_chat = args.iter().any(|a| a == "--chat");
+    let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned());
     println!("{}", include_str!("../../../assets/akuma_40.txt"));
     println!("  {DIM}akuma miot — a litter, against the real runtime, no wasm{OFF}\n");
+    if let Some(node) = arg("--rpc") {
+        let seed = arg("--identity-seed").unwrap_or_else(|| "1".to_string());
+        let roster = arg("--roster").unwrap_or_else(|| "root=1,mimi=2,tama=3,kuro=4,sora=5".to_string());
+        let open = arg("--open");
+        let say = arg("--say");
+        let to = arg("--to");
+        rpc::run(&node, &seed, &roster, open.as_deref(), say.as_deref(), to.as_deref()).await;
+        return;
+    }
     if is_chat || is_live {
         let host = std::env::var("OLLAMA_HOST")
             .unwrap_or_else(|_| "http://localhost:11434".into());

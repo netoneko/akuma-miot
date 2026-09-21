@@ -10,7 +10,7 @@
 
 use miot_llm::{chat_tools, Llm};
 use miot_primitives::Effect;
-use miot_runtime::{Litter, RuntimeOrigin, System};
+use miot_runtime::{AccountId, Litter, RuntimeOrigin, System};
 use polkadot_sdk::*;
 
 use frame_support::traits::OnInitialize;
@@ -28,7 +28,12 @@ pub async fn run(host: &str, model: &str, models: &str) {
     let bench = Bench::new(host, model, models);
     println!("  {DIM}chat — type to the litter, blank line or /quit to leave{OFF}");
     for who in CATS {
-        println!("    {}{:>5}{OFF} {DIM}{}{OFF}", colour(who), name(who), bench.for_cat(who).label());
+        println!(
+            "    {}{:>5}{OFF} {DIM}{}{OFF}",
+            colour(who.clone()),
+            name(who.clone()),
+            bench.for_cat(&who).label()
+        );
     }
     println!("{DIM}──────────────────────────────────────────────────────────────{OFF}");
 
@@ -46,7 +51,7 @@ pub async fn run(host: &str, model: &str, models: &str) {
         }
 
         // `to` is the litter unless the operator tagged somebody.
-        let to = line
+        let to: Option<AccountId> = line
             .split_whitespace()
             .find_map(|w| w.strip_prefix('@'))
             .and_then(account);
@@ -62,14 +67,14 @@ pub async fn run(host: &str, model: &str, models: &str) {
 
         // Anything the chain says woke somebody gets a turn. The waking rule
         // lives in `Effect::wakes`, not here — this loop only obeys it.
-        let mut woke: Vec<u64> = Vec::new();
+        let mut woke: Vec<AccountId> = Vec::new();
         for e in &effects {
             if let Effect::Said { to, from_root, body, .. } = e {
                 if !e.wakes() {
                     continue;
                 }
-                let targets: Vec<u64> = match to {
-                    Some(t) => vec![*t],
+                let targets: Vec<AccountId> = match to {
+                    Some(t) => vec![t.clone()],
                     None if *from_root => CATS.to_vec(),
                     None => vec![],
                 };
@@ -83,20 +88,20 @@ pub async fn run(host: &str, model: &str, models: &str) {
         }
 
         for who in woke {
-            out(&format!("{DIM}  …{}{OFF}\r", name(who)));
+            out(&format!("{DIM}  …{}{OFF}\r", name(who.clone())));
             let prompt = format!(
                 "The operator said to the litter:\n\"{line}\"\n\n\
                  Reply with SendMessage. Keep it to a couple of sentences. \
                  Say who you are and what you are for."
             );
             let turn = match bench
-                .for_cat(who)
-                .turn(&personas(who, who == CATS[0], ""), &prompt, chat_tools())
+                .for_cat(&who)
+                .turn(&personas(who.clone(), who == CATS[0], ""), &prompt, chat_tools())
                 .await
             {
                 Ok(t) => t,
                 Err(e) => {
-                    println!("{DIM}  {} unreachable: {e}{OFF}", name(who));
+                    println!("{DIM}  {} unreachable: {e}{OFF}", name(who.clone()));
                     continue;
                 }
             };
@@ -110,18 +115,18 @@ pub async fn run(host: &str, model: &str, models: &str) {
                 .and_then(|c| c.str("body"))
                 .unwrap_or_else(|| turn.text.trim().to_string());
             if body.is_empty() {
-                println!("{DIM}  {} said nothing{OFF}", name(who));
+                println!("{DIM}  {} said nothing{OFF}", name(who.clone()));
                 continue;
             }
             block += 1;
             let _ = ext.execute_with(|| {
                 System::set_block_number(block);
-                Litter::say(RuntimeOrigin::signed(who), None, body.clone())
+                Litter::say(RuntimeOrigin::signed(who.clone()), None, body.clone())
             });
 
             println!(
                 "{}{:>5}{OFF}  {body}  {DIM}({} tok, {:.0}s){OFF}",
-                colour(who),
+                colour(who.clone()),
                 cat_name(who),
                 turn.tokens,
                 turn.ms as f64 / 1000.0
