@@ -1,0 +1,28 @@
+[workspace]
+resolver = "2"
+members = ["crates/miot-primitives", "crates/miot-tasks"]
+
+# Every crate here builds and tests on the HOST. That is a rule, not an
+# accident: meow's core is unreachable by `cargo test` (raw Linux syscalls
+# throughout, `no_std` end to end), which is why its three testable pieces had
+# to be carved into sibling crates and the rest hides behind an in-binary
+# suite. Anything that cannot be tested on the host is in the wrong crate.
+#
+# `std`-only members (miot-node, miot-cli, …) get excluded from
+# `default-members` when they land, so a bare `cargo build` at this root never
+# tries to cross-compile a `std` binary for a target that has no `std`.
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://github.com/netoneko/akuma-miot"
+
+[workspace.dependencies]
+miot-primitives = { path = "crates/miot-primitives", default-features = false }
+miot-tasks = { path = "crates/miot-tasks", default-features = false }
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

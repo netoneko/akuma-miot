@@ -1,0 +1,18 @@
+[package]
+name = "miot-primitives"
+description = "Shared types for the Akuma Miot task lifecycle — no_std, zero dependencies"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Zero dependencies, on purpose, for as long as it lasts. This crate is named
+# by the pure state machine (`miot-tasks`), by the FRAME pallet, and by every
+# agent; anything it depends on, all three inherit. SCALE/scale-info derives
+# arrive with `pallet-litter` in Phase 1, behind a `codec` feature, so the
+# host test loop never pays for them.
+[dependencies]
+
+[features]
+default = ["std"]
+std = []
