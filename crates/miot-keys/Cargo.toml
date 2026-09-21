@@ -1,17 +1,21 @@
 [package]
 name = "miot-keys"
-description = "Cat identity — ed25519 keys, SSH public key parsing, signed calls"
+description = "Cat identity — the operator's SSH key as a Substrate account"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
-# Same crate and the same feature set meow's `sig.rs` pinned, and the same
-# reason: default-features off sheds the curve25519 precomputed tables (~30 KB)
-# and zeroize. A cat signs once per act, not in a hot loop.
+# No `ed25519-dalek`, no hand-rolled signing envelope. polkadot-sdk is already
+# pulled, and it has all of this: `ed25519::Pair` for keys, `AccountId32` for
+# accounts, `MultiSignature` for signatures, and `UncheckedExtrinsic` plus the
+# `frame-system` transaction extensions for everything a signed call needs.
+#
+# What is left here is the one thing polkadot-sdk does NOT have: reading an
+# OpenSSH `authorized_keys` line, so the operator's identity is the key they
+# already use to reach the machine rather than a new secret.
 [dependencies]
-ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
-rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+polkadot-sdk = { workspace = true, default-features = true, features = ["sp-core", "sp-runtime"] }
 base64 = "0.22"
 
 [dev-dependencies]

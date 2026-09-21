@@ -17,5 +17,9 @@ repository.workspace = true
 [dependencies]
 parity-db = "0.5"
 
+[[bin]]
+name = "storeprobe"
+path = "src/bin/storeprobe.rs"
+
 [dev-dependencies]
 tempfile = "3"

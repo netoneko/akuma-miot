@@ -759,27 +759,46 @@ almost nothing of the kernel.
 polkadot-sdk is moving toward PolkaVM/RISC-V. Confirm `wasmi` is still a
 first-class executor in the pinned version before betting on it.
 
-#### The database — the actual blocker
+#### The database — measured, not argued
 
-A node stores headers, bodies and the **state trie** (a Merkle-Patricia trie
-over all storage — the thing each header's state root commits to).
+A node stores headers, bodies and the state trie. Two backends:
 
 - **RocksDB** — C++. A C++ toolchain to build, LZ4/snappy, heavy mmap, file
   locking, background compaction threads.
-- **ParityDB** — pure Rust, purpose-built, easier to cross-compile. Still
-  mmaps large files and leans on sparse-file support.
+- **ParityDB** — pure Rust, purpose-built, cross-compiles to musl without a C
+  toolchain. This is what `crates/miot-store` uses.
 
-**Correction to an earlier draft of this document.** It claimed an in-memory
-backend would make this a non-issue, on the grounds that
-`LITTER_STATE_MACHINE.md` already says *"State dies with the process — by
-design"*, so ephemerality is the matching semantics. That was rhetorically neat
-and technically wrong: `--tmp` gives a throwaway **directory**, not a
-memory-only store. There is still a real database underneath, so the mmap,
-sparse-file and fsync requirements all remain.
+**Correction, twice over.** Earlier drafts of this document said (a) an
+in-memory backend would make this a non-issue, and (b) the database was "the
+actual blocker" for a node on Akuma. (a) was wrong — `--tmp` gives a throwaway
+*directory*, not a memory-only store, so the mmap and fsync requirements
+remain. (b) was reasoning from requirements rather than from a run, which is
+exactly what this document's own premise is supposed to prevent. Akuma
+advertises `mmap`, demand paging and MMU-backed isolation, and hosts `rustc`,
+which mmaps heavily.
 
-Large mmap plus sparse files on Akuma's ext2-over-virtio-blk is the genuine
-risk, and unlike the executor there is no `wasmi`-shaped escape hatch. It would
-be real filesystem work, or a storage backend written for it.
+So it was measured instead. `cargo run -p miot-store --bin storeprobe` opens a
+store, appends 256 blocks, compacts, rewinds, reopens across a process
+boundary, and writes a 64 KiB value. On macOS and on bare `busybox`
+aarch64 Linux, all seven stages pass.
+
+What it found:
+
+| | |
+|---|---|
+| apparent size | **97.3 MB** (3 × 32 MB index files) |
+| actually allocated | **4.0 MB** |
+| verdict | **genuinely sparse — the files have holes** |
+
+So the concern was right in kind: ParityDB does create sparse, mmap'd files.
+Whether Akuma's ext2-over-virtio-blk handles holes and file-backed mmap of
+them is now **a five-minute test rather than an argument** —
+`overlays/local/build-akuma.sh` cross-compiles `storeprobe` to a 0.8 MB static
+aarch64 binary, and its exit status is the number of stages it completed.
+
+That staged-exit shape is borrowed from `akuma/userspace/amd64/ruststd`, for
+its stated reason: a program that dies at stage 3 has no exit status to report,
+so a truncated log has to name the wall it hit.
 
 #### Net
 
