@@ -3,13 +3,25 @@
 *Miot Kotów* — Polish for "a litter of kittens". **Akuma** is the signature cat,
 and the kernel the litter already runs on.
 
-**v2, 2026-09-21.** Re-cut after two decisions:
+**v3, 2026-09-21.** Re-cut after four decisions, the last of which changed the
+shape of the whole thing:
 
-1. **Everything is `std` + tokio.** The only `no_std` crates in this project
-   are the three that FRAME and wasm force to be.
-2. **meow is not the base.** Akuma Miot builds a new agent. We harvest meow's
-   *semantics and findings* — which were only learnable by running the thing — and none of its
-   structure.
+1. **Everything is `std` + tokio.** The only `no_std` crates are the ones FRAME
+   needs to be.
+2. **meow is not the base.** We harvest its *semantics and findings* — only
+   learnable by running the thing — and none of its structure.
+3. **No separate node, no forkless upgrades.** Every cat carries the chain.
+4. **FRAME, executed natively. No wasm.** Which follows from (3): the blob
+   exists to be swapped on chain for an upgrade, and we do not upgrade. FRAME's
+   runtime side is an ordinary Rust library — `pallet-litter`'s own tests have
+   always run it that way — so the runtime is compiled code and `sc-executor`,
+   the wasm toolchain and the state trie all fall away with it. The upgrade
+   path stays open: add `substrate-wasm-builder` and `impl_runtime_apis!` later
+   and the same runtime compiles to a blob.
+
+**What that bought, measured:** a 1.6 MB binary, a 1 m 39 s cold Linux build,
+and three apt packages. See `RESULTS.md`, which is evidence rather than
+intentions — including live runs against real models.
 
 **nca is out of scope.** Not a base, not a fork, not a harvest source. It stays
 where it is, untouched.
@@ -34,8 +46,15 @@ recovery from a signature*. That last sentence is `ensure_signed(origin)`.
 
 `LITTER_WORKFLOW.md` says it out loud: *"a hand-rolled Tendermint with futures
 bolted onto it."* It is not wrong. **Akuma Miot is that observation taken
-seriously: the consensus half replaced by polkadot-sdk, the agent half rebuilt
-on tokio, and the behavioural findings carried across intact.**
+seriously: the record and its deterministic application become a FRAME runtime,
+the agent half is rebuilt on tokio, and the behavioural findings carry across
+intact.**
+
+The consensus *machinery* — wasm, the trie database, libp2p, GRANDPA — turned
+out to be separable from the part that was worth having. What we kept is
+`ensure_signed`, a state machine that ticks on block cadence and waits for
+nobody, and an ordered record. What we dropped is everything that existed to
+support forkless upgrades we are not doing.
 
 ---
 
@@ -373,12 +392,24 @@ only what nobody else will ever read.
 | **Artifacts** — the final report | chain (§2.6) | ✅ `MaxArtifactLen` 64 KiB | ✅ |
 | **Roster + identity** | chain accounts | ✅ | ✅ |
 | **Working set** — conversation, in-flight futures, aggregation buffer | `miot-bodies`, **agent-local** | ✗ | ⚠️ resumable, not authoritative |
-| **Raw tool output** — full build logs, file contents, transcripts | `miot-bodies`, **agent-local** | ✗ | ✗ — nor should it |
+| **Raw tool output** — full build logs, file contents, transcripts | `miot-bodies`, **agent-local**, one store per cat | ✗ | ✗ — nor should it |
 
-`miot-bodies` is a **local store, not a service.** No HTTP, no content
-addressing across the network, no retention negotiation, no hash verification
-between hosts. It never leaves the machine it was written on, which is exactly
-why it cannot bloat anything.
+`miot-bodies` is a **local store, not a service** — one per cat. No HTTP, no
+content addressing across the network, no retention negotiation, no hash
+verification between hosts. It never leaves the machine it was written on,
+which is exactly why it cannot bloat anything.
+
+Nothing reads another cat's store: not the leader, not the operator, not the
+chain. Tool calls and their results just lie around locally. A cat **may**
+publish one — deliberately, by putting it in a `done` or a message — and pays
+the `MaxResult` cap to do so. Everything it does not publish is nobody else's
+business.
+
+Tool *surfaces* are per-cat as well. One cat may have a shell and another not;
+one model can call tools at all and another cannot. The litter is heterogeneous
+in **capability**, not just in persona — which is the deeper reason re-homing
+exists: a sub-task can be undoable by its assignee for reasons no amount of
+nudging fixes.
 
 The pressure this creates is deliberate and good: **an agent cannot publish a
 40 KB build log.** To get something on chain it has to fit `MaxResultLen`, so

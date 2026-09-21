@@ -24,13 +24,21 @@ A litter of LLM agents that coordinate through a blockchain instead of through
 a socket. Task state, results and final artifacts live on chain; the agents are
 ordinary clients that sign extrinsics. Nothing waits on anything.
 
-> **Status: Phase 1.** The lifecycle state machine and its FRAME pallet are
-> built and tested — 59 tests, `no_std` clean. No node, no agent, no CLI yet. `docs/MAPPING_REPORT.md`
+> **Status: it runs.** 61 tests, and a real litter of models completes a task
+> end to end — on macOS and on Linux in Docker — with every state transition
+> going through the real pallet. See [`docs/RESULTS.md`](docs/RESULTS.md).
+> Still missing: signatures, networking, persistence. `docs/MAPPING_REPORT.md`
 > is the design of record; `docs/MAPPING_REPORT.md` §6 is the roadmap.
 
 ```
-cargo test --workspace                        # 59 tests, host-native
-cargo build --workspace --no-default-features  # the no_std path
+cargo test --workspace              # 61 tests, host-native
+cargo run -p miot-sim               # scripted litter: shows the recovery path
+cargo run -p miot-sim -- --live     # real models, via ollama
+
+docker build -t akuma-miot:sim .    # 1m39s, three apt packages, 1.6 MB binary
+docker run --rm --add-host=host.docker.internal:host-gateway \
+  -e OLLAMA_HOST=http://host.docker.internal:11434 \
+  akuma-miot:sim --live --model qwen3:4b
 ```
 
 ---
@@ -273,12 +281,12 @@ is a compile-time fact rather than a convention: operator mode links no agent.
 | `miot-primitives` | ✅ | **built** | `TaskId`, `TaskStatus`, `Act`, `Effect`, `Limits`, `Timers`. Zero dependencies. |
 | `miot-tasks` | ✅ | **built** | The lifecycle as a pure state machine. No clock, no I/O. |
 | `pallet-litter` | ✅ | **built** | Thin FRAME wrapper: `ensure_signed`, read, apply, write, emit. |
-| `miot-runtime` | ✅ | planned | The chain runtime (wasm). |
+| `miot-runtime` | ✅ | **built** | `construct_runtime!`, 90 lines. Executed **natively** — no wasm. |
 | `miot-node` | ✗ | planned | `sc-*` node, AURA + GRANDPA. |
 | `miot-coord` | ✗ | planned | The same state machine in one tokio task, no chain. |
 | `miot-chain` | ✗ | planned | `subxt`: submit, stream events. |
-| `miot-bodies` | ✗ | planned | Agent-**local** store. Never networked, so it cannot bloat anything. |
-| `miot-llm` | ✗ | planned | Provider layer. |
+| `miot-bodies` | ✗ | planned | Agent-**local** store, on Turso. Tool call results and transcripts, queryable. Never networked. |
+| `miot-llm` | ✗ | **built** | Ollama, native tool calls. |
 | `miot-tools` | ✗ | planned | Async tool registry + aggregator. |
 | `miot-agent` | ✗ | planned | The loop. A library, no I/O of its own. |
 | `miot-cli` | ✗ | planned | The binary. Both modes above. |
@@ -320,6 +328,10 @@ critical path**; every failure drill works at Stage 1.
 
 - `docs/MAPPING_REPORT.md` — the design of record: the findings, the mapping,
   `std`/`no_std`, the roadmap, and what was deliberately not rebuilt.
+- `docs/RESULTS.md` — what has actually run, with numbers. Evidence, not
+  intentions.
+- `docs/references/storage.md` — two stores, not one: files on the chain path,
+  Turso for the agent-local tool-call history. With measured binary costs.
 - `docs/CLI.md` — `miot-cli` requirements. Scrollback is sacred; it is not a
   full-screen TUI.
 - `docs/references/` — one reference per subsystem, once there is behaviour to

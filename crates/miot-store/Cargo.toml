@@ -1,0 +1,21 @@
+[package]
+name = "miot-store"
+description = "The block log — ParityDB, with leader-wins rewind"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# `parity-db` and nothing else. Measured at +373 KB stripped, which is small
+# enough that hand-rolling an append-only file would be trading crash-safety
+# and atomic commits for nothing (docs/references/storage.md).
+#
+# Deliberately NO dependency on the runtime, FRAME, or SCALE: this crate stores
+# opaque bytes keyed by height. That is what lets it be tested natively in
+# milliseconds with no chain in sight, and it means a change to the block
+# format never touches the storage layer.
+[dependencies]
+parity-db = "0.5"
+
+[dev-dependencies]
+tempfile = "3"
