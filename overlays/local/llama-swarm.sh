@@ -18,11 +18,17 @@ MODEL="${MIOT_GGUF:-$HOME/.ollama/models/blobs/sha256-3e4cb14174460404e7a233e531
 PORTS=(8081 8082 8083 8084)
 CATS=(mimi tama kuro sora)
 CTX="${MIOT_CTX:-8192}"
-# Threads PER SERVER. llama-server defaults to ~8 regardless of how many of
-# itself are running, so four servers take ~32 threads on a 12-core box and
-# spend the difference context-switching. Divide the machine instead.
-CORES="$(sysctl -n hw.physicalcpu 2>/dev/null || nproc)"
-THREADS="${MIOT_THREADS:-$(( CORES / 4 > 0 ? CORES / 4 : 1 ))}"
+# Threads PER SERVER. One is enough, and that is measured rather than assumed:
+# with -ngl 99 the GPU does the matmuls and CPU threads only handle sampling,
+# so 4-way concurrent latency was identical at -t 3 (16.54s) and -t 1 (16.28s).
+# llama-server otherwise defaults to ~8 regardless of how many copies are
+# running, which puts 32 threads on a 12-core box for no gain.
+#
+# Measured on the same box: ONE server alone answers in 4.1s, FOUR concurrently
+# in 16.5s — exactly 4x. They serialize on the single GPU. Four servers here buy
+# independent endpoints and per-cat models, NOT throughput; that needs separate
+# machines.
+THREADS="${MIOT_THREADS:-1}"
 NGL="${MIOT_NGL:-99}"
 RUN="${TMPDIR:-/tmp}/miot-llama"
 

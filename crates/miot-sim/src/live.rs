@@ -213,6 +213,13 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
 
         for e in effects {
             // ---- agent loop: takes as long as it takes ----
+            // A turn is stateless, so the chain is the only memory there is.
+            // Every prompt carries the parent question: without it a worker
+            // answers its sub-task in isolation and the leader synthesises
+            // from results it can no longer relate to a question.
+            let question = ext.execute_with(|| {
+                Litter::task(parent).map(|t| t.text).unwrap_or_default()
+            });
             let (who, prompt) = match &e {
                 Effect::Directed { to, task, directive } => {
                     let p = match directive {
@@ -245,8 +252,10 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                                 continue;
                             }
                             format!(
-                                "[clearance-needed: {task}]\nResults awaiting your verdict:\n{}\n\
-                                 For EACH one call TaskUpdate with status=clear if you accept it.",
+                                "[clearance-needed: {task}]\nThe question: {question}\n\n\
+                                 Results awaiting your verdict:\n{}\n\
+                                 For EACH one call TaskUpdate with status=clear if it helps answer \
+                                 the question, or status=reopen with text saying why if it does not.",
                                 results.join("\n")
                             )
                         }
@@ -265,11 +274,13 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                                     .collect::<Vec<_>>()
                             });
                             format!(
-                                "[artifact-needed: {task}]\nEvery sub-task is cleared:\n{}\n\
+                                "[artifact-needed: {task}]\n\
+                                 THE QUESTION YOU MUST ANSWER:\n{question}\n\n\
+                                 What the litter found:\n{}\n\n\
                                  Call TaskUpdate with task={task}, status=artifact, and text set \
-                                 to the final report in markdown. Start it with a '# ' heading \
-                                 that names the question, then give the answer with the \
-                                 reasoning behind it.",
+                                 to the final report in markdown. The '# ' heading must restate \
+                                 THE QUESTION ABOVE, and the report must answer it directly. Do \
+                                 not report on some other topic the material happens to mention.",
                                 results.join("\n")
                             )
                         }
@@ -309,18 +320,27 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                 Effect::Assigned { to, task, what, .. } => (
                     *to,
                     format!(
-                        "[assigned: {task}] {what}\nCall TaskUpdate with task={task} and \
-                         status=claim to take it."
+                        "The litter is working on this question:\n{question}\n\n\
+                         [assigned: {task}] Your part: {what}\n\
+                         Call TaskUpdate with task={task} and status=claim to take it."
                     ),
                 ),
-                Effect::Nudge { to, task, .. } => (
-                    *to,
-                    format!(
-                        "[work: {task}] You claimed this. Do it now and report: call TaskUpdate \
-                         with task={task}, status=done, and text set to what you found about the \
-                         host you run on. If you cannot, use status=failed."
-                    ),
-                ),
+                Effect::Nudge { to, task, .. } => {
+                    let mine = ext.execute_with(|| {
+                        Litter::task(*task).map(|t| t.text).unwrap_or_default()
+                    });
+                    (
+                        *to,
+                        format!(
+                            "The litter is working on this question:\n{question}\n\n\
+                             [work: {task}] You claimed this part: {mine}\n\
+                             Do it now from the MATERIAL in your context. Call TaskUpdate with \
+                             task={task}, status=done, and text set to your findings — concrete, \
+                             citing what in the material supports them. If you cannot, use \
+                             status=failed."
+                        ),
+                    )
+                }
                 Effect::Closed { task, title } => {
                     println!("{DIM}{block:>4}         {task} closed — \"{title}\"{OFF}");
                     closed = true;
