@@ -1,10 +1,13 @@
-# Build and run the litter simulation on Linux.
+# Build and run the litter on Linux.
 #
-# Nothing exotic: there is no wasm toolchain, no wasm32 target, no C++ database
-# and no `sc-executor` in this image, because the runtime is executed natively
-# (see crates/miot-runtime/src/lib.rs). That is the whole reason this Dockerfile
-# is five lines of apt instead of a substrate build environment.
-FROM rust:1.98-slim AS build
+# No wasm toolchain, no wasm32 target, no C++ database, no `sc-executor` —
+# the runtime is executed natively (crates/miot-runtime/src/lib.rs). That is
+# why this is three apt packages rather than a substrate build environment.
+#
+# Both stages pin bookworm ON PURPOSE. A newer builder links against a glibc
+# the runtime image does not have, and the failure is at exec time, not build
+# time: `libc.so.6: version GLIBC_2.39 not found`.
+FROM rust:1.98-slim-bookworm AS build
 RUN apt-get update && apt-get install -y --no-install-recommends \
       build-essential clang pkg-config \
     && rm -rf /var/lib/apt/lists/*
@@ -15,5 +18,7 @@ COPY assets ./assets
 RUN cargo build --release -p miot-sim
 
 FROM debian:bookworm-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 COPY --from=build /src/target/release/miot-sim /usr/local/bin/miot-sim
 ENTRYPOINT ["/usr/local/bin/miot-sim"]

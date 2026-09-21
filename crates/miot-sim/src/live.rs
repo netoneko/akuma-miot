@@ -27,12 +27,14 @@ const ROOT: u64 = 1;
 const MIMI: u64 = 2;
 const TAMA: u64 = 3;
 const KURO: u64 = 4;
+const SORA: u64 = 5;
 
 fn account(n: &str) -> Option<u64> {
     match n.trim().trim_start_matches('@').to_ascii_lowercase().as_str() {
         "mimi" => Some(MIMI),
         "tama" => Some(TAMA),
         "kuro" => Some(KURO),
+        "sora" => Some(SORA),
         _ => None,
     }
 }
@@ -55,30 +57,44 @@ fn host_facts() -> String {
     )
 }
 
+/// Distinct reasoning styles, not decoration.
+///
+/// Lifted from `meow/litter/personas/`, where the litter ran Sherlock, Zenigata,
+/// Tiger and friends against each other. The point is that a litter of four
+/// identical cats produces four identical answers and the leader learns nothing
+/// from having asked twice — heterogeneity is what makes a second opinion an
+/// opinion.
+fn character(who: u64) -> &'static str {
+    match who {
+        MIMI => include_str!("../personas/mimi.md"),
+        TAMA => include_str!("../personas/tama.md"),
+        KURO => include_str!("../personas/kuro.md"),
+        _ => include_str!("../personas/sora.md"),
+    }
+}
+
 fn persona(who: u64, is_leader: bool) -> String {
-    let base = format!(
-        "You are {}, one cat in a litter of AI agents called Akuma Miot. \
-         The litter coordinates over a blockchain: every act you take is an \
+    let protocol = format!(
+        "\nThe litter coordinates over a blockchain: every act you take is an \
          extrinsic, and the chain decides what happens next.\n\n\
          What you can actually observe about the machine you run on:\n{}\n\n\
-         Rules:\n\
+         How this works:\n\
          - You will be told exactly which verb to use. Use it.\n\
          - Task ids look like t1 (a parent) or t1.2 (a sub-task). Never invent one.\n\
-         - Be concise and concrete. Results are size-capped, so say what happened \
-           rather than pasting output.\n",
-        name(who),
+         - Messages reach you automatically. There is no inbox to read, so never \
+           try to read one.\n\
+         - A sub-task stays open until you say otherwise, so never leave one \
+           unanswered.\n\
+         - Results are size-capped: say what happened rather than pasting output.\n",
         host_facts()
     );
-    if is_leader {
-        format!(
-            "{base}\nYou are the LEADER. You split parent tasks into directed \
-             sub-tasks with TaskPlan (all sub-tasks in ONE call), you clear \
-             results you accept, and you write the final report. \
-             The other cats are: tama, kuro. Never assign work to root."
-        )
+    let role = if is_leader {
+        "\nYou are the LEADER. The other cats are: tama, kuro, sora. \
+         Never assign work to root — it has no agent behind it."
     } else {
-        format!("{base}\nYou are a WORKER. You claim what you are given and report back.")
-    }
+        "\nYou are a WORKER. You claim what you are given and report back."
+    };
+    format!("{}{protocol}{role}", character(who))
 }
 
 fn banner(block: u64, who: u64, t: &Turn, what: &str) {
@@ -96,9 +112,47 @@ fn banner(block: u64, who: u64, t: &Turn, what: &str) {
     }
 }
 
-pub async fn run(host: &str, model: &str) {
-    let llm = Ollama::new(host, model);
-    println!("  {DIM}live: {model} via {host}{OFF}");
+/// One model per cat.
+///
+/// `--models mimi=gemma4-yolo-4b:latest,tama=gemma3:4b,...`, or one `--model`
+/// for all of them. A heterogeneous litter is the interesting case: the cats
+/// disagree for reasons other than sampling noise.
+pub struct Bench {
+    by_cat: Vec<(u64, Ollama, String)>,
+    fallback: (Ollama, String),
+}
+
+impl Bench {
+    pub fn new(host: &str, default_model: &str, spec: &str) -> Self {
+        let mut by_cat = Vec::new();
+        for part in spec.split(',').filter(|p| !p.trim().is_empty()) {
+            if let Some((n, m)) = part.split_once('=') {
+                if let Some(a) = account(n) {
+                    by_cat.push((a, Ollama::new(host, m.trim()), m.trim().to_string()));
+                }
+            }
+        }
+        Bench {
+            by_cat,
+            fallback: (Ollama::new(host, default_model), default_model.to_string()),
+        }
+    }
+
+    fn for_cat(&self, who: u64) -> (&Ollama, &str) {
+        self.by_cat
+            .iter()
+            .find(|(a, _, _)| *a == who)
+            .map(|(_, o, m)| (o, m.as_str()))
+            .unwrap_or((&self.fallback.0, self.fallback.1.as_str()))
+    }
+}
+
+pub async fn run(host: &str, model: &str, models: &str) {
+    let bench = Bench::new(host, model, models);
+    println!("  {DIM}live via {host}{OFF}");
+    for who in [MIMI, TAMA, KURO, SORA] {
+        println!("    {}{:>5}{OFF} {DIM}{}{OFF}", colour(who), name(who), bench.for_cat(who).1);
+    }
     println!("{DIM}block  who    what{OFF}");
     println!("{DIM}──────────────────────────────────────────────────────────────{OFF}");
 
@@ -195,7 +249,36 @@ pub async fn run(host: &str, model: &str) {
                                 results.join("\n")
                             )
                         }
-                        Directive::ReassignNeeded | Directive::LeaderElected => continue,
+                        // The chain has given up re-offering and is asking
+                        // the leader to move the work. Dropping this is what
+                        // stalls a parent forever — the protocol surfaced the
+                        // problem correctly and the agent has to answer it.
+                        Directive::ReassignNeeded => {
+                            let stuck = ext.execute_with(|| {
+                                Litter::table()
+                                    .subtasks(*task)
+                                    .filter(|t| t.status == TaskStatus::Pending)
+                                    .map(|t| {
+                                        format!(
+                                            "{} is stuck with {} (offered {} times, never claimed)",
+                                            t.id,
+                                            t.assignee.map(name).unwrap_or("?"),
+                                            t.reoffers
+                                        )
+                                    })
+                                    .collect::<Vec<_>>()
+                            });
+                            if stuck.is_empty() {
+                                continue;
+                            }
+                            format!(
+                                "[reassign-needed: {task}]\n{}\nCall TaskReassign for EACH \
+                                 stuck sub-task, moving it to a cat that is not the one \
+                                 already stuck with it.",
+                                stuck.join("\n")
+                            )
+                        }
+                        Directive::LeaderElected => continue,
                     };
                     (*to, p)
                 }
@@ -223,6 +306,7 @@ pub async fn run(host: &str, model: &str) {
             };
 
             let msgs = [Msg::system(persona(who, who == MIMI)), Msg::user(prompt)];
+            let (llm, _model) = bench.for_cat(who);
             let turn = match llm.turn(&msgs, &task_tools()).await {
                 Ok(t) => t,
                 Err(err) => {
@@ -302,6 +386,18 @@ fn apply(
             match r {
                 Ok(()) => banner(block, who, turn, &format!("TaskPlan {task} → {n} sub-tasks")),
                 Err(e) => banner(block, who, turn, &format!("TaskPlan {task} REFUSED: {e:?}")),
+            }
+        }
+        "TaskReassign" => {
+            let Some(task) = c.str("task").and_then(|t| parse_task(&t)) else { return };
+            let Some(to) = c.str("to").and_then(|n| account(&n)) else {
+                banner(block, who, turn, "TaskReassign: unknown cat");
+                return;
+            };
+            let r = ext.execute_with(|| Litter::reassign(RuntimeOrigin::signed(who), task, to));
+            match r {
+                Ok(()) => banner(block, who, turn, &format!("re-homed {task} → {}", name(to))),
+                Err(e) => banner(block, who, turn, &format!("reassign {task} REFUSED: {e:?}")),
             }
         }
         "TaskUpdate" => {

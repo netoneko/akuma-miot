@@ -154,6 +154,13 @@ pub fn task_tools() -> serde_json::Value {
           "text":{"type":"string","description":"your result, or the report for status=artifact"}
         },"required":["task","status"]}}},
       {"type":"function","function":{
+        "name":"TaskReassign",
+        "description":"Leader only. Move a sub-task to a different cat when its current one cannot do it — it went silent, or it reported failed.",
+        "parameters":{"type":"object","properties":{
+          "task":{"type":"string","description":"the sub-task id, e.g. t1.1"},
+          "to":{"type":"string","description":"the cat to move it to"}
+        },"required":["task","to"]}}},
+      {"type":"function","function":{
         "name":"TaskPlan",
         "description":"Leader only. Split a parent task into directed sub-tasks, all in ONE call.",
         "parameters":{"type":"object","properties":{

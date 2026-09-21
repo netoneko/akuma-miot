@@ -107,7 +107,12 @@ async fn main() {
             .position(|a| a == "--model")
             .and_then(|i| args.get(i + 1).cloned())
             .unwrap_or_else(|| "gemma4-yolo-4b:latest".into());
-        live::run(&host, &model).await;
+        let models = args
+            .iter()
+            .position(|a| a == "--models")
+            .and_then(|i| args.get(i + 1).cloned())
+            .unwrap_or_default();
+        live::run(&host, &model, &models).await;
         return;
     }
     println!("{DIM}block  who    what{OFF}");
