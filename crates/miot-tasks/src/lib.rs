@@ -75,7 +75,13 @@ pub struct Task<A> {
     budget_announced: bool,
     /// Parents: when the outstanding directive is next repeated.
     next_directive: BlockNumber,
-    /// Parents: when the artifact landed. What [`TaskTable::gc`] ages against.
+    /// Parents: consecutive directive nags with no resolving action from the
+    /// leader. Resets whenever the leader (or a holder, making new progress
+    /// the leader needs to see) does something that makes a directive due
+    /// again — never inside the nag loop itself.
+    directive_nudges_used: u8,
+    /// Parents: when the artifact landed, **or** when the table gave up and
+    /// failed it. What [`TaskTable::gc`] ages against either way.
     pub closed_at: Option<BlockNumber>,
 }
 
@@ -198,6 +204,9 @@ impl<A: Clone + Eq> TaskTable<A> {
         self.leader = Some(who.clone());
         for t in self.tasks.iter_mut().filter(|t| t.is_parent()) {
             t.next_directive = now;
+            // A new leader gets a fresh budget — the old one's exhaustion
+            // said nothing about this one.
+            t.directive_nudges_used = 0;
         }
         alloc::vec![Effect::Directed {
             to: who,
@@ -270,6 +279,7 @@ impl<A: Clone + Eq> TaskTable<A> {
             // Due immediately: the leader should be asked to plan on the very
             // next tick, not one nag interval from now.
             next_directive: now,
+            directive_nudges_used: 0,
             closed_at: None,
         });
         Ok((
@@ -348,6 +358,7 @@ impl<A: Clone + Eq> TaskTable<A> {
                 reoffers: 0,
                 budget_announced: false,
                 next_directive: now,
+                directive_nudges_used: 0,
                 closed_at: None,
             });
             effects.push(Effect::Assigned {
@@ -361,6 +372,7 @@ impl<A: Clone + Eq> TaskTable<A> {
         let p = self.task_mut(parent)?;
         p.status = TaskStatus::Planned;
         p.next_directive = now.saturating_add(nag);
+        p.directive_nudges_used = 0;
         Ok(effects)
     }
 
@@ -563,9 +575,11 @@ impl<A: Clone + Eq> TaskTable<A> {
         t.offered_at = None;
         t.nudges_used = 0;
         let parent = id.parent_id();
-        // The leader is wanted now, not one interval from now.
+        // The leader is wanted now, not one interval from now — and this is
+        // new information, so it gets a fresh budget to act on it.
         if let Ok(p) = self.task_mut(parent) {
             p.next_directive = now;
+            p.directive_nudges_used = 0;
         }
         Ok(alloc::vec![Effect::Record {
             who: who.clone(),
@@ -595,6 +609,7 @@ impl<A: Clone + Eq> TaskTable<A> {
         let parent = id.parent_id();
         if let Ok(p) = self.task_mut(parent) {
             p.next_directive = now;
+            p.directive_nudges_used = 0;
         }
         Ok(alloc::vec![Effect::Record {
             who: who.clone(),
@@ -804,7 +819,12 @@ impl<A: Clone + Eq> TaskTable<A> {
         }
 
         // Leader directives. Re-sent on an interval rather than once, because
-        // a dropped directive would otherwise stall a parent permanently.
+        // a dropped directive would otherwise stall a parent permanently —
+        // but bounded, because a leader that never resolves one after
+        // `max_directive_nudges` tries is not going to on try `n+1` either,
+        // and nobody asked for an extension. Exhausting the budget fails the
+        // parent outright rather than going quiet: there is no reassignment
+        // act for a leader, so silence would mean nobody ever hears about it.
         let leader = match self.leader.clone() {
             Some(l) => l,
             None => return effects,
@@ -816,8 +836,21 @@ impl<A: Clone + Eq> TaskTable<A> {
             .filter_map(|t| self.directive_for(t).map(|d| (t.id, d)))
             .collect();
         for (id, directive) in due {
+            let exhausted = self
+                .task_mut(id)
+                .map(|p| p.directive_nudges_used >= cfg.timers.max_directive_nudges)
+                .unwrap_or(false);
+            if exhausted {
+                if let Ok(p) = self.task_mut(id) {
+                    p.status = TaskStatus::Failed;
+                    p.closed_at = Some(now);
+                }
+                effects.push(Effect::Failed { task: id });
+                continue;
+            }
             if let Ok(p) = self.task_mut(id) {
                 p.next_directive = now.saturating_add(cfg.timers.directive_nag);
+                p.directive_nudges_used = p.directive_nudges_used.saturating_add(1);
             }
             effects.push(Effect::Directed {
                 to: leader.clone(),
@@ -875,7 +908,7 @@ impl<A: Clone + Eq> TaskTable<A> {
         let doomed: Vec<u32> = self
             .tasks
             .iter()
-            .filter(|t| t.is_parent() && t.status == TaskStatus::Closed)
+            .filter(|t| t.is_parent() && matches!(t.status, TaskStatus::Closed | TaskStatus::Failed))
             .filter(|t| now.saturating_sub(t.closed_at.unwrap_or(now)) >= keep_for)
             .map(|t| t.id.parent)
             .collect();

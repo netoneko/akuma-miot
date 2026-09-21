@@ -130,6 +130,11 @@ parameter_types! {
     pub const WorkNag: u32 = 30;
     /// 3 min. How often an outstanding leader directive repeats.
     pub const DirectiveNag: u32 = 30;
+    /// How many directive nags a leader gets before the parent is failed
+    /// outright. Same count as a worker's `MaxNudges`, for the same reason:
+    /// a capable model resolves it well inside this budget, and a leader
+    /// that hasn't after this many tries is not going to on the next one.
+    pub const MaxDirectiveNudges: u8 = 3;
     /// A day. How long a closed parent's rows linger before GC; its artifact
     /// is kept forever regardless.
     pub const GcKeepFor: u32 = 14_400;
@@ -142,6 +147,7 @@ impl pallet_litter::Config for Runtime {
     type DirectiveNag = DirectiveNag;
     type MaxNudges = ConstU8<3>;
     type MaxReoffers = ConstU8<3>;
+    type MaxDirectiveNudges = MaxDirectiveNudges;
     type GcKeepFor = GcKeepFor;
     type MaxText = ConstU32<4096>;
     // A forcing function, not a safety rail: a cat that cannot publish a 40 KB

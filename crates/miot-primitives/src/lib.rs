@@ -91,6 +91,11 @@ pub enum TaskStatus {
     Planned,
     /// Parent: artifact submitted, done.
     Closed,
+    /// Parent: the leader never resolved an outstanding directive within its
+    /// nag budget — no automatic retry, no automatic reassignment (there is
+    /// no such act), and nobody asked for an extension. Terminal, like
+    /// `Closed`, but never carries an artifact: nothing was produced.
+    Failed,
     /// Sub-task: offered to its assignee, unclaimed.
     Pending,
     /// Sub-task: claimed, lease running.
@@ -289,6 +294,13 @@ pub enum Effect<A> {
     NudgeBudgetSpent { holder: A, task: TaskId },
     /// Broadcast, non-waking: a parent closed with its artifact.
     Closed { task: TaskId, title: String },
+    /// Broadcast, non-waking: a parent's directive-nag budget ran out and
+    /// the table closed it as [`TaskStatus::Failed`] rather than nag
+    /// forever. Distinct from [`Effect::NudgeBudgetSpent`] (that one leaves
+    /// the sub-task open, riding its lease out) because there is no lease
+    /// and no reassignment act for a *leader* — going quiet would just mean
+    /// nobody ever hears about it. This is the operator's signal instead.
+    Failed { task: TaskId },
     /// Broadcast, non-waking: the leader moved a sub-task to a different cat.
     Rehomed { task: TaskId, from: Option<A>, to: A },
 }
@@ -384,6 +396,22 @@ pub struct Timers {
     /// assignee that will never answer is a loop that pays forever, and the
     /// parent can never close while one sub-task is stuck in it.
     pub max_reoffers: u8,
+    /// How many consecutive unanswered directive nags a leader gets, before
+    /// the table stops asking.
+    ///
+    /// Directives were once sent once and dropped a parent permanently on a
+    /// missed turn (`directives_are_repeated_not_sent_once`) — nagging fixed
+    /// that. But nagging *forever* trades one failure for another: a leader
+    /// that is wedged, dead, or simply wrong about the verb every time
+    /// (observed live: `WrongStatus`/`WrongKind` refusals, repeating) burns
+    /// an LLM turn per nag with nothing to show for it, same as an unbounded
+    /// worker nudge would. There is no automatic "reassign the leader" —
+    /// see [`Effect::DirectiveBudgetSpent`] — so exhausting this budget means
+    /// the parent goes quiet until the operator notices, not that it recovers
+    /// on its own. Bounded anyway, because a quiet parent is cheaper than a
+    /// litter spending its whole token budget on a leader that will never
+    /// get it right.
+    pub max_directive_nudges: u8,
 }
 
 impl Default for Timers {
@@ -395,6 +423,7 @@ impl Default for Timers {
             directive_nag: 20,
             max_nudges: 3,
             max_reoffers: 3,
+            max_directive_nudges: 3,
         }
     }
 }

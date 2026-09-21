@@ -973,6 +973,53 @@ fn an_exhausted_offer_asks_the_leader_to_re_home_it() {
     let _ = p;
 }
 
+/// The leader-side counterpart: a directive with no resolving act — nobody
+/// asked for an extension — fails the parent outright rather than nagging
+/// forever. Unlike a stuck sub-task, there is no reassignment act for a
+/// leader, so silence would mean nobody ever hears about it.
+#[test]
+fn an_unresolved_directive_fails_the_parent_after_its_nag_budget() {
+    let (mut t, p) = opened(); // leader installed, never planned
+    let mut fx = alloc::vec![];
+    let nag = cfg().timers.directive_nag;
+    let max = cfg().timers.max_directive_nudges;
+    // One tick per nag interval, well past the budget.
+    for n in 0..=(max as u32 + 2) {
+        fx.extend(t.tick(n * nag));
+    }
+    let nags = fx.iter().filter(|e| matches!(e, Effect::Directed { .. })).count();
+    assert_eq!(nags as u8, max, "exactly `max_directive_nudges` nags, not one more");
+    assert!(
+        fx.iter().any(|e| matches!(e, Effect::Failed { task } if *task == p)),
+        "the budget running out must be a named effect, not silence"
+    );
+    assert_eq!(t.get(p).unwrap().status, TaskStatus::Failed);
+}
+
+/// A resolving act — the leader actually planning — must reset the budget a
+/// *previous*, unrelated stall used up. Otherwise a leader that was merely
+/// slow once would carry a permanent, shrinking allowance into work it has
+/// not failed at yet.
+#[test]
+fn planning_resets_a_directive_budget_a_earlier_stall_had_spent() {
+    let (mut t, p) = opened();
+    let nag = cfg().timers.directive_nag;
+    let max = cfg().timers.max_directive_nudges;
+    // Burn every nag but the last one, then resolve it.
+    for n in 1..max as u32 {
+        t.tick(n * nag);
+    }
+    t.plan(
+        &LEAD,
+        Authority::Leader,
+        p,
+        &[PlanItem { who: TAMA, what: "run the build".into(), expect: String::new() }],
+        (max as u32) * nag,
+    )
+    .unwrap();
+    assert_eq!(t.get(p).unwrap().status, TaskStatus::Planned, "planning must have been accepted, not refused");
+}
+
 /// The missing half of "root is not a worker": `LITTER_WORKFLOW.md` excludes
 /// the operator from being a *re-homing candidate*, which only means anything
 /// if re-homing exists.

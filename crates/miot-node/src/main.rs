@@ -132,6 +132,9 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
         Effect::Closed { task, title } => {
             json!({"t":"closed","task":task.to_string(),"title":title})
         }
+        Effect::Failed { task } => {
+            json!({"t":"failed","task":task.to_string()})
+        }
         Effect::Rehomed { task, from, to } => {
             json!({"t":"rehomed","task":task.to_string(),"from":from.as_ref().map(to_hex),"to":to_hex(to)})
         }

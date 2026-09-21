@@ -107,6 +107,12 @@ pub mod pallet {
         /// will never answer stalls the parent permanently.
         #[pallet::constant]
         type MaxReoffers: Get<u8>;
+        /// How many consecutive unanswered directive nags a leader gets
+        /// before the table fails the parent outright. There is no
+        /// reassignment act for a leader, so unlike a worker's nudge budget
+        /// running out, exhausting this one is terminal for the parent.
+        #[pallet::constant]
+        type MaxDirectiveNudges: Get<u8>;
         /// How long a closed parent's rows linger before GC. Its artifact is
         /// kept forever regardless.
         #[pallet::constant]
@@ -355,6 +361,7 @@ pub mod pallet {
                     directive_nag: T::DirectiveNag::get(),
                     max_nudges: T::MaxNudges::get(),
                     max_reoffers: T::MaxReoffers::get(),
+                    max_directive_nudges: T::MaxDirectiveNudges::get(),
                 },
                 limits: Limits {
                     max_text: T::MaxText::get() as usize,
