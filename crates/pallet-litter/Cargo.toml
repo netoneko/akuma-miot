@@ -1,0 +1,32 @@
+[package]
+name = "pallet-litter"
+description = "FRAME pallet wrapping the Akuma Miot task lifecycle"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+codec = { package = "parity-scale-codec", version = "3", default-features = false, features = ["derive"] }
+scale-info = { version = "2", default-features = false, features = ["derive"] }
+frame-support = { version = "39", default-features = false }
+frame-system = { version = "39", default-features = false }
+sp-runtime = { version = "40", default-features = false }
+miot-primitives = { workspace = true, features = ["codec"] }
+miot-tasks = { workspace = true, features = ["codec"] }
+
+[dev-dependencies]
+sp-io = { version = "39" }
+sp-core = { version = "35" }
+
+[features]
+default = ["std"]
+std = [
+  "codec/std",
+  "scale-info/std",
+  "frame-support/std",
+  "frame-system/std",
+  "sp-runtime/std",
+  "miot-primitives/std",
+  "miot-tasks/std",
+]

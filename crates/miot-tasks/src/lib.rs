@@ -43,6 +43,8 @@ use miot_primitives::{
 /// discriminator, and the accessors below refuse the wrong kind rather than
 /// quietly doing nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
+#[cfg_attr(feature = "codec", scale_info(skip_type_params(A)))]
 pub struct Task<A> {
     pub id: TaskId,
     pub status: TaskStatus,
@@ -70,6 +72,8 @@ pub struct Task<A> {
     budget_announced: bool,
     /// Parents: when the outstanding directive is next repeated.
     next_directive: BlockNumber,
+    /// Parents: when the artifact landed. What [`TaskTable::gc`] ages against.
+    pub closed_at: Option<BlockNumber>,
 }
 
 impl<A> Task<A> {
@@ -80,6 +84,38 @@ impl<A> Task<A> {
     /// Whether this sub-task has reached a state the leader has accepted.
     pub fn is_cleared(&self) -> bool {
         self.status == TaskStatus::Cleared
+    }
+}
+
+/// The part of the table that belongs in storage.
+///
+/// [`Config`] is deliberately **not** in here. It comes from the pallet's own
+/// `Config` associated constants, so a chain can retune a timer with a runtime
+/// upgrade instead of a migration, and every block does not pay to encode and
+/// decode a struct of constants that never change.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
+#[cfg_attr(feature = "codec", scale_info(skip_type_params(A)))]
+pub struct State<A> {
+    pub tasks: Vec<Task<A>>,
+    pub artifacts: Vec<(TaskId, Artifact<A>)>,
+    /// Parent ids are never reused, even after GC drops the rows.
+    pub next_parent: u32,
+    pub leader: Option<A>,
+    pub root: Option<A>,
+}
+
+impl<A> Default for State<A> {
+    fn default() -> Self {
+        State {
+            tasks: Vec::new(),
+            artifacts: Vec::new(),
+            // Ids start at 1 so `TaskId::default()` — all zeroes — is never a
+            // real task. `set_leader` uses it as the "no task" address.
+            next_parent: 1,
+            leader: None,
+            root: None,
+        }
     }
 }
 
@@ -105,6 +141,34 @@ impl<A: Clone + Eq> TaskTable<A> {
             leader: None,
             root,
             cfg,
+        }
+    }
+
+    /// Rebuild a table from stored state plus the caller's config.
+    ///
+    /// This is the whole of `pallet-litter`'s read half: load, apply, store.
+    /// Nothing is validated on the way in — the state was written by this same
+    /// machine, and re-checking it every block would be paying for a
+    /// corruption that can only come from a bad migration.
+    pub fn from_state(state: State<A>, cfg: Config) -> Self {
+        TaskTable {
+            tasks: state.tasks,
+            artifacts: state.artifacts,
+            next_parent: state.next_parent,
+            leader: state.leader,
+            root: state.root,
+            cfg,
+        }
+    }
+
+    /// Hand the storable part back.
+    pub fn into_state(self) -> State<A> {
+        State {
+            tasks: self.tasks,
+            artifacts: self.artifacts,
+            next_parent: self.next_parent,
+            leader: self.leader,
+            root: self.root,
         }
     }
 
@@ -178,6 +242,10 @@ impl<A: Clone + Eq> TaskTable<A> {
         if text.len() > self.cfg.limits.max_text {
             return Err(Error::TooLong);
         }
+        // One parent plus its eventual sub-tasks has to fit.
+        if self.tasks.len() + 1 + self.cfg.limits.max_subtasks > self.cfg.limits.max_tasks {
+            return Err(Error::TooManyTasks);
+        }
         let id = TaskId::parent(self.next_parent);
         self.next_parent += 1;
         self.tasks.push(Task {
@@ -198,6 +266,7 @@ impl<A: Clone + Eq> TaskTable<A> {
             // Due immediately: the leader should be asked to plan on the very
             // next tick, not one nag interval from now.
             next_directive: now,
+            closed_at: None,
         });
         Ok((
             id,
@@ -254,7 +323,7 @@ impl<A: Clone + Eq> TaskTable<A> {
         let mut effects = alloc::vec![Effect::Planned {
             who: who.clone(),
             task: parent,
-            count: items.len(),
+            count: items.len() as u32,
         }];
         for (i, it) in items.iter().enumerate() {
             let id = TaskId::sub(parent.parent, (i + 1) as u16);
@@ -274,6 +343,7 @@ impl<A: Clone + Eq> TaskTable<A> {
                 nudges_used: 0,
                 budget_announced: false,
                 next_directive: now,
+                closed_at: None,
             });
             effects.push(Effect::Assigned {
                 to: it.who.clone(),
@@ -530,6 +600,7 @@ impl<A: Clone + Eq> TaskTable<A> {
         ));
         let p = self.task_mut(id)?;
         p.status = TaskStatus::Closed;
+        p.closed_at = Some(now);
         Ok(alloc::vec![
             Effect::Record {
                 who: who.clone(),
@@ -676,6 +747,43 @@ impl<A: Clone + Eq> TaskTable<A> {
             }
             _ => None,
         }
+    }
+
+    /// Drop the rows of parents closed at least `keep_for` blocks ago.
+    ///
+    /// This is the **only** kind of compaction that is consensus business
+    /// (`docs/MAPPING_REPORT.md` §2.7). It is deterministic, it is cheap, and
+    /// it is what keeps the table bounded over a long-lived chain.
+    ///
+    /// **Artifacts are never dropped.** They are the durable output the whole
+    /// lifecycle exists to produce; it is the bookkeeping around them that is
+    /// disposable. A closed parent's rows are recoverable from history if
+    /// anyone ever needs them, and its artifact is right here if they do not.
+    ///
+    /// Returns how many rows went. Idempotent.
+    pub fn gc(&mut self, now: BlockNumber, keep_for: BlockNumber) -> usize {
+        let doomed: Vec<u32> = self
+            .tasks
+            .iter()
+            .filter(|t| t.is_parent() && t.status == TaskStatus::Closed)
+            .filter(|t| now.saturating_sub(t.closed_at.unwrap_or(now)) >= keep_for)
+            .map(|t| t.id.parent)
+            .collect();
+        if doomed.is_empty() {
+            return 0;
+        }
+        let before = self.tasks.len();
+        self.tasks.retain(|t| !doomed.contains(&t.id.parent));
+        before - self.tasks.len()
+    }
+
+    /// How many rows are live. The thing [`Limits::max_tasks`] caps.
+    pub fn len(&self) -> usize {
+        self.tasks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.tasks.is_empty()
     }
 
     fn task_mut(&mut self, id: TaskId) -> Result<&mut Task<A>, Error> {

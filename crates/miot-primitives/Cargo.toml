@@ -12,7 +12,12 @@ repository.workspace = true
 # arrive with `pallet-litter` in Phase 1, behind a `codec` feature, so the
 # host test loop never pays for them.
 [dependencies]
+codec = { package = "parity-scale-codec", version = "3", default-features = false, features = ["derive"], optional = true }
+scale-info = { version = "2", default-features = false, features = ["derive"], optional = true }
 
 [features]
 default = ["std"]
-std = []
+# SCALE encoding + type metadata. Off by default so the host test loop never
+# pays for it; `pallet-litter` turns it on.
+codec = ["dep:codec", "dep:scale-info"]
+std = ["codec?/std", "scale-info?/std"]

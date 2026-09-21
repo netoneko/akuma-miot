@@ -7,8 +7,13 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+codec = { package = "parity-scale-codec", version = "3", default-features = false, features = ["derive"], optional = true }
+scale-info = { version = "2", default-features = false, features = ["derive"], optional = true }
 miot-primitives = { workspace = true }
 
 [features]
 default = ["std"]
-std = ["miot-primitives/std"]
+# SCALE encoding + type metadata. Off by default so the host test loop never
+# pays for it; `pallet-litter` turns it on.
+codec = ["dep:codec", "dep:scale-info", "miot-primitives/codec"]
+std = ["miot-primitives/std", "codec?/std", "scale-info?/std"]

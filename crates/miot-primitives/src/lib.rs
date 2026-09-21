@@ -38,6 +38,8 @@ pub type BlockNumber = u32;
 /// runtime storage are a cost and a parsing surface, and every comparison the
 /// table does is on identity.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
+#[cfg_attr(feature = "codec", scale_info(skip_type_params(A)))]
 pub struct TaskId {
     pub parent: u32,
     pub sub: u16,
@@ -81,6 +83,7 @@ impl core::fmt::Display for TaskId {
 /// `Pending → InProgress → AwaitingClearance → Cleared`, with `Reopen` sending
 /// one back to `Pending`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
 pub enum TaskStatus {
     /// Parent: opened, not yet split.
     Open,
@@ -105,6 +108,7 @@ pub enum TaskStatus {
 /// near-identical tool names — and a new act then costs a value instead of new
 /// surface. `Failed` was the first one added that way, and proved it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
 pub enum Act {
     Claim,
     Done,
@@ -136,6 +140,7 @@ impl Act {
 /// the socket can claim to be the operator. Under FRAME this comes from
 /// `ensure_signed`/`ensure_root`, so there is no name to forge.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
 pub enum Authority {
     /// The operator. Outranks the leader. **Never a worker** — see
     /// `Error::RootNotAssignable`.
@@ -148,6 +153,8 @@ pub enum Authority {
 
 /// One line of a leader's plan: who does what, and what "done" looks like.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
+#[cfg_attr(feature = "codec", scale_info(skip_type_params(A)))]
 pub struct PlanItem<A> {
     pub who: A,
     pub what: String,
@@ -160,6 +167,7 @@ pub struct PlanItem<A> {
 /// stored, because whether to retry, reassign or accept a failure is the
 /// leader's decision and not the table's.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
 pub enum Outcome {
     Done(String),
     Failed(String),
@@ -185,6 +193,7 @@ impl Outcome {
 /// are delivered to workers — and re-sends on a nag interval, because a
 /// dropped directive stalls a parent permanently.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
 pub enum Directive {
     /// A parent is open and unsplit.
     PlanNeeded,
@@ -199,6 +208,7 @@ pub enum Directive {
 
 /// Why a sub-task went back into the queue.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
 pub enum Requeue {
     /// Nobody claimed the offer inside the claim window.
     Unclaimed,
@@ -216,6 +226,8 @@ pub enum Requeue {
 /// [`Effect::wakes`] is what an agent's aggregator consults, and it is a
 /// property of the effect rather than a decision each consumer re-derives.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
+#[cfg_attr(feature = "codec", scale_info(skip_type_params(A)))]
 pub enum Effect<A> {
     /// Targeted, waking: a sub-task is offered to its assignee.
     Assigned {
@@ -246,7 +258,7 @@ pub enum Effect<A> {
     Opened { who: A, task: TaskId },
     /// Broadcast, non-waking: a parent was split, atomically, into `count`
     /// directed sub-tasks.
-    Planned { who: A, task: TaskId, count: usize },
+    Planned { who: A, task: TaskId, count: u32 },
     /// Broadcast, non-waking: an accepted act. Refused acts produce no
     /// record — nothing happened, so there is nothing to replicate.
     Record { who: A, task: TaskId, act: Act },
@@ -287,6 +299,7 @@ impl<A> Effect<A> {
 ///
 /// Typed, so no caller has to read prose to find out whether state changed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
 pub enum Error {
     /// The origin may not do this.
     NotAuthorized,
@@ -318,6 +331,8 @@ pub enum Error {
     AlreadySubmitted,
     /// Two agents cannot hold one sub-task.
     AlreadyClaimed,
+    /// The table is full. Close or GC something first.
+    TooManyTasks,
 }
 
 /// Deadlines, in **blocks**.
@@ -368,6 +383,13 @@ pub struct Limits {
     pub max_artifact: usize,
     pub max_title: usize,
     pub max_subtasks: usize,
+    /// Cap on live task rows — parents plus sub-tasks.
+    ///
+    /// Without this the table is *unbounded*: every other limit caps the size
+    /// of one row, and none of them stops rows accumulating forever. A state
+    /// machine destined for runtime storage has to bound its own growth, and
+    /// [`Error::TooManyTasks`] plus GC of closed parents is how.
+    pub max_tasks: usize,
 }
 
 impl Default for Limits {
@@ -378,6 +400,7 @@ impl Default for Limits {
             max_artifact: 64 * 1024,
             max_title: 128,
             max_subtasks: 8,
+            max_tasks: 512,
         }
     }
 }
@@ -396,6 +419,8 @@ pub struct Config {
 /// else** — markdown structure is a convention the agent renders, never a
 /// consensus rule a model could violate.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
+#[cfg_attr(feature = "codec", scale_info(skip_type_params(A)))]
 pub struct Artifact<A> {
     pub title: String,
     pub body: String,

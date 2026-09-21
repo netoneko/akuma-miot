@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/miot-primitives", "crates/miot-tasks"]
+members = ["crates/miot-primitives", "crates/miot-tasks", "crates/pallet-litter"]
 
 # Every crate here builds and tests on the HOST. That is a rule, not an
 # accident: meow's core is unreachable by `cargo test` (raw Linux syscalls
