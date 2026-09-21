@@ -28,7 +28,7 @@ const TAMA: u64 = 3; // works
 const KURO: u64 = 4; // never answers — the cat we have to recover from
 const SORA: u64 = 5; // picks up what kuro dropped
 
-fn name(a: u64) -> &'static str {
+pub fn name(a: u64) -> &'static str {
     match a {
         ROOT => "root",
         MIMI => "mimi",
@@ -41,7 +41,7 @@ fn name(a: u64) -> &'static str {
 
 /// One ANSI colour per sender, reused every time that cat acts — the thing that
 /// makes a scroll of the whole litter's back-and-forth readable at a glance.
-fn colour(a: u64) -> &'static str {
+pub fn colour(a: u64) -> &'static str {
     match a {
         ROOT => "\x1b[97m",
         MIMI => "\x1b[95m",
@@ -52,8 +52,8 @@ fn colour(a: u64) -> &'static str {
     }
 }
 
-const DIM: &str = "\x1b[2m";
-const OFF: &str = "\x1b[0m";
+pub const DIM: &str = "\x1b[2m";
+pub const OFF: &str = "\x1b[0m";
 
 fn who(a: u64) -> String {
     format!("{}{:>5}{}", colour(a), name(a), OFF)
@@ -67,7 +67,7 @@ fn note(block: u64, what: &str) {
     println!("{DIM}{block:>4}         {what}{OFF}");
 }
 
-fn new_ext() -> sp_io::TestExternalities {
+pub fn new_ext() -> sp_io::TestExternalities {
     use sp_runtime::BuildStorage;
     let mut t = frame_system::GenesisConfig::<Runtime>::default().build_storage().unwrap();
     pallet_litter::GenesisConfig::<Runtime> { root: Some(ROOT), leader: Some(MIMI) }
@@ -79,7 +79,7 @@ fn new_ext() -> sp_io::TestExternalities {
 }
 
 /// Everything the chain emitted since the last call.
-fn drain() -> Vec<Effect<u64>> {
+pub fn drain() -> Vec<Effect<u64>> {
     let out: Vec<_> = System::events()
         .into_iter()
         .filter_map(|r| match r.event {
@@ -91,9 +91,25 @@ fn drain() -> Vec<Effect<u64>> {
     out
 }
 
-fn main() {
+mod live;
+
+#[tokio::main(flavor = "current_thread")]
+async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let is_live = args.iter().any(|a| a == "--live");
     println!("{}", include_str!("../../../assets/akuma_40.txt"));
     println!("  {DIM}akuma miot — a litter, against the real runtime, no wasm{OFF}\n");
+    if is_live {
+        let host = std::env::var("OLLAMA_HOST")
+            .unwrap_or_else(|_| "http://localhost:11434".into());
+        let model = args
+            .iter()
+            .position(|a| a == "--model")
+            .and_then(|i| args.get(i + 1).cloned())
+            .unwrap_or_else(|| "gemma4-yolo-4b:latest".into());
+        live::run(&host, &model).await;
+        return;
+    }
     println!("{DIM}block  who    what{OFF}");
     println!("{DIM}─────────────────────────────────────────────────────────────{OFF}");
 
