@@ -4930,6 +4930,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "miot-runtime"
+version = "0.1.0"
+dependencies = [
+ "miot-primitives",
+ "pallet-litter",
+ "parity-scale-codec",
+ "polkadot-sdk",
+ "scale-info",
+]
+
+[[package]]
+name = "miot-sim"
+version = "0.1.0"
+dependencies = [
+ "miot-primitives",
+ "miot-runtime",
+ "pallet-litter",
+ "polkadot-sdk",
+]
+
+[[package]]
 name = "miot-tasks"
 version = "0.1.0"
 dependencies = [

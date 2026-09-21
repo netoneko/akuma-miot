@@ -1,31 +1,30 @@
 [package]
 name = "miot-runtime"
-description = "The Akuma Miot chain runtime — pallet-litter plus consensus"
+description = "The Akuma Miot runtime — FRAME, executed natively. No wasm."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# No `substrate-wasm-builder`, no build.rs, no wasm target.
+#
+# The blob exists in Substrate to be swapped on chain for a forkless upgrade.
+# We do not upgrade, and we do not run `sc-service`, so we execute the runtime
+# as what it already is: ordinary compiled Rust. FRAME's runtime side is a
+# library; the wasm requirement comes entirely from the node.
+#
+# The upgrade path stays open precisely because nothing here is unusual: add
+# `substrate-wasm-builder` and `impl_runtime_apis!` later and this same runtime
+# compiles to a blob.
 [dependencies]
 codec = { package = "parity-scale-codec", version = "3", default-features = false, features = ["derive"] }
 scale-info = { version = "2", default-features = false, features = ["derive"] }
 polkadot-sdk = { workspace = true, features = [
   "frame-executive", "frame-support", "frame-system",
-  "pallet-aura", "pallet-balances", "pallet-grandpa", "pallet-sudo",
-  "pallet-timestamp", "pallet-transaction-payment",
-  "sp-api", "sp-block-builder", "sp-consensus-aura", "sp-consensus-grandpa",
-  "sp-core", "sp-genesis-builder", "sp-inherents", "sp-offchain", "sp-runtime",
-  "sp-session", "sp-transaction-pool", "sp-version",
-  "frame-system-rpc-runtime-api", "pallet-transaction-payment-rpc-runtime-api",
+  "sp-core", "sp-io", "sp-runtime", "sp-version",
 ] }
+miot-primitives = { workspace = true, features = ["codec"] }
 pallet-litter = { path = "../pallet-litter", default-features = false }
-
-# Compiles the runtime to wasm. The blob is what the node executes and what a
-# forkless upgrade would replace — not needed *yet* (nobody is upgrading
-# anything), but it is how polkadot-sdk executes a runtime at all, since native
-# execution was removed. See docs/MAPPING_REPORT.md §5.2.
-[build-dependencies]
-substrate-wasm-builder = { version = "34", optional = true }
 
 [features]
 default = ["std"]
@@ -33,6 +32,6 @@ std = [
   "codec/std",
   "scale-info/std",
   "polkadot-sdk/std",
+  "miot-primitives/std",
   "pallet-litter/std",
-  "dep:substrate-wasm-builder",
 ]

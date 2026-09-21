@@ -696,9 +696,22 @@ other two are the real questions, and they are not equally hard.
 #### Wasm — the solvable half
 
 The runtime *is* a wasm blob, stored on chain as `:code`. That is the forkless
-upgrade mechanism, and it is why native runtime execution was deprecated and
-then removed: "run the STF natively" is not a supported configuration. So the
-node needs an executor.
+upgrade mechanism.
+
+**Correction.** Earlier drafts of this document said native runtime execution
+had been *removed*. It has not. `sc-executor 0.50.0` still exports
+`NativeElseWasmExecutor` and `NativeExecutionDispatch`, carrying a deprecation
+note that reads *"Will be removed at end of 2024"* — still shipping in the 2606
+train, well past its own date.
+
+It does not help, though, and the name says why: *Native-**Else**-Wasm*. It
+dispatches to native only when the native runtime version matches the on-chain
+one and **falls back to `WasmExecutor`** otherwise. The blob is still the
+on-chain `:code`, still the fallback, still built. It skips wasm *execution*
+sometimes; it never skips the wasm *build*.
+
+So inside `sc-service` the blob is unavoidable whatever executor is chosen —
+and outside it, the blob is not needed at all (§5.3).
 
 | | `wasmtime` | `wasmi` |
 |---|---|---|
