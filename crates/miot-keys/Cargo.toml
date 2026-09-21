@@ -1,0 +1,18 @@
+[package]
+name = "miot-keys"
+description = "Cat identity — ed25519 keys, SSH public key parsing, signed calls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# Same crate and the same feature set meow's `sig.rs` pinned, and the same
+# reason: default-features off sheds the curve25519 precomputed tables (~30 KB)
+# and zeroize. A cat signs once per act, not in a hot loop.
+[dependencies]
+ed25519-dalek = { version = "2", default-features = false, features = ["alloc", "rand_core"] }
+rand_core = { version = "0.6", default-features = false, features = ["getrandom"] }
+base64 = "0.22"
+
+[dev-dependencies]
+hex = "0.4"
