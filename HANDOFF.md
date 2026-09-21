@@ -215,6 +215,33 @@ rather than asserted.
   to get the real one (`/home/<user>.guest`, also aliased at
   `/home/<user>.linux` — same inode, either name works once you're inside).
   `limactl copy` itself has no such problem; it takes real guest paths.
+- **A `Failed` parent doesn't normally disappear immediately — `TaskTable::gc`
+  (wired into `pallet-litter`'s `on_initialize`) only drops rows closed at
+  least `GcKeepFor` blocks ago (14,400, i.e. 24h at `BLOCK_MS=6000`).** Not a
+  bug on its own — `gc`'s doc comment calls this "the only kind of compaction
+  that is consensus business," deliberately not instant — but 24h is tuned
+  for a real chain's audit trail, not this dev loop, and it reads as a bug
+  the first time a task lingers in `/tasks` after you thought you were done
+  with it. **`/clear` (`clear_all`) is the one exception, fixed 2026-09-22**:
+  it now calls `gc(now, keep_for: 0)` itself right after failing every open
+  parent, sweeping *every* already-closed/failed parent immediately, not just
+  the ones it just failed — "/clear is a session boundary, nobody needs the
+  old records lying around." `GcKeepFor` itself is unchanged for the natural
+  path (`DirectiveNag` exhaustion) — a parent that failed on its own still
+  sits for 24h unless an operator `/clear`s it away. Revisit `GcKeepFor`
+  itself with the same "measured against LLM turns" treatment the timers
+  above got, if that natural-failure lingering ever gets in the way too.
+- **A `WrongStatus` refusal on `TaskPlan`/`TaskUpdate` can be a race, not a
+  bug** — observed live, 2026-09-22: a parent got a `PlanNeeded` directive,
+  mimi picked it up and spent 45s planning it, and by the time `TaskPlan`
+  landed the same parent had already been `/clear`'d (in that case, by a
+  concurrent operator test against the same node) — so the pallet correctly
+  refused a plan against a task that was no longer `Open`. The refusal is the
+  system working as designed (`docs/MAPPING_REPORT.md` §1.1: "applied-vs-
+  refused must be typed, never sniffed"), not silent corruption. Before
+  chasing this as a state-machine bug, check whether the task's status
+  changed between the directive being issued and the reply landing — `curl
+  .../tasks` or `.../events` will show it.
 
 ---
 
@@ -246,8 +273,17 @@ rather than asserted.
 ## Where to read
 
 - `README.md` — the diagrams and the agent/CLI split
+- `docs/PROTOCOL.md` — **the canonical reference**: vocabulary (`TaskId`,
+  `Act`, `Effect`, `Directive`), the tx/state/event distinction, every
+  dispatchable's authority, the actual tuned timer values (not
+  `miot-primitives`'s generic doc-comment defaults), GC, and which tools an
+  agent gets for which wake reason. Read this before re-deriving any of it
+  from source again.
 - `docs/MAPPING_REPORT.md` — design of record: the findings table (§1.1), the
-  misconception the port introduced (§1.2), what was deliberately not rebuilt
+  misconception the port introduced (§1.2), what was deliberately not
+  rebuilt. §7 has the open, not-yet-built design questions (wayward,
+  participant notification, on-chain tagging) — `docs/PROTOCOL.md` is what's
+  built, this is what's proposed.
 - `docs/RESULTS.md` — **what actually ran, with numbers.** Evidence, not
   intentions. Read this before trusting any claim elsewhere.
 - `docs/CLI.md` — `miot-cli` requirements. Scrollback is sacred.

@@ -433,6 +433,13 @@ impl<A: Clone + Eq> TaskTable<A> {
             }
             effects.push(Effect::Failed { task: id });
         }
+        // A session boundary means it: nobody is coming back to look at a
+        // record the operator just declared dead, so there is no reason to
+        // let it sit out `GcKeepFor` (tuned for a real chain's audit trail,
+        // not a "start fresh" gesture). `keep_for: 0` sweeps every
+        // already-closed/failed parent too, not just the ones failed just
+        // now — `/clear` is "move on," so anything dead is fair game.
+        self.gc(now, 0);
         Ok(effects)
     }
 

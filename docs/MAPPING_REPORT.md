@@ -872,6 +872,24 @@ have required.
     in-flight claim/lease keeps ticking or pauses — `miot-tasks`' existing
     `claim_window` machinery is the likely thing to re-arm on rejoin rather
     than a new mechanism.
+6b. **Any status change — leader, wayward, or (eventually) participant —
+    should wake whoever's affected, not just update storage silently, noted
+    2026-09-22.** There's already a working precedent for this:
+    `TaskTable::set_leader` doesn't just flip `self.leader`, it queues a
+    `Directive::LeaderElected` for the new holder specifically *because* "a
+    leader which is never told it is the leader simply never plans anything"
+    (`crates/miot-tasks/src/lib.rs`, `set_leader`'s doc comment). Wayward/
+    rejoin (#6a) should follow the same shape: going wayward or rejoining is
+    an event the rest of the litter needs told, not a fact only the affected
+    cat's own local state knows — otherwise a leader keeps directing work to
+    a cat that silently can't do it, or nobody ever learns a re-homed task is
+    now somebody else's. Whatever effect #6a ends up emitting for wayward/
+    rejoin should wake the leader specifically (so it can decide whether to
+    reassign), the same way `LeaderElected` wakes the new leader. Participant
+    join/leave has no mechanism to notify *from* yet at all — it's blocked on
+    the same "no real membership growth path" gap `HANDOFF.md`'s "Not yet
+    real" section already names, so that one waits on membership growth being
+    solved first, not on #6a.
 7. **Does `miot-llm` wrap `genai` or define its own trait?** genai normalizes
    14 providers including Ollama, with tool calls, streaming and reasoning
    controls — which is most of `miot-llm`'s job. A thin local trait over it
