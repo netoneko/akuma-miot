@@ -179,11 +179,22 @@ async fn watch(http: &reqwest::Client, node: &str, since: u64, seconds: u64) {
 /// One-shot: sign, submit, watch the log for a few seconds, exit.
 ///
 /// `--rpc <url> [--identity-seed <seed>] [--roster name=seed,...] (--open
-/// "<text>" | --say "<body>" [--to <name>])`. Without `--identity-seed`,
-/// signs as the persisted identity at `~/.akuma/miot/id_ed25519.seed`
-/// (created on first use) — the same account every time, rather than a
-/// fresh throwaway one per call.
-pub async fn run(node: &str, seed: Option<&str>, roster: &str, open: Option<&str>, say: Option<&str>, to: Option<&str>) {
+/// "<text>" | --say "<body>" [--to <name>] | --clear)`. Without
+/// `--identity-seed`, signs as the persisted identity at
+/// `~/.akuma/miot/id_ed25519.seed` (created on first use) — the same
+/// account every time, rather than a fresh throwaway one per call.
+/// `--clear` needs that identity to actually be root on this chain
+/// (`MIOT_ROOT_PUBKEY`/`MIOT_ROOT` on the node) — same authority as
+/// `--open`, just root-only rather than root-or-leader.
+pub async fn run(
+    node: &str,
+    seed: Option<&str>,
+    roster: &str,
+    open: Option<&str>,
+    say: Option<&str>,
+    to: Option<&str>,
+    clear: bool,
+) {
     let identity = match seed {
         Some(s) => Identity::from_seed(&parse_seed(s)),
         None => load_or_create_identity(),
@@ -197,7 +208,9 @@ pub async fn run(node: &str, seed: Option<&str>, roster: &str, open: Option<&str
         Err(_) => 0,
     };
 
-    if let Some(text) = open {
+    if clear {
+        submit(&http, node, &identity, RuntimeCall::Litter(pallet_litter::Call::clear_all {})).await;
+    } else if let Some(text) = open {
         submit(&http, node, &identity, RuntimeCall::Litter(pallet_litter::Call::open { text: text.to_string() })).await;
     } else if let Some(body) = say {
         let to = to.and_then(|n| resolve(roster, n));
@@ -206,7 +219,7 @@ pub async fn run(node: &str, seed: Option<&str>, roster: &str, open: Option<&str
         }
         submit(&http, node, &identity, RuntimeCall::Litter(pallet_litter::Call::say { to, body: body.to_string() })).await;
     } else {
-        println!("  nothing to do — pass --open \"<text>\" or --say \"<body>\"");
+        println!("  nothing to do — pass --open \"<text>\", --say \"<body>\", or --clear");
         return;
     }
 

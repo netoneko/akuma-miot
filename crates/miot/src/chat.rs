@@ -26,7 +26,7 @@ fn out(s: &str) {
 
 pub async fn run(host: &str, model: &str, models: &str) {
     let bench = Bench::new(host, model, models);
-    println!("  {DIM}chat — type to the litter, blank line or /quit to leave{OFF}");
+    println!("  {DIM}chat — type to the litter, /clear to fail every open task, blank line or /quit to leave{OFF}");
     for who in CATS {
         println!(
             "    {}{:>5}{OFF} {DIM}{}{OFF}",
@@ -48,6 +48,18 @@ pub async fn run(host: &str, model: &str, models: &str) {
         let line = line.trim().to_string();
         if line.is_empty() || line == "/quit" {
             break;
+        }
+        if line == "/clear" {
+            block += 1;
+            let effects = ext.execute_with(|| {
+                System::set_block_number(block);
+                Litter::on_initialize(block);
+                Litter::clear_all(RuntimeOrigin::signed(ROOT)).expect("root may clear");
+                drain()
+            });
+            let n = effects.iter().filter(|e| matches!(e, Effect::Failed { .. })).count();
+            println!("{DIM}  cleared {n} open task(s) — starting fresh on this chain{OFF}");
+            continue;
         }
 
         // `to` is the litter unless the operator tagged somebody.

@@ -114,7 +114,8 @@ async fn main() {
         let open = arg("--open");
         let say = arg("--say");
         let to = arg("--to");
-        rpc::run(&node, seed.as_deref(), &roster, open.as_deref(), say.as_deref(), to.as_deref()).await;
+        let clear = args.iter().any(|a| a == "--clear");
+        rpc::run(&node, seed.as_deref(), &roster, open.as_deref(), say.as_deref(), to.as_deref(), clear).await;
         return;
     }
     if is_chat || is_live {

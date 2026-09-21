@@ -16,7 +16,7 @@ is imported**, only its behavioural findings, each now a named test.
 ## Run it
 
 ```bash
-cargo test --workspace                 # 89 tests, host-native, no docker
+cargo test --workspace                 # 91 tests, host-native, no docker
 
 # models on the HOST (Metal). Docker on macOS has no GPU passthrough.
 overlays/local/llama-swarm.sh up       # 4 llama-servers, ports 8081-8084
@@ -110,6 +110,27 @@ any can't be nonce-checked. **Worth reconsidering later:** a minimal
 `pallet-balances` (zero-fee weight, or just used for its provider bookkeeping)
 might be a smaller surface than operator-curated membership lists, especially
 once membership needs to grow without a redeploy.
+
+**`DirectiveNag` was unbounded, and a live run found that the hard way.**
+Watching a real litter close a task, mimi (leader) mis-fired `TaskUpdate`
+(`WrongStatus`/`WrongKind`) a few times on the same directive, and nothing
+would ever have stopped the chain re-nagging it forever — no cap existed,
+unlike a worker's `MaxNudges`. Fixed: `Timers::max_directive_nudges` (default
+3, same count as `MaxNudges`) bounds it, and exhausting the budget now fails
+the parent outright (`TaskStatus::Failed`, `Effect::Failed`) rather than
+going quiet — there's no "reassign the leader" act the way `ReassignNeeded`
+exists for a stuck worker, so silence would mean nobody ever heard about it.
+A resolving action (a result landing, a leadership change, a successful
+`plan`) resets the budget; only the nag loop itself spends it.
+
+**`clear_all` — a session boundary, not a task-lifecycle act.** Operator-only
+extrinsic that fails every currently-open parent at once (reuses
+`TaskStatus::Failed`/`Effect::Failed`, same terminal outcome as the
+directive-nag exhaustion above — the log doesn't distinguish "leader never
+resolved it" from "operator moved on," because downstream nothing needs to).
+`/clear` in `miot --chat`; `--clear` on `miot --rpc`. Task ids keep
+incrementing past a clear — a "session" is just old parents going quiet, not
+a fresh genesis.
 
 **Two stores, not one.** Chain write path is ParityDB (`miot-store`, +373 KB).
 Agent-local tool output is planned for Turso, and is **per-cat and private** —

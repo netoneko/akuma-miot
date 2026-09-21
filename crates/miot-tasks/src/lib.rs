@@ -404,6 +404,38 @@ impl<A: Clone + Eq> TaskTable<A> {
         }])
     }
 
+    /// Fail every currently open parent (`Open` or `Planned`) at once.
+    /// Operator only — this is a session boundary, not a task-lifecycle act,
+    /// same rank as `set_leader`/`set_root`.
+    ///
+    /// Reuses [`TaskStatus::Failed`]/[`Effect::Failed`] rather than a
+    /// separate "cleared" outcome: whether a parent ended with no artifact
+    /// because the leader never resolved a directive or because the
+    /// operator chose to move on, the fact that matters downstream — no
+    /// artifact exists, GC may reclaim the row — is identical either way.
+    /// Sub-tasks are left as they are; nothing reads them once their parent
+    /// is terminal, and `gc` drops them together with it.
+    pub fn clear_all(&mut self, auth: Authority, now: BlockNumber) -> Result<Vec<Effect<A>>, Error> {
+        if auth != Authority::Root {
+            return Err(Error::NotAuthorized);
+        }
+        let open: Vec<TaskId> = self
+            .tasks
+            .iter()
+            .filter(|t| t.is_parent() && matches!(t.status, TaskStatus::Open | TaskStatus::Planned))
+            .map(|t| t.id)
+            .collect();
+        let mut effects = Vec::with_capacity(open.len());
+        for id in open {
+            if let Ok(p) = self.task_mut(id) {
+                p.status = TaskStatus::Failed;
+                p.closed_at = Some(now);
+            }
+            effects.push(Effect::Failed { task: id });
+        }
+        Ok(effects)
+    }
+
     /// Move a sub-task to a different cat. Leader only.
     ///
     /// The missing half of "root is not a worker". `LITTER_WORKFLOW.md` spells

@@ -313,6 +313,15 @@ pub mod pallet {
             Self::apply(|t, auth, _now| t.say(&who, auth, to.clone(), &body), &who)
         }
 
+        /// Fail every open parent at once. Operator only — a session
+        /// boundary ("start fresh on this chain"), not a task-lifecycle act.
+        #[pallet::call_index(7)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn clear_all(origin: OriginFor<T>) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            Self::apply(|t, auth, now| t.clear_all(auth, now), &who)
+        }
+
         /// Move a sub-task to a different cat. Leader only.
         ///
         /// How a litter recovers from a member that cannot do the job — it
