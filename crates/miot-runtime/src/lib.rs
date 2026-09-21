@@ -51,14 +51,36 @@ impl frame_system::Config for Runtime {
 }
 
 parameter_types! {
-    // At 6 s blocks. Every one of these is longer than it looks, because the
-    // unit that matters is an LLM turn: 120-200 s on a 4B model is 20-34
-    // blocks, and the litter's first claim window was *shorter than one turn*.
-    pub const ClaimWindow: u32 = 100;   // 10 min
-    pub const Lease: u32 = 150;         // 15 min
-    pub const WorkNag: u32 = 25;        // 2.5 min
-    pub const DirectiveNag: u32 = 20;   // 2 min
-    pub const GcKeepFor: u32 = 14_400;  // a day
+    // ONE BLOCK IS SIX SECONDS (miot-node's BLOCK_MS), so a wake cadence of
+    // N minutes is N * 10 blocks.
+    //
+    // The unit that actually matters is one LLM turn. Measured on qwen3:4b
+    // across four cats sharing one GPU: a worker turn is 30-120 s and a leader
+    // turn — planning, or clearing several sub-tasks — reached **230 s**.
+    //
+    // A wake cadence shorter than a turn is the failure the litter already
+    // documented and this project then reproduced: at a 20 s directive
+    // interval the leader was re-woken eleven times per turn and spent its
+    // throughput answering directives that were stale before it read them.
+    //
+    // So: **a 3-minute wake cadence**, anchored per task. Each sub-task's nag
+    // and each parent's directive run on their own clock from when that thing
+    // became due, so the litter is not a metronome that wakes everyone at
+    // once — it is N independent timers that mostly stay quiet.
+
+    /// 6 min. An offer nobody claimed is re-made. Two full turns, so an
+    /// assignee that is merely slow is never re-offered out from under itself.
+    pub const ClaimWindow: u32 = 60;
+    /// 15 min. A claimed sub-task whose holder went silent is requeued. Long
+    /// enough that a genuinely working cat is never interrupted.
+    pub const Lease: u32 = 150;
+    /// 3 min. How often a holder is told to get on with it.
+    pub const WorkNag: u32 = 30;
+    /// 3 min. How often an outstanding leader directive repeats.
+    pub const DirectiveNag: u32 = 30;
+    /// A day. How long a closed parent's rows linger before GC; its artifact
+    /// is kept forever regardless.
+    pub const GcKeepFor: u32 = 14_400;
 }
 
 impl pallet_litter::Config for Runtime {

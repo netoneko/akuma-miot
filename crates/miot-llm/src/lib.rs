@@ -20,7 +20,8 @@
 //! syntax, and a tool call arrives already parsed with its arguments in fields.
 
 use genai::adapter::AdapterKind;
-use genai::chat::{ChatMessage, ChatRequest, Tool};
+pub use genai::chat::Tool;
+use genai::chat::{ChatMessage, ChatRequest};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 use std::time::Instant;
