@@ -112,7 +112,20 @@ async fn main() {
             .position(|a| a == "--models")
             .and_then(|i| args.get(i + 1).cloned())
             .unwrap_or_default();
-        live::run(&host, &model, &models).await;
+        let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned());
+        let task = arg("--task").unwrap_or_else(|| {
+            "Where are you running? Each cat reports what it can determine about its host. \
+             Then produce a combined report."
+                .into()
+        });
+        // "Mount" a document into every cat's context.
+        let brief = arg("--brief")
+            .and_then(|p| std::fs::read_to_string(&p).ok())
+            .unwrap_or_default();
+        if !brief.is_empty() {
+            println!("  {DIM}brief: {} chars mounted{OFF}", brief.len());
+        }
+        live::run(&host, &model, &models, &task, &brief).await;
         return;
     }
     println!("{DIM}block  who    what{OFF}");

@@ -1,13 +1,16 @@
 [package]
 name = "miot-llm"
-description = "Provider layer for Akuma Miot cats"
+description = "What a cat thinks with"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
+# `genai` rather than a third hand-rolled adapter. It normalises fifteen
+# providers behind one chat/tool-call API — including `zai` and `bigmodel`,
+# which are GLM, and are on the roadmap. Writing that adapter ourselves was the
+# alternative.
 [dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-serde = { version = "1", features = ["derive"] }
+genai = "0.5"
 serde_json = "1"
 tokio = { version = "1", features = ["time"] }

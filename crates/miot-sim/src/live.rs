@@ -14,7 +14,7 @@
 //! decides the content. That division is the whole reason a small model can
 //! drive this at all.
 
-use miot_llm::{task_tools, Msg, Ollama, Turn};
+use miot_llm::{task_tools, Llm, Turn};
 use miot_primitives::{Act, Directive, Effect, PlanItem, TaskId, TaskStatus};
 use miot_runtime::{Litter, RuntimeOrigin, System};
 use polkadot_sdk::*;
@@ -73,11 +73,10 @@ fn character(who: u64) -> &'static str {
     }
 }
 
-fn persona(who: u64, is_leader: bool) -> String {
+fn persona(who: u64, is_leader: bool, brief: &str) -> String {
     let protocol = format!(
-        "\nThe litter coordinates over a blockchain: every act you take is an \
+        "{}\nThe litter coordinates over a blockchain: every act you take is an \
          extrinsic, and the chain decides what happens next.\n\n\
-         What you can actually observe about the machine you run on:\n{}\n\n\
          How this works:\n\
          - You will be told exactly which verb to use. Use it.\n\
          - Task ids look like t1 (a parent) or t1.2 (a sub-task). Never invent one.\n\
@@ -85,8 +84,9 @@ fn persona(who: u64, is_leader: bool) -> String {
            try to read one.\n\
          - A sub-task stays open until you say otherwise, so never leave one \
            unanswered.\n\
-         - Results are size-capped: say what happened rather than pasting output.\n",
-        host_facts()
+         - Results are size-capped: say what happened rather than pasting output.\n\
+         - Answer the task you were given. Nothing else.\n",
+        ""
     );
     let role = if is_leader {
         "\nYou are the LEADER. The other cats are: tama, kuro, sora. \
@@ -94,7 +94,22 @@ fn persona(who: u64, is_leader: bool) -> String {
     } else {
         "\nYou are a WORKER. You claim what you are given and report back."
     };
-    format!("{}{protocol}{role}", character(who))
+    // The brief is "mounted": whatever the operator pointed us at, verbatim, in
+    // every cat's context. Cheaper and more honest than a read tool for a
+    // question about a document — the cats are debating the same text.
+    let material = if brief.trim().is_empty() {
+        // No brief: the only thing a cat can honestly report on is its own host.
+        format!("\n\nWhat you can observe about the machine you run on:\n{}\n", host_facts())
+    } else {
+        format!(
+            "\n\n--- MATERIAL ---\nThis is the document you are reasoning about. \
+             Every claim you make must come from it.\n\n{brief}\n--- END MATERIAL ---\n"
+        )
+    };
+    // Material goes BEFORE the protocol rules: it is the subject, and burying
+    // it under housekeeping is how a litter ends up answering the wrong
+    // question — which is exactly what happened when host facts sat here.
+    format!("{}{material}{protocol}{role}", character(who))
 }
 
 fn banner(block: u64, who: u64, t: &Turn, what: &str) {
@@ -118,8 +133,8 @@ fn banner(block: u64, who: u64, t: &Turn, what: &str) {
 /// for all of them. A heterogeneous litter is the interesting case: the cats
 /// disagree for reasons other than sampling noise.
 pub struct Bench {
-    by_cat: Vec<(u64, Ollama, String)>,
-    fallback: (Ollama, String),
+    by_cat: Vec<(u64, Llm)>,
+    fallback: Llm,
 }
 
 impl Bench {
@@ -143,31 +158,27 @@ impl Bench {
                         }
                         None => (host.to_string(), target.to_string()),
                     };
-                    let label = format!("{m} @ {}", h.rsplit('/').next().unwrap_or(&h));
-                    by_cat.push((a, Ollama::new(&h, &m), label));
+                    by_cat.push((a, Llm::local(&h, &m)));
                 }
             }
         }
-        Bench {
-            by_cat,
-            fallback: (Ollama::new(host, default_model), default_model.to_string()),
-        }
+        Bench { by_cat, fallback: Llm::local(host, default_model) }
     }
 
-    fn for_cat(&self, who: u64) -> (&Ollama, &str) {
+    fn for_cat(&self, who: u64) -> &Llm {
         self.by_cat
             .iter()
-            .find(|(a, _, _)| *a == who)
-            .map(|(_, o, m)| (o, m.as_str()))
-            .unwrap_or((&self.fallback.0, self.fallback.1.as_str()))
+            .find(|(a, _)| *a == who)
+            .map(|(_, l)| l)
+            .unwrap_or(&self.fallback)
     }
 }
 
-pub async fn run(host: &str, model: &str, models: &str) {
+pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str) {
     let bench = Bench::new(host, model, models);
     println!("  {DIM}live via {host}{OFF}");
     for who in [MIMI, TAMA, KURO, SORA] {
-        println!("    {}{:>5}{OFF} {DIM}{}{OFF}", colour(who), name(who), bench.for_cat(who).1);
+        println!("    {}{:>5}{OFF} {DIM}{}{OFF}", colour(who), name(who), bench.for_cat(who).label());
     }
     println!("{DIM}block  who    what{OFF}");
     println!("{DIM}──────────────────────────────────────────────────────────────{OFF}");
@@ -176,18 +187,14 @@ pub async fn run(host: &str, model: &str, models: &str) {
     let parent = TaskId::parent(1);
 
     let opened = ext.execute_with(|| {
-        Litter::open(
-            RuntimeOrigin::signed(ROOT),
-            "Where are you running? Each cat reports what it can determine about \
-             its host. Then produce a combined report."
-                .into(),
-        )
-        .expect("root may open");
+        Litter::open(RuntimeOrigin::signed(ROOT), task.to_string())
+            .expect("root may open");
         drain()
     });
     drop(opened);
+    let head: String = task.chars().take(64).collect();
     println!(
-        "{DIM}   1{OFF}  {}{:>5}{OFF}  opened t1 — \"where are you running?\"",
+        "{DIM}   1{OFF}  {}{:>5}{OFF}  opened t1 — \"{head}…\"",
         colour(ROOT),
         name(ROOT)
     );
@@ -261,7 +268,8 @@ pub async fn run(host: &str, model: &str, models: &str) {
                                 "[artifact-needed: {task}]\nEvery sub-task is cleared:\n{}\n\
                                  Call TaskUpdate with task={task}, status=artifact, and text set \
                                  to the final report in markdown. Start it with a '# ' heading \
-                                 that names the question. Answer: where is this litter running?",
+                                 that names the question, then give the answer with the \
+                                 reasoning behind it.",
                                 results.join("\n")
                             )
                         }
@@ -321,9 +329,11 @@ pub async fn run(host: &str, model: &str, models: &str) {
                 _ => continue,
             };
 
-            let msgs = [Msg::system(persona(who, who == MIMI)), Msg::user(prompt)];
-            let (llm, _model) = bench.for_cat(who);
-            let turn = match llm.turn(&msgs, &task_tools()).await {
+            let turn = match bench
+                .for_cat(who)
+                .turn(&persona(who, who == MIMI, brief), &prompt, task_tools())
+                .await
+            {
                 Ok(t) => t,
                 Err(err) => {
                     println!("{DIM}{block:>4}         llm error: {err}{OFF}");

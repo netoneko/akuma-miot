@@ -18,6 +18,11 @@ MODEL="${MIOT_GGUF:-$HOME/.ollama/models/blobs/sha256-3e4cb14174460404e7a233e531
 PORTS=(8081 8082 8083 8084)
 CATS=(mimi tama kuro sora)
 CTX="${MIOT_CTX:-8192}"
+# Threads PER SERVER. llama-server defaults to ~8 regardless of how many of
+# itself are running, so four servers take ~32 threads on a 12-core box and
+# spend the difference context-switching. Divide the machine instead.
+CORES="$(sysctl -n hw.physicalcpu 2>/dev/null || nproc)"
+THREADS="${MIOT_THREADS:-$(( CORES / 4 > 0 ? CORES / 4 : 1 ))}"
 NGL="${MIOT_NGL:-99}"
 RUN="${TMPDIR:-/tmp}/miot-llama"
 
@@ -32,10 +37,10 @@ up() {
     # --jinja is REQUIRED for tool calling: without it llama-server serves the
     # plain chat template and silently never emits a tool_calls field.
     nohup llama-server -m "$MODEL" --host 127.0.0.1 --port "$p" \
-      -c "$CTX" -ngl "$NGL" --jinja --parallel 1 \
+      -c "$CTX" -ngl "$NGL" --jinja --parallel 1 -t "$THREADS" \
       > "$RUN/$c.log" 2>&1 &
     echo $! > "$RUN/$c.pid"
-    echo "  $c :$p starting (pid $!)"
+    echo "  $c :$p starting (pid $!, -t $THREADS)"
   done
   echo "waiting for models to load..."
   for p in "${PORTS[@]}"; do
