@@ -137,29 +137,59 @@ No fork-choice rule, no longest-chain, no voting. **The leader's chain is
 canonical by definition.** A cat that finds its log diverging rewinds to the
 fork point, discards its own blocks above it, and adopts the leader's.
 
+**Rewind lands on a compaction, or on genesis — never on an arbitrary height.**
+
 ```
-  ours    1 ── 2 ── 3 ── 4' ── 5' ── 6'      fork_point(theirs) = 3
-  leader  1 ── 2 ── 3 ── 4 ── 5 ── 6 ── 7    rewind_to(3) → state@3, dropped 3
-  after   1 ── 2 ── 3 ── 4 ── 5 ── 6 ── 7
+                  ⬇ last compaction
+  ours    1 ── 2 ─[3]─ 4 ── 5' ── 6' ── 7'     fork_point(theirs) = 4
+  leader  1 ── 2 ─[3]─ 4 ── 5 ── 6 ── 7 ── 8   rewind → 3, state@3, dropped 4
+  after                [3]                     replay leader 4..8
 ```
+
+The rewind is deliberately **coarser than the divergence**. Landing on the exact
+fork point would need a state snapshot at every height; landing on a compaction
+needs one per epoch, and the cost is replaying a few blocks that were never in
+dispute. That keeps the set of recovery targets to a handful of well-known,
+already-agreed heights instead of all of them.
+
+A fork *below* the last compaction lands at genesis — we cannot restore a state
+we no longer hold, so the honest answer is to rebuild rather than pretend. Rare
+by construction: a compaction is a point the litter has already agreed on.
 
 Right for a litter, badly wrong for a public chain — the difference is the
 trust model. This is one operator's swarm in one trust domain, so the expensive
 machinery that exists to stop a leader lying buys nothing.
 
-**A cat can lose work this way**, and that is accepted rather than regretted.
-It is the trade the lease already makes: the protocol prefers the litter making
-progress over preserving one member's contribution. An extrinsic in a discarded
-block is gone; if the cat still cares, it submits it again.
+**A rewind discards records, not work** — which is less costly than it first
+looks, and worth being precise about.
 
-### Why a state snapshot at every height
+What a cat *did* — its tool calls, their output, what it learned — is in its own
+local store, and no rewind touches that. What goes is the on-chain *claim* of
+having done it. Since the compaction state carries the open sub-task list
+forward, the task is still open afterwards: the tick re-offers it and the cat
+resubmits from what it already holds. One cheap turn, not a redo.
 
-Because the state is single-digit KB, and that changes what a rewind costs. A
-chain with a large state must snapshot rarely and replay forward from the
-nearest one. A litter can afford a snapshot per block, which makes rewind
-**O(dropped) with no replay at all** — load the snapshot at the fork point and
-carry on. `prune` keeps that bounded, and a rewind past the pruned floor is
-refused rather than silently wrong.
+The protocol already has the paths. A post-rewind resubmission arrives without
+a claim and possibly past its lease — which is exactly *"accept a submit
+without a claim"* and the late-submit branch, both of which exist because
+losing an answer is worse than losing the ceremony.
+
+The exposure is bounded as well: only blocks above the last compaction can be
+discarded, so the window is one epoch of churn rather than all of history.
+
+### Compaction is the recovery boundary
+
+State is written at compaction and nowhere else, which is what makes the rewind
+target small, known and agreed.
+
+It is also the same boundary meow already had. Its compaction marker was where
+a cold agent stopped paging history (`LITTER_STATE_MACHINE.md`); here it is
+*also* where a diverged cat rewinds to. One concept, two uses, and the second
+falls out of the first rather than being invented.
+
+Compaction drops the blocks below it in the same commit — after a compaction
+there is nothing to replay from below it, so keeping them would be keeping
+history nobody can use.
 
 ## Risks accepted
 

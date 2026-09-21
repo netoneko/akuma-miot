@@ -37,11 +37,24 @@
 //! trust domain"*), so the machinery that exists to stop a leader lying buys
 //! nothing.
 //!
-//! **A cat can lose work this way**, and that is accepted rather than
-//! regretted. It is the trade the lease already makes: the protocol prefers the
-//! litter making progress over preserving one member's contribution. An
-//! extrinsic in a discarded block is gone; if the cat still cares, it submits
-//! it again.
+//! # What a rewind actually costs
+//!
+//! Less than it first appears: it discards **records, not work**.
+//!
+//! What a cat *did* — the tool calls it made, the output it got, what it
+//! learned — lives in its own local store, and no rewind touches that. What is
+//! discarded is the on-chain *claim* of having done it. And because the
+//! compaction state carries the open sub-task list forward, the task is still
+//! open after the rewind: the tick re-offers it, and the cat resubmits from
+//! what it already holds. One cheap turn, not a redo.
+//!
+//! The protocol already has the paths for this. A post-rewind resubmission
+//! arrives without a claim, and possibly past its lease — which is exactly
+//! "accept a submit without a claim" and the late-submit branch, both of which
+//! exist because losing an answer is worse than losing the ceremony.
+//!
+//! The exposure is bounded too: only blocks above the last compaction can be
+//! discarded, so the window is one epoch of churn rather than all of history.
 
 use parity_db::{Db, Options};
 use std::path::Path;
