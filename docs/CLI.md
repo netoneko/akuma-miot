@@ -18,7 +18,8 @@ What exists:
   `name=seed` roster — never on the wire — exactly as this doc anticipated
   ("Implemented today against placeholder u64 accounts; becomes a key lookup
   unchanged when the runtime's `AccountId` switches"). That switch happened;
-  the resolution logic didn't need to.
+  the resolution logic didn't need to. **Multi-tag and explicit broadcast
+  added 2026-09-22** — see the resolution to §8's open question, below.
 - **§2/§0-adjacent, interactive:** `--rpc <url> --chat` reuses the in-process
   `--chat` REPL (`chat.rs`) verbatim — same prompt, same `/quit`, same
   `@name` handling — but every line is a real signed extrinsic and replies
@@ -150,10 +151,21 @@ Rules:
   untagged litter traffic is **non-waking** by default. This is the same
   asymmetry the protocol already enforces — waking four agents per broadcast
   turns one message into four LLM turns.
-- `@litter` explicitly targets everyone and wakes nobody in particular.
+- `@all`, `@cats`, and `@litter` are synonyms that explicitly target
+  everyone — same effect as leaving the message untagged (`to: None` from
+  root already wakes every cat, see `Effect::wakes`), just spelled out. If
+  one of these appears anywhere in the message, any other `@name` tags in
+  the same line are ignored: broadcast already reaches them.
+- Tagging more than one name (`@tama @kuro compare your findings`) tags
+  both — **resolved 2026-09-22, see §8** as one `say` extrinsic per
+  addressee, submitted in the order the tags appear in the line, all
+  carrying the same body. Replies are printed in that same order, as they
+  come back (sequentially in `--chat`'s in-process turn loop; in arrival
+  order off the event log for `--rpc --chat`).
 - An unknown `@name` is a **soft warning printed above the composer, not a
-  refusal** — the message still sends. Refusing to send because a name was
-  misspelled is worse than sending it.
+  refusal** — the message still sends (as a broadcast, since there was
+  nothing valid to target). Refusing to send because a name was misspelled
+  is worse than sending it.
 - Tab-completes from the on-chain roster.
 - **`@name` resolves to a key, not a name.** Once identities are public keys
   (`miot-keys`: an account *is* a 32-byte ed25519 key), a tag is just the
@@ -333,7 +345,17 @@ Copied from Akuma. `assets/` holds the vendored art.
   arriving mid-stream. Options: buffer the turn and print it whole, or print a
   `tama is thinking…` line that is replaced on completion (a rewrite, which
   §0 resists). Leaning toward buffering with a spinner on the composer line.
-- **Tagging semantics on chain.** Is `@tama` a field on the message record, or
-  is it parsed out of the body by each agent? A field is checkable and cannot
-  be misspelled into invisibility; the body is what the model actually writes.
-  Probably both: the CLI parses and sets the field, the agent reads the field.
+- **Tagging semantics on chain — resolved 2026-09-22, for now.** `say`'s `to`
+  field stays `Option<AccountId>` (singular) rather than growing a `Vec` —
+  no pallet/primitives change. Multiple tags in one line become **multiple
+  `say` extrinsics**, one per addressee, same body, submitted in tag order.
+  Chosen over a schema change because it needed no protocol surgery and
+  every existing consumer (`Effect::wakes`, the scripted demo's printer,
+  `--rpc --chat`'s replay) already understands "one `Said` effect, one
+  `to`." Cost: the chain log shows the same body once per addressee rather
+  than once with a list of recipients — a real duplicate, not a rendering
+  choice, so `/history` and replay will show it too. Revisit if that
+  duplication ever matters (e.g. once `miot-store` persists everything
+  forever rather than a bounded ring) — a `Vec<AccountId>` field or a
+  separate `TaggedIn: Vec<TaskId>`-style side table would collapse it back
+  to one record.

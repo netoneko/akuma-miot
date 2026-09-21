@@ -118,6 +118,34 @@ fn resolve(roster: &str, name: &str) -> Option<AccountId> {
     })
 }
 
+const BROADCAST_ALIASES: [&str; 3] = ["all", "cats", "litter"];
+
+/// `@name` tags in a line → who to `say` to, against `roster`. Mirrors
+/// `chat.rs`'s `parse_targets`: `@all`/`@cats`/`@litter` anywhere in the line
+/// forces an explicit broadcast (empty target list); otherwise every
+/// resolved `@name` becomes a target, in appearance order, deduplicated.
+/// Unrecognized tags come back separately as a soft warning, not a refusal.
+fn parse_targets(roster: &str, line: &str) -> (Vec<AccountId>, Vec<String>) {
+    let mut targets = Vec::new();
+    let mut unknown = Vec::new();
+    for word in line.split_whitespace() {
+        let Some(tag) = word.strip_prefix('@') else { continue };
+        let lower = tag.trim_end_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+        if BROADCAST_ALIASES.contains(&lower.as_str()) {
+            return (Vec::new(), Vec::new());
+        }
+        match resolve(roster, &lower) {
+            Some(a) => {
+                if !targets.contains(&a) {
+                    targets.push(a);
+                }
+            }
+            None => unknown.push(lower),
+        }
+    }
+    (targets, unknown)
+}
+
 /// The reverse of [`resolve`] — every roster entry as `(name, account)`, so
 /// replies can be printed by name instead of a bare hex string.
 fn roster_map(roster: &str) -> Vec<(String, AccountId)> {
@@ -326,8 +354,23 @@ pub async fn chat(node: &str, seed: Option<&str>, roster: &str) {
             continue;
         }
 
-        let to = line.split_whitespace().find_map(|w| w.strip_prefix('@')).and_then(|n| resolve(roster, n));
-        submit(&http, node, &identity, RuntimeCall::Litter(pallet_litter::Call::say { to, body: line })).await;
+        let (targets, unknown) = parse_targets(roster, &line);
+        for bad in &unknown {
+            println!("{DIM}  no such cat: @{bad}{OFF}");
+        }
+        if targets.is_empty() {
+            submit(&http, node, &identity, RuntimeCall::Litter(pallet_litter::Call::say { to: None, body: line.clone() })).await;
+        } else {
+            for t in &targets {
+                submit(
+                    &http,
+                    node,
+                    &identity,
+                    RuntimeCall::Litter(pallet_litter::Call::say { to: Some(t.clone()), body: line.clone() }),
+                )
+                .await;
+            }
+        }
         cursor = wait_for_replies(&http, node, cursor, &map, &me, 200).await;
     }
     println!("\n{DIM}  bye.{OFF}");

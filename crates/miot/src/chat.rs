@@ -24,6 +24,35 @@ fn out(s: &str) {
     let _ = std::io::stdout().flush();
 }
 
+const BROADCAST_ALIASES: [&str; 3] = ["all", "cats", "litter"];
+
+/// `@name` tags in a line → who to `say` to. Explicit broadcast
+/// (`@all`/`@cats`/`@litter`) short-circuits to an empty target list (the
+/// caller's "no targets" case already broadcasts); otherwise every resolved
+/// `@name` becomes a target, in the order it appears, deduplicated. Unknown
+/// tags are returned separately — a soft warning, not a refusal (see
+/// docs/CLI.md §2).
+fn parse_targets(line: &str) -> (Vec<AccountId>, Vec<String>) {
+    let mut targets = Vec::new();
+    let mut unknown = Vec::new();
+    for word in line.split_whitespace() {
+        let Some(tag) = word.strip_prefix('@') else { continue };
+        let lower = tag.trim_end_matches(|c: char| !c.is_alphanumeric()).to_ascii_lowercase();
+        if BROADCAST_ALIASES.contains(&lower.as_str()) {
+            return (Vec::new(), Vec::new());
+        }
+        match account(&lower) {
+            Some(a) => {
+                if !targets.contains(&a) {
+                    targets.push(a);
+                }
+            }
+            None => unknown.push(lower),
+        }
+    }
+    (targets, unknown)
+}
+
 pub async fn run(host: &str, model: &str, models: &str) {
     let bench = Bench::new(host, model, models);
     println!("  {DIM}chat — type to the litter, /clear to fail every open task, blank line or /quit to leave{OFF}");
@@ -62,20 +91,36 @@ pub async fn run(host: &str, model: &str, models: &str) {
             continue;
         }
 
-        // `to` is the litter unless the operator tagged somebody.
-        let to: Option<AccountId> = line
-            .split_whitespace()
-            .find_map(|w| w.strip_prefix('@'))
-            .and_then(account);
+        // Targets: `@all`/`@cats`/`@litter` (or no tag at all) means
+        // broadcast; one or more `@name` tags means one `say` per addressee,
+        // in the order they appear. See docs/CLI.md §2/§8.
+        let (targets, unknown) = parse_targets(&line);
+        for bad in &unknown {
+            println!("{DIM}  no such cat: @{bad}{OFF}");
+        }
 
-        block += 1;
-        let effects = ext.execute_with(|| {
-            System::set_block_number(block);
-            Litter::on_initialize(block);
-            Litter::say(RuntimeOrigin::signed(ROOT), to, line.clone())
-                .expect("root may speak");
-            drain()
-        });
+        let mut effects = Vec::new();
+        if targets.is_empty() {
+            block += 1;
+            effects.extend(ext.execute_with(|| {
+                System::set_block_number(block);
+                Litter::on_initialize(block);
+                Litter::say(RuntimeOrigin::signed(ROOT), None, line.clone())
+                    .expect("root may speak");
+                drain()
+            }));
+        } else {
+            for t in &targets {
+                block += 1;
+                effects.extend(ext.execute_with(|| {
+                    System::set_block_number(block);
+                    Litter::on_initialize(block);
+                    Litter::say(RuntimeOrigin::signed(ROOT), Some(t.clone()), line.clone())
+                        .expect("root may speak");
+                    drain()
+                }));
+            }
+        }
 
         // Anything the chain says woke somebody gets a turn. The waking rule
         // lives in `Effect::wakes`, not here — this loop only obeys it.
