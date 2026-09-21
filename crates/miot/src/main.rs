@@ -286,7 +286,7 @@ async fn main() {
                     Effect::Requeued { task, why, .. } => {
                         note(block, &format!("{task} requeued ({why:?})"));
                     }
-                    Effect::Closed { task, title } => {
+                    Effect::Closed { task, title, .. } => {
                         say(block, MIMI, format!("{task} closed — \"{title}\""));
                     }
                     _ => {}

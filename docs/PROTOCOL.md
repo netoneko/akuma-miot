@@ -14,28 +14,42 @@ entry"? All three exist and are deliberately different:
 
 | Layer | What it is | Lives where | Example |
 |---|---|---|---|
-| **Transactions** (extrinsics) | The verbs. Signed calls that *mutate* state. | The wire / a signed `UncheckedExtrinsic` | `Litter::update(task: t1.2, act: Done, text: "...")` |
-| **State** | The nouns. One `Task<A>` row per task, mutated in place by transactions. | `pallet_litter::Litter`, one `StorageValue<State<AccountId>>` | `t1.2`'s `status` field flips `Pending → InProgress → AwaitingClearance` over its life |
-| **Effects** (events) | A derived, append-only *log* of what happened, for observability and for waking agents. | `miot-node`'s in-memory ring (`/events`), not consensus state | `Effect::Directed{to: mimi, task: t1, directive: PlanNeeded}` |
+| **Transactions** (extrinsics) | The verbs. Signed calls that *decide* what happened. | The wire / a signed `UncheckedExtrinsic` | `Litter::update(task: t1.2, act: Done, text: "...")` |
+| **Effects** (events) | The **one and only description of a state change**. Everything below is folded from these. | `TaskTable::apply`'s input; `miot-node`'s in-memory ring (`/events`) for observability | `Effect::Directed{to: mimi, task: t1, directive: PlanNeeded}` |
+| **State** | The nouns. One `Task<A>` row per task — a *materialized view*, never mutated except by folding an effect through `apply`. | `pallet_litter::Litter`, one `StorageValue<State<AccountId>>` | `t1.2`'s `status` field flips `Pending → InProgress → AwaitingClearance` over its life |
 
-A task is **state**, not a transaction and not a log entry. `t1` failing
-means a transaction (`clear_all`, or the block tick exhausting
-`DirectiveNag`) set `t1.status = Failed` in the one `State` blob, *and* — as
-a side effect of that same transaction — appended an `Effect::Failed{task:
-t1}` row to the event log. The log is a *projection*, not the source of
-truth; replaying it is how a fresh reader (a restarted node, `--rpc --chat`'s
-start-up replay) catches up, not how the live node itself decides anything.
+A task is **state**, and state is **a fold over effects** — genuinely, as of
+2026-09-22 (`TaskTable::apply`, `crates/miot-tasks/src/lib.rs`), not just at
+the persistence layer. Every verb (`open`, `plan`, `claim`, `clear_all`,
+`tick`, ...) first *decides* what effects should happen — pure, no
+mutation — then calls `self.apply(effect, now)` once per effect, and
+`apply` is the **only** place `tasks`/`artifacts`/`leader`/`next_parent`
+are ever written. There is no second, parallel "what does dispatch do to
+storage" code path to drift from: live application and replaying a
+persisted effect log call the exact same function.
 
-**One further wrinkle, at the persistence layer specifically**
-(`miot-store`, being wired into `miot-node` as of 2026-09-22 — see
-`HANDOFF.md` item 2): on disk, only raw transactions are kept, plus a full
-`State` snapshot at each compaction point — nothing in between. So
-*reconstructing* state after a restart or a fork rewind genuinely does mean
-replaying transactions (through `Executive::apply_extrinsic`, block by
-block, from the last snapshot forward) — an event-sourced model at the
-storage layer, even though the live in-memory runtime is ordinary mutable
-state, not re-derived per read. Both descriptions are correct; they're about
-different layers.
+This is why `Opened`, `Record`, and `Closed` carry more than the minimum an
+agent's prompt needs (`text`, the result body, the artifact `body`+`author`)
+— `apply` has to reconstruct a `Task`/`Artifact` from *only* the effect, so
+whatever isn't already derivable from current state (a free-text input the
+operator or an agent typed) has to ride along on the effect itself. See
+`replaying_the_effect_log_reproduces_live_state_exactly`
+(`crates/miot-tasks/src/tests.rs`) — it runs a full lifecycle live, replays
+only the resulting effect log into an untouched table, and asserts the two
+are field-for-field identical. That test is the actual guarantee; this
+section is just the explanation.
+
+**One known, deliberate approximation**: a sub-task's `opened_by` (`/tasks`'
+display field only, never read for authorization) is stamped as the
+*assignee* when `apply(Assigned)` creates the row fresh, because the
+`Assigned` effect that creates it doesn't carry who called `plan`. Cheap to
+add a field later if that field ever needs to be exact; not worth it today
+for a value nothing but a listing reads.
+
+**Persistence** (`miot-store` → `miot-node`, HANDOFF item 2, not yet wired):
+the effect log described above *is* what gets persisted and replayed after a
+restart — `apply` was built to make that trustworthy rather than merely
+plausible.
 
 ## Vocabulary (`crates/miot-primitives/src/lib.rs`)
 

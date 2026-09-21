@@ -1116,3 +1116,72 @@ fn a_cleared_subtask_cannot_be_re_homed() {
         Error::WrongStatus
     );
 }
+
+/// The point of `TaskTable::apply`: state is a fold over the effect log, so
+/// folding the same effects into a second, untouched table must reproduce
+/// byte-identical state. This is what makes replaying a persisted event log
+/// after a restart (`miot-store` → `miot-node`, HANDOFF item 2) trustworthy
+/// instead of merely plausible — see `docs/PROTOCOL.md`.
+///
+/// Deliberately exercises every effect-producing path once: open, plan,
+/// claim, submit, clear, a tick-driven reoffer (nobody claims `sub2` in
+/// time), then claim/submit/clear/artifact to close it out.
+#[test]
+fn replaying_the_effect_log_reproduces_live_state_exactly() {
+    let mut live = table();
+    let mut log: Vec<(Effect<A>, BlockNumber)> = Vec::new();
+
+    let fx = live.set_leader(LEAD, 0);
+    log.extend(fx.into_iter().map(|e| (e, 0)));
+
+    let (parent, fx) = live.open(&ROOT, Authority::Root, "debate if this works", 1).unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 1)));
+
+    let fx = live
+        .plan(
+            &LEAD,
+            Authority::Leader,
+            parent,
+            &[
+                PlanItem { who: TAMA, what: "run the build".into(), expect: "pass/fail".into() },
+                PlanItem { who: KURO, what: "audit locking".into(), expect: String::new() },
+            ],
+            2,
+        )
+        .unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 2)));
+
+    let sub1 = TaskId::sub(parent.parent, 1);
+    let sub2 = TaskId::sub(parent.parent, 2);
+
+    let fx = live.update(&TAMA, Authority::Peer, sub1, Act::Claim, "", 3).unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 3)));
+    let fx = live.update(&TAMA, Authority::Peer, sub1, Act::Done, "build passed", 4).unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 4)));
+    let fx = live.update(&LEAD, Authority::Leader, sub1, Act::Clear, "", 5).unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 5)));
+
+    // Nobody claims sub2 in time (claim_window: 10, offered at 2) — the tick
+    // reoffers it. Exercises `Requeue::Unclaimed` + the re-created `Assigned`.
+    let fx = live.tick(30);
+    log.extend(fx.into_iter().map(|e| (e, 30)));
+
+    let fx = live.update(&KURO, Authority::Peer, sub2, Act::Claim, "", 31).unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 31)));
+    let fx = live.update(&KURO, Authority::Peer, sub2, Act::Done, "no locking issues", 32).unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 32)));
+    let fx = live.update(&LEAD, Authority::Leader, sub2, Act::Clear, "", 33).unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 33)));
+    let fx = live.update(&LEAD, Authority::Leader, parent, Act::Artifact, "# it works\n\nyes.", 34).unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 34)));
+
+    // A fresh table, fed nothing but the effect log above — no calls to
+    // `open`/`plan`/`update`/`tick` at all.
+    let mut replayed = table();
+    for (e, now) in &log {
+        replayed.apply(e, *now);
+    }
+
+    assert_eq!(replayed.tasks(), live.tasks(), "replay must reproduce every task row exactly");
+    assert_eq!(replayed.artifact(parent), live.artifact(parent), "including the artifact");
+}

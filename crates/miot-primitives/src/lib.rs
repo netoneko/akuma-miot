@@ -276,13 +276,26 @@ pub enum Effect<A> {
     /// one remark into four LLM turns.
     Said { from: A, to: Option<A>, body: String, from_root: bool },
     /// Broadcast, non-waking: a parent task was opened.
-    Opened { who: A, task: TaskId },
+    ///
+    /// Carries `text` — the task's own description — because this effect is
+    /// also the sole record `TaskTable::apply` has to reconstruct the row
+    /// from: state is rebuilt by folding the effect log, not by re-running
+    /// the original transaction, so anything the table needs that isn't
+    /// already derivable from existing state has to live on the effect. See
+    /// `docs/PROTOCOL.md`'s tx/state/event section.
+    Opened { who: A, task: TaskId, text: String },
     /// Broadcast, non-waking: a parent was split, atomically, into `count`
     /// directed sub-tasks.
     Planned { who: A, task: TaskId, count: u32 },
     /// Broadcast, non-waking: an accepted act. Refused acts produce no
     /// record — nothing happened, so there is nothing to replicate.
-    Record { who: A, task: TaskId, act: Act },
+    ///
+    /// `text` carries `Act::Done`/`Act::Failed`'s result body — the same
+    /// text that becomes `Task::outcome` — empty for every other `Act`. Same
+    /// reason as `Opened::text`: the effect is what `apply` rebuilds state
+    /// from, so the result body has to ride along rather than live only in
+    /// the original (unpersisted) transaction.
+    Record { who: A, task: TaskId, act: Act, text: String },
     /// Broadcast, non-waking: a sub-task returned to the queue.
     Requeued {
         task: TaskId,
@@ -293,7 +306,12 @@ pub enum Effect<A> {
     /// once, then the table stops asking and lets the lease do its work.
     NudgeBudgetSpent { holder: A, task: TaskId },
     /// Broadcast, non-waking: a parent closed with its artifact.
-    Closed { task: TaskId, title: String },
+    ///
+    /// `body` and `author` ride along for the same reason `Opened::text`
+    /// does: `Artifact::body`/`::author` live only here and in `State`, so
+    /// without them `apply` could set the parent `Closed` but could never
+    /// reconstruct the artifact itself on replay.
+    Closed { task: TaskId, title: String, body: String, author: A },
     /// Broadcast, non-waking: a parent's directive-nag budget ran out and
     /// the table closed it as [`TaskStatus::Failed`] rather than nag
     /// forever. Distinct from [`Effect::NudgeBudgetSpent`] (that one leaves
@@ -558,6 +576,7 @@ mod tests {
             who: "tama",
             task: TaskId::sub(1, 1),
             act: Act::Done,
+            text: "done".into(),
         };
         assert!(a.wakes(), "an assignment must wake its assignee");
         assert!(!r.wakes(), "a broadcast record must not wake anyone");

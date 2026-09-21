@@ -134,6 +134,26 @@ resolved it" from "operator moved on," because downstream nothing needs to).
 incrementing past a clear — a "session" is just old parents going quiet, not
 a fresh genesis.
 
+**`miot-tasks` is genuinely event-sourced now, not just observably so —
+2026-09-22.** Every verb used to mutate `self.tasks`/`self.artifacts`/
+`self.leader` directly and return the resulting `Effect`s as a description
+of what it had already done. Now every verb *decides* its effects (pure, no
+mutation) and calls the new `TaskTable::apply(effect, now)` once per effect
+— the **only** place state is written. Live application and replaying a
+persisted effect log after a restart go through the identical function, so
+they cannot quietly drift apart the way two independently-maintained code
+paths eventually do. Forced `Effect::Opened`/`Record`/`Closed` to carry
+`text`/`body`/`author` — fields an agent's prompt never needed but `apply`
+does, since it can only reconstruct a `Task`/`Artifact` from what the effect
+itself carries. Verified by
+`replaying_the_effect_log_reproduces_live_state_exactly`
+(`crates/miot-tasks/src/tests.rs`): runs a full lifecycle live, replays only
+the resulting effects into an untouched table, asserts field-for-field
+equality. `docs/PROTOCOL.md`'s tx/state/event section is the write-up; this
+is what makes wiring `miot-store` into `miot-node` (item 2, below) a matter
+of persisting+replaying the effect log rather than something to re-derive
+from raw transactions.
+
 **Two stores, not one.** Chain write path is ParityDB (`miot-store`, +373 KB).
 Agent-local tool output is planned for Turso, and is **per-cat and private** —
 nothing reads another cat's store.

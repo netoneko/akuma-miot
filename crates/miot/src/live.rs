@@ -352,7 +352,7 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                         ),
                     )
                 }
-                Effect::Closed { task, title } => {
+                Effect::Closed { task, title, .. } => {
                     println!("{DIM}{block:>4}         {task} closed — \"{title}\"{OFF}");
                     closed = true;
                     continue;

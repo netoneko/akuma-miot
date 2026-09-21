@@ -108,7 +108,9 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
         Effect::Said { from, to, body, from_root } => {
             json!({"t":"said","from":to_hex(from),"to":to.as_ref().map(to_hex),"body":body,"root":from_root})
         }
-        Effect::Opened { who, task } => json!({"t":"opened","who":to_hex(who),"task":task.to_string()}),
+        Effect::Opened { who, task, text } => {
+            json!({"t":"opened","who":to_hex(who),"task":task.to_string(),"text":text})
+        }
         Effect::Planned { who, task, count } => {
             json!({"t":"planned","who":to_hex(who),"task":task.to_string(),"count":count})
         }
@@ -121,8 +123,8 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
         Effect::Nudge { to, task, remaining, last } => {
             json!({"t":"nudge","to":to_hex(to),"task":task.to_string(),"remaining":remaining,"last":last})
         }
-        Effect::Record { who, task, act } => {
-            json!({"t":"record","who":to_hex(who),"task":task.to_string(),"act":act.as_str()})
+        Effect::Record { who, task, act, text } => {
+            json!({"t":"record","who":to_hex(who),"task":task.to_string(),"act":act.as_str(),"text":text})
         }
         Effect::Requeued { task, from, why } => {
             json!({"t":"requeued","task":task.to_string(),"from":from.as_ref().map(to_hex),"why":format!("{why:?}")})
@@ -130,8 +132,8 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
         Effect::NudgeBudgetSpent { holder, task } => {
             json!({"t":"budget_spent","holder":to_hex(holder),"task":task.to_string()})
         }
-        Effect::Closed { task, title } => {
-            json!({"t":"closed","task":task.to_string(),"title":title})
+        Effect::Closed { task, title, body, author } => {
+            json!({"t":"closed","task":task.to_string(),"title":title,"body":body,"author":to_hex(author)})
         }
         Effect::Failed { task } => {
             json!({"t":"failed","task":task.to_string()})

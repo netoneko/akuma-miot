@@ -201,18 +201,15 @@ impl<A: Clone + Eq> TaskTable<A> {
         if self.leader.as_ref() == Some(&who) {
             return Vec::new();
         }
-        self.leader = Some(who.clone());
-        for t in self.tasks.iter_mut().filter(|t| t.is_parent()) {
-            t.next_directive = now;
-            // A new leader gets a fresh budget — the old one's exhaustion
-            // said nothing about this one.
-            t.directive_nudges_used = 0;
-        }
-        alloc::vec![Effect::Directed {
+        let effects = alloc::vec![Effect::Directed {
             to: who,
             task: TaskId::default(),
             directive: Directive::LeaderElected,
-        }]
+        }];
+        for e in &effects {
+            self.apply(e, now);
+        }
+        effects
     }
 
     pub fn get(&self, id: TaskId) -> Option<&Task<A>> {
@@ -238,6 +235,239 @@ impl<A: Clone + Eq> TaskTable<A> {
         &self.tasks
     }
 
+    /// Fold one effect into state — the **only** place `tasks`, `artifacts`,
+    /// `leader` and `next_parent` are mutated. Every verb below decides its
+    /// effects first, live, then calls this once per effect; replaying a
+    /// persisted effect log after a restart calls it identically. One code
+    /// path for "what does this effect do to state," so replay can never
+    /// quietly drift from what actually happened — see
+    /// `docs/PROTOCOL.md`'s tx/state/event section for why this exists.
+    ///
+    /// `now` is a parameter rather than baked into every effect because it's
+    /// already known to whoever is folding (the live caller has it in scope;
+    /// replay is iterating block by block) — duplicating it onto every
+    /// variant would be redundant. Timer *durations* (`lease`, `work_nag`,
+    /// ...) come from `self.cfg`, which is fixed at compile time today, so
+    /// replaying against the same binary reproduces the same deadlines.
+    pub fn apply(&mut self, effect: &Effect<A>, now: BlockNumber) {
+        match effect {
+            Effect::Opened { who, task, text } => {
+                self.next_parent = self.next_parent.max(task.parent + 1);
+                self.tasks.push(Task {
+                    id: *task,
+                    status: TaskStatus::Open,
+                    text: text.clone(),
+                    expect: String::new(),
+                    assignee: None,
+                    holder: None,
+                    outcome: None,
+                    opened_by: who.clone(),
+                    opened_at: now,
+                    offered_at: None,
+                    lease_until: None,
+                    next_nag: None,
+                    nudges_used: 0,
+                    reoffers: 0,
+                    budget_announced: false,
+                    next_directive: now,
+                    directive_nudges_used: 0,
+                    closed_at: None,
+                });
+            }
+            Effect::Planned { task, .. } => {
+                let nag = self.cfg.timers.directive_nag;
+                if let Ok(p) = self.task_mut(*task) {
+                    p.status = TaskStatus::Planned;
+                    p.next_directive = now.saturating_add(nag);
+                    p.directive_nudges_used = 0;
+                }
+            }
+            Effect::Assigned { to, task, what, expect } => {
+                if let Ok(t) = self.task_mut(*task) {
+                    t.assignee = Some(to.clone());
+                    t.status = TaskStatus::Pending;
+                    t.text = what.clone();
+                    t.expect = expect.clone();
+                    t.offered_at = Some(now);
+                } else {
+                    // First offer: `plan` doesn't create sub-task rows
+                    // itself any more, this does. `opened_by` has no
+                    // functional role (display only, `/tasks`'s
+                    // "opened_by") and the leader who planned isn't on this
+                    // effect, so it's approximated as the assignee —
+                    // harmless; add a field here if that ever needs to be
+                    // exact.
+                    self.tasks.push(Task {
+                        id: *task,
+                        status: TaskStatus::Pending,
+                        text: what.clone(),
+                        expect: expect.clone(),
+                        assignee: Some(to.clone()),
+                        holder: None,
+                        outcome: None,
+                        opened_by: to.clone(),
+                        opened_at: now,
+                        offered_at: Some(now),
+                        lease_until: None,
+                        next_nag: None,
+                        nudges_used: 0,
+                        reoffers: 0,
+                        budget_announced: false,
+                        next_directive: now,
+                        directive_nudges_used: 0,
+                        closed_at: None,
+                    });
+                }
+            }
+            Effect::Directed { to, task, directive } => {
+                if *directive == Directive::LeaderElected {
+                    self.leader = Some(to.clone());
+                    for t in self.tasks.iter_mut().filter(|t| t.is_parent()) {
+                        t.next_directive = now;
+                        t.directive_nudges_used = 0;
+                    }
+                } else {
+                    let nag = self.cfg.timers.directive_nag;
+                    if let Ok(p) = self.task_mut(*task) {
+                        p.next_directive = now.saturating_add(nag);
+                        p.directive_nudges_used = p.directive_nudges_used.saturating_add(1);
+                    }
+                }
+            }
+            Effect::Nudge { task, remaining, .. } => {
+                let work_nag = self.cfg.timers.work_nag;
+                let max = self.cfg.timers.max_nudges;
+                if let Ok(t) = self.task_mut(*task) {
+                    t.nudges_used = max.saturating_sub(*remaining);
+                    t.next_nag = Some(now.saturating_add(work_nag));
+                }
+            }
+            Effect::Record { who, task, act, text } => match act {
+                Act::Claim => {
+                    let (lease, work_nag) = (self.cfg.timers.lease, self.cfg.timers.work_nag);
+                    if let Ok(t) = self.task_mut(*task) {
+                        t.status = TaskStatus::InProgress;
+                        t.holder = Some(who.clone());
+                        t.lease_until = Some(now.saturating_add(lease));
+                        t.next_nag = Some(now.saturating_add(work_nag));
+                        t.nudges_used = 0;
+                        t.reoffers = 0;
+                        t.budget_announced = false;
+                        t.offered_at = None;
+                    }
+                }
+                Act::Done | Act::Failed => {
+                    let outcome = if *act == Act::Failed {
+                        Outcome::Failed(text.clone())
+                    } else {
+                        Outcome::Done(text.clone())
+                    };
+                    let parent = task.parent_id();
+                    if let Ok(t) = self.task_mut(*task) {
+                        t.status = TaskStatus::AwaitingClearance;
+                        t.outcome = Some(outcome);
+                        t.holder = Some(who.clone());
+                        t.lease_until = None;
+                        t.next_nag = None;
+                        t.offered_at = None;
+                        t.nudges_used = 0;
+                    }
+                    if let Ok(p) = self.task_mut(parent) {
+                        p.next_directive = now;
+                        p.directive_nudges_used = 0;
+                    }
+                }
+                Act::Clear => {
+                    let parent = task.parent_id();
+                    if let Ok(t) = self.task_mut(*task) {
+                        t.status = TaskStatus::Cleared;
+                    }
+                    if let Ok(p) = self.task_mut(parent) {
+                        p.next_directive = now;
+                        p.directive_nudges_used = 0;
+                    }
+                }
+                Act::Reopen => {
+                    if let Ok(t) = self.task_mut(*task) {
+                        t.status = TaskStatus::Pending;
+                        t.outcome = None;
+                        t.holder = None;
+                        t.offered_at = Some(now);
+                        t.lease_until = None;
+                        t.next_nag = None;
+                        t.nudges_used = 0;
+                        t.budget_announced = false;
+                    }
+                }
+                // The state change lives on the accompanying `Closed`
+                // effect instead — see `commit_artifact`.
+                Act::Artifact => {}
+            },
+            Effect::Requeued { task, why, .. } => match why {
+                Requeue::Unclaimed => {
+                    if let Ok(t) = self.task_mut(*task) {
+                        t.offered_at = Some(now);
+                        t.reoffers = t.reoffers.saturating_add(1);
+                    }
+                }
+                Requeue::LeaseExpired => {
+                    if let Ok(t) = self.task_mut(*task) {
+                        t.status = TaskStatus::Pending;
+                        t.holder = None;
+                        t.offered_at = Some(now);
+                        t.lease_until = None;
+                        t.next_nag = None;
+                        t.nudges_used = 0;
+                        t.budget_announced = false;
+                    }
+                }
+                // `Rehomed`'s own effect already carries the full reset
+                // (it needs `to`, which this effect doesn't have); `Reopened`
+                // is already handled by `Record{act: Reopen}` above. Both
+                // arrive alongside this one in the same batch, never alone.
+                Requeue::Rehomed | Requeue::Reopened => {}
+            },
+            Effect::Rehomed { task, to, .. } => {
+                if let Ok(t) = self.task_mut(*task) {
+                    t.assignee = Some(to.clone());
+                    t.status = TaskStatus::Pending;
+                    t.holder = None;
+                    t.outcome = None;
+                    t.offered_at = Some(now);
+                    t.lease_until = None;
+                    t.next_nag = None;
+                    t.nudges_used = 0;
+                    t.reoffers = 0;
+                    t.budget_announced = false;
+                }
+            }
+            Effect::NudgeBudgetSpent { task, .. } => {
+                if let Ok(t) = self.task_mut(*task) {
+                    t.budget_announced = true;
+                    t.next_nag = None;
+                }
+            }
+            Effect::Closed { task, title, body, author } => {
+                self.artifacts.push((
+                    task.parent_id(),
+                    Artifact { title: title.clone(), body: body.clone(), author: author.clone(), at: now },
+                ));
+                if let Ok(p) = self.task_mut(*task) {
+                    p.status = TaskStatus::Closed;
+                    p.closed_at = Some(now);
+                }
+            }
+            Effect::Failed { task } => {
+                if let Ok(p) = self.task_mut(*task) {
+                    p.status = TaskStatus::Failed;
+                    p.closed_at = Some(now);
+                }
+            }
+            // Chat. Never touches task state.
+            Effect::Said { .. } => {}
+        }
+    }
+
     // ---- acts -------------------------------------------------------------
 
     /// Open a parent task. Operator or leader only.
@@ -259,36 +489,11 @@ impl<A: Clone + Eq> TaskTable<A> {
             return Err(Error::TooManyTasks);
         }
         let id = TaskId::parent(self.next_parent);
-        self.next_parent += 1;
-        self.tasks.push(Task {
-            id,
-            status: TaskStatus::Open,
-            text: text.to_string(),
-            expect: String::new(),
-            assignee: None,
-            holder: None,
-            outcome: None,
-            opened_by: who.clone(),
-            opened_at: now,
-            offered_at: None,
-            lease_until: None,
-            next_nag: None,
-            nudges_used: 0,
-            reoffers: 0,
-            budget_announced: false,
-            // Due immediately: the leader should be asked to plan on the very
-            // next tick, not one nag interval from now.
-            next_directive: now,
-            directive_nudges_used: 0,
-            closed_at: None,
-        });
-        Ok((
-            id,
-            alloc::vec![Effect::Opened {
-                who: who.clone(),
-                task: id
-            }],
-        ))
+        let effects = alloc::vec![Effect::Opened { who: who.clone(), task: id, text: text.to_string() }];
+        for e in &effects {
+            self.apply(e, now);
+        }
+        Ok((id, effects))
     }
 
     /// Split a parent into directed sub-tasks. Leader only, one call.
@@ -341,26 +546,6 @@ impl<A: Clone + Eq> TaskTable<A> {
         }];
         for (i, it) in items.iter().enumerate() {
             let id = TaskId::sub(parent.parent, (i + 1) as u16);
-            self.tasks.push(Task {
-                id,
-                status: TaskStatus::Pending,
-                text: it.what.clone(),
-                expect: it.expect.clone(),
-                assignee: Some(it.who.clone()),
-                holder: None,
-                outcome: None,
-                opened_by: who.clone(),
-                opened_at: now,
-                offered_at: Some(now),
-                lease_until: None,
-                next_nag: None,
-                nudges_used: 0,
-                reoffers: 0,
-                budget_announced: false,
-                next_directive: now,
-                directive_nudges_used: 0,
-                closed_at: None,
-            });
             effects.push(Effect::Assigned {
                 to: it.who.clone(),
                 task: id,
@@ -368,11 +553,9 @@ impl<A: Clone + Eq> TaskTable<A> {
                 expect: it.expect.clone(),
             });
         }
-        let nag = self.cfg.timers.directive_nag;
-        let p = self.task_mut(parent)?;
-        p.status = TaskStatus::Planned;
-        p.next_directive = now.saturating_add(nag);
-        p.directive_nudges_used = 0;
+        for e in &effects {
+            self.apply(e, now);
+        }
         Ok(effects)
     }
 
@@ -396,12 +579,16 @@ impl<A: Clone + Eq> TaskTable<A> {
         if body.len() > self.cfg.limits.max_message {
             return Err(Error::TooLong);
         }
-        Ok(alloc::vec![Effect::Said {
+        let effects = alloc::vec![Effect::Said {
             from: who.clone(),
             to,
             body: body.to_string(),
             from_root: auth == Authority::Root,
-        }])
+        }];
+        // `apply(Said)` is a no-op — chat touches no task state — but every
+        // verb routes through it uniformly so there is exactly one place
+        // that ever decides otherwise.
+        Ok(effects)
     }
 
     /// Fail every currently open parent (`Open` or `Planned`) at once.
@@ -425,13 +612,9 @@ impl<A: Clone + Eq> TaskTable<A> {
             .filter(|t| t.is_parent() && matches!(t.status, TaskStatus::Open | TaskStatus::Planned))
             .map(|t| t.id)
             .collect();
-        let mut effects = Vec::with_capacity(open.len());
-        for id in open {
-            if let Ok(p) = self.task_mut(id) {
-                p.status = TaskStatus::Failed;
-                p.closed_at = Some(now);
-            }
-            effects.push(Effect::Failed { task: id });
+        let effects: Vec<Effect<A>> = open.iter().map(|&task| Effect::Failed { task }).collect();
+        for e in &effects {
+            self.apply(e, now);
         }
         // A session boundary means it: nobody is coming back to look at a
         // record the operator just declared dead, so there is no reason to
@@ -484,23 +667,17 @@ impl<A: Clone + Eq> TaskTable<A> {
         if !matches!(t.status, TaskStatus::Pending | TaskStatus::AwaitingClearance) {
             return Err(Error::WrongStatus);
         }
-        let from = t.assignee.replace(to.clone());
-        t.status = TaskStatus::Pending;
-        t.holder = None;
-        t.outcome = None;
-        t.offered_at = Some(now);
-        t.lease_until = None;
-        t.next_nag = None;
-        // A fresh holder gets fresh budgets — both of them.
-        t.nudges_used = 0;
-        t.reoffers = 0;
-        t.budget_announced = false;
+        let from = t.assignee.clone();
         let (what, expect) = (t.text.clone(), t.expect.clone());
-        Ok(alloc::vec![
+        let effects = alloc::vec![
             Effect::Rehomed { task: id, from, to: to.clone() },
             Effect::Requeued { task: id, from: None, why: Requeue::Rehomed },
             Effect::Assigned { to, task: id, what, expect },
-        ])
+        ];
+        for e in &effects {
+            self.apply(e, now);
+        }
+        Ok(effects)
     }
 
     /// Every per-task act: claim, done, failed, clear, reopen, artifact.
@@ -527,7 +704,6 @@ impl<A: Clone + Eq> TaskTable<A> {
     }
 
     fn claim(&mut self, who: &A, id: TaskId, now: BlockNumber) -> Result<Vec<Effect<A>>, Error> {
-        let (lease, work_nag) = (self.cfg.timers.lease, self.cfg.timers.work_nag);
         let t = self.task_mut(id)?;
         if t.is_parent() {
             return Err(Error::WrongKind);
@@ -540,24 +716,17 @@ impl<A: Clone + Eq> TaskTable<A> {
         if t.assignee.as_ref() != Some(who) {
             return Err(Error::NotYours);
         }
-        t.status = TaskStatus::InProgress;
-        t.holder = Some(who.clone());
-        t.lease_until = Some(now.saturating_add(lease));
-        t.next_nag = Some(now.saturating_add(work_nag));
-        t.nudges_used = 0;
-        t.reoffers = 0;
-        t.budget_announced = false;
-        t.offered_at = None;
         // Nudged once immediately, then on the nag interval. Claiming ends a
         // turn, and nothing in the protocol addresses the holder again — the
         // replicated record is non-waking by design — so without this the
         // sub-task rides its lease out untouched. Observed live: two agents
         // claimed, both turns ended cleanly, neither ever reported.
-        Ok(alloc::vec![
+        let effects = alloc::vec![
             Effect::Record {
                 who: who.clone(),
                 task: id,
-                act: Act::Claim
+                act: Act::Claim,
+                text: String::new(),
             },
             Effect::Nudge {
                 to: who.clone(),
@@ -565,7 +734,11 @@ impl<A: Clone + Eq> TaskTable<A> {
                 remaining: self.cfg.timers.max_nudges,
                 last: false,
             },
-        ])
+        ];
+        for e in &effects {
+            self.apply(e, now);
+        }
+        Ok(effects)
     }
 
     fn submit(
@@ -583,6 +756,7 @@ impl<A: Clone + Eq> TaskTable<A> {
         } else {
             Act::Done
         };
+        let text = outcome.text().to_string();
         let t = self.task_mut(id)?;
         if t.is_parent() {
             return Err(Error::WrongKind);
@@ -606,25 +780,11 @@ impl<A: Clone + Eq> TaskTable<A> {
             TaskStatus::AwaitingClearance => return Err(Error::AlreadySubmitted),
             _ => return Err(Error::WrongStatus),
         }
-        t.status = TaskStatus::AwaitingClearance;
-        t.outcome = Some(outcome);
-        t.holder = Some(who.clone());
-        t.lease_until = None;
-        t.next_nag = None;
-        t.offered_at = None;
-        t.nudges_used = 0;
-        let parent = id.parent_id();
-        // The leader is wanted now, not one interval from now — and this is
-        // new information, so it gets a fresh budget to act on it.
-        if let Ok(p) = self.task_mut(parent) {
-            p.next_directive = now;
-            p.directive_nudges_used = 0;
+        let effects = alloc::vec![Effect::Record { who: who.clone(), task: id, act, text }];
+        for e in &effects {
+            self.apply(e, now);
         }
-        Ok(alloc::vec![Effect::Record {
-            who: who.clone(),
-            task: id,
-            act
-        }])
+        Ok(effects)
     }
 
     fn clear(
@@ -644,17 +804,11 @@ impl<A: Clone + Eq> TaskTable<A> {
         if t.status != TaskStatus::AwaitingClearance {
             return Err(Error::WrongStatus);
         }
-        t.status = TaskStatus::Cleared;
-        let parent = id.parent_id();
-        if let Ok(p) = self.task_mut(parent) {
-            p.next_directive = now;
-            p.directive_nudges_used = 0;
+        let effects = alloc::vec![Effect::Record { who: who.clone(), task: id, act: Act::Clear, text: String::new() }];
+        for e in &effects {
+            self.apply(e, now);
         }
-        Ok(alloc::vec![Effect::Record {
-            who: who.clone(),
-            task: id,
-            act: Act::Clear
-        }])
+        Ok(effects)
     }
 
     fn reopen(
@@ -675,21 +829,13 @@ impl<A: Clone + Eq> TaskTable<A> {
         if t.status != TaskStatus::AwaitingClearance {
             return Err(Error::WrongStatus);
         }
-        t.status = TaskStatus::Pending;
-        t.outcome = None;
-        t.holder = None;
-        t.offered_at = Some(now);
-        t.lease_until = None;
-        t.next_nag = None;
-        // A requeue hands the next holder a fresh budget.
-        t.nudges_used = 0;
-        t.budget_announced = false;
         let (assignee, what, expect) = (t.assignee.clone(), t.text.clone(), t.expect.clone());
         let mut effects = alloc::vec![
             Effect::Record {
                 who: who.clone(),
                 task: id,
-                act: Act::Reopen
+                act: Act::Reopen,
+                text: String::new(),
             },
             Effect::Requeued {
                 task: id,
@@ -704,6 +850,9 @@ impl<A: Clone + Eq> TaskTable<A> {
                 what,
                 expect,
             });
+        }
+        for e in &effects {
+            self.apply(e, now);
         }
         Ok(effects)
     }
@@ -737,26 +886,19 @@ impl<A: Clone + Eq> TaskTable<A> {
             return Err(Error::SubtasksOutstanding);
         }
         let title = title_from_markdown(body, self.cfg.limits.max_title);
-        self.artifacts.push((
-            id,
-            Artifact {
-                title: title.clone(),
-                body: body.to_string(),
-                author: who.clone(),
-                at: now,
-            },
-        ));
-        let p = self.task_mut(id)?;
-        p.status = TaskStatus::Closed;
-        p.closed_at = Some(now);
-        Ok(alloc::vec![
+        let effects = alloc::vec![
             Effect::Record {
                 who: who.clone(),
                 task: id,
-                act: Act::Artifact
+                act: Act::Artifact,
+                text: String::new(),
             },
-            Effect::Closed { task: id, title },
-        ])
+            Effect::Closed { task: id, title, body: body.to_string(), author: who.clone() },
+        ];
+        for e in &effects {
+            self.apply(e, now);
+        }
+        Ok(effects)
     }
 
     // ---- the tick ---------------------------------------------------------
@@ -774,25 +916,26 @@ impl<A: Clone + Eq> TaskTable<A> {
         let cfg = self.cfg;
         let mut effects = Vec::new();
 
-        for t in self.tasks.iter_mut().filter(|t| !t.is_parent()) {
+        // Stage 1: sub-task lifecycle. A read-only pass over `self.tasks`
+        // building effects, applied immediately after — stage 2 (leader
+        // directives, via `directive_for`) reads sub-task status and has to
+        // see this tick's fresh state, exactly as it did back when this loop
+        // mutated in place. Splitting "decide" from "apply" (rather than
+        // mutating inline as before) is what lets `apply` also be the replay
+        // path — see `docs/PROTOCOL.md`.
+        let mut stage1 = Vec::new();
+        for t in self.tasks.iter().filter(|t| !t.is_parent()) {
             match t.status {
                 TaskStatus::InProgress => {
                     let expired = t.lease_until.is_some_and(|d| now >= d);
                     if expired {
-                        let from = t.holder.take();
-                        t.status = TaskStatus::Pending;
-                        t.offered_at = Some(now);
-                        t.lease_until = None;
-                        t.next_nag = None;
-                        t.nudges_used = 0;
-                        t.budget_announced = false;
-                        effects.push(Effect::Requeued {
+                        stage1.push(Effect::Requeued {
                             task: t.id,
-                            from,
+                            from: t.holder.clone(),
                             why: Requeue::LeaseExpired,
                         });
                         if let Some(to) = t.assignee.clone() {
-                            effects.push(Effect::Assigned {
+                            stage1.push(Effect::Assigned {
                                 to,
                                 task: t.id,
                                 what: t.text.clone(),
@@ -807,10 +950,8 @@ impl<A: Clone + Eq> TaskTable<A> {
                             None => continue,
                         };
                         if t.nudges_used < cfg.timers.max_nudges {
-                            t.nudges_used += 1;
-                            t.next_nag = Some(now.saturating_add(cfg.timers.work_nag));
-                            let remaining = cfg.timers.max_nudges - t.nudges_used;
-                            effects.push(Effect::Nudge {
+                            let remaining = cfg.timers.max_nudges - (t.nudges_used + 1);
+                            stage1.push(Effect::Nudge {
                                 to: holder,
                                 task: t.id,
                                 remaining,
@@ -821,9 +962,7 @@ impl<A: Clone + Eq> TaskTable<A> {
                             // After the budget the table stops asking, says so
                             // once, and lets the lease requeue the work to
                             // somebody else.
-                            t.budget_announced = true;
-                            t.next_nag = None;
-                            effects.push(Effect::NudgeBudgetSpent { holder, task: t.id });
+                            stage1.push(Effect::NudgeBudgetSpent { holder, task: t.id });
                         }
                     }
                 }
@@ -837,15 +976,13 @@ impl<A: Clone + Eq> TaskTable<A> {
                         && t.offered_at
                             .is_some_and(|o| now >= o.saturating_add(cfg.timers.claim_window)) =>
                 {
-                    t.offered_at = Some(now);
-                    t.reoffers += 1;
-                    effects.push(Effect::Requeued {
+                    stage1.push(Effect::Requeued {
                         task: t.id,
                         from: None,
                         why: Requeue::Unclaimed,
                     });
                     if let Some(to) = t.assignee.clone() {
-                        effects.push(Effect::Assigned {
+                        stage1.push(Effect::Assigned {
                             to,
                             task: t.id,
                             what: t.text.clone(),
@@ -856,10 +993,15 @@ impl<A: Clone + Eq> TaskTable<A> {
                 _ => {}
             }
         }
+        for e in &stage1 {
+            self.apply(e, now);
+        }
+        effects.extend(stage1);
 
-        // Leader directives. Re-sent on an interval rather than once, because
-        // a dropped directive would otherwise stall a parent permanently —
-        // but bounded, because a leader that never resolves one after
+        // Stage 2: leader directives, now reading this tick's fresh sub-task
+        // state. Re-sent on an interval rather than once, because a dropped
+        // directive would otherwise stall a parent permanently — but
+        // bounded, because a leader that never resolves one after
         // `max_directive_nudges` tries is not going to on try `n+1` either,
         // and nobody asked for an extension. Exhausting the budget fails the
         // parent outright rather than going quiet: there is no reassignment
@@ -874,29 +1016,22 @@ impl<A: Clone + Eq> TaskTable<A> {
             .filter(|t| t.is_parent() && now >= t.next_directive)
             .filter_map(|t| self.directive_for(t).map(|d| (t.id, d)))
             .collect();
+        let mut stage2 = Vec::new();
         for (id, directive) in due {
             let exhausted = self
                 .task_mut(id)
                 .map(|p| p.directive_nudges_used >= cfg.timers.max_directive_nudges)
                 .unwrap_or(false);
             if exhausted {
-                if let Ok(p) = self.task_mut(id) {
-                    p.status = TaskStatus::Failed;
-                    p.closed_at = Some(now);
-                }
-                effects.push(Effect::Failed { task: id });
-                continue;
+                stage2.push(Effect::Failed { task: id });
+            } else {
+                stage2.push(Effect::Directed { to: leader.clone(), task: id, directive });
             }
-            if let Ok(p) = self.task_mut(id) {
-                p.next_directive = now.saturating_add(cfg.timers.directive_nag);
-                p.directive_nudges_used = p.directive_nudges_used.saturating_add(1);
-            }
-            effects.push(Effect::Directed {
-                to: leader.clone(),
-                task: id,
-                directive,
-            });
         }
+        for e in &stage2 {
+            self.apply(e, now);
+        }
+        effects.extend(stage2);
         effects
     }
 
