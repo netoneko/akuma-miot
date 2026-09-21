@@ -9,7 +9,7 @@
 //! No streaming yet. A turn is seconds and nothing downstream can use a
 //! partial one — the agent submits an extrinsic or it does not.
 
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize)]
@@ -49,43 +49,38 @@ pub struct Turn {
     pub ms: u64,
 }
 
-#[derive(Deserialize)]
-struct RawResp {
-    message: RawMsg,
-    #[serde(default)]
-    eval_count: u32,
-    #[serde(default)]
-    total_duration: u64,
-}
-
-#[derive(Deserialize)]
-struct RawMsg {
-    #[serde(default)]
-    content: String,
-    #[serde(default)]
-    tool_calls: Vec<RawCall>,
-}
-
-#[derive(Deserialize)]
-struct RawCall {
-    function: RawFn,
-}
-
-#[derive(Deserialize)]
-struct RawFn {
-    name: String,
-    #[serde(default)]
-    arguments: serde_json::Value,
+/// Which chat dialect an endpoint speaks.
+///
+/// `llama-server` and ollama both do native tool calls; they disagree only on
+/// the envelope. Detected from the URL rather than configured, because getting
+/// it wrong is a 404 and there is nothing to decide.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Dialect {
+    /// ollama `/api/chat`
+    Ollama,
+    /// OpenAI-compatible `/v1/chat/completions` — what `llama-server --jinja`
+    /// serves.
+    OpenAi,
 }
 
 pub struct Ollama {
     client: reqwest::Client,
     url: String,
     model: String,
+    dialect: Dialect,
 }
 
 impl Ollama {
+    /// `host` is a base URL. A `:11434` default port means ollama; anything
+    /// else is assumed to be a `llama-server`, which is the common case for a
+    /// swarm of one server per cat.
     pub fn new(host: &str, model: &str) -> Self {
+        let dialect =
+            if host.contains(":11434") { Dialect::Ollama } else { Dialect::OpenAi };
+        Self::with_dialect(host, model, dialect)
+    }
+
+    pub fn with_dialect(host: &str, model: &str, dialect: Dialect) -> Self {
         Ollama {
             client: reqwest::Client::builder()
                 // A turn is the loose loop: minutes is normal, and nothing
@@ -93,9 +88,17 @@ impl Ollama {
                 .timeout(Duration::from_secs(600))
                 .build()
                 .expect("http client"),
-            url: format!("{host}/api/chat"),
+            url: match dialect {
+                Dialect::Ollama => format!("{host}/api/chat"),
+                Dialect::OpenAi => format!("{host}/v1/chat/completions"),
+            },
             model: model.to_string(),
+            dialect,
         }
+    }
+
+    pub fn dialect(&self) -> Dialect {
+        self.dialect
     }
 
     pub async fn turn(
@@ -103,15 +106,27 @@ impl Ollama {
         msgs: &[Msg],
         tools: &serde_json::Value,
     ) -> Result<Turn, String> {
-        let body = serde_json::json!({
-            "model": self.model,
-            "stream": false,
-            "messages": msgs,
-            "tools": tools,
-            // Low temperature: we want the model to pick the verb it was told
-            // to pick, not to be interesting about it.
-            "options": { "temperature": 0.2 },
-        });
+        // Low temperature: we want the model to pick the verb it was told to
+        // pick, not to be interesting about it. The two dialects spell that —
+        // and the cap that stops a reasoning model spending its whole budget
+        // without emitting a call — in different places.
+        let body = match self.dialect {
+            Dialect::Ollama => serde_json::json!({
+                "model": self.model,
+                "stream": false,
+                "messages": msgs,
+                "tools": tools,
+                "options": { "temperature": 0.2, "num_predict": 2048 },
+            }),
+            Dialect::OpenAi => serde_json::json!({
+                "model": self.model,
+                "stream": false,
+                "messages": msgs,
+                "tools": tools,
+                "temperature": 0.2,
+                "max_tokens": 2048,
+            }),
+        };
         let resp = self
             .client
             .post(&self.url)
@@ -122,18 +137,50 @@ impl Ollama {
         if !resp.status().is_success() {
             return Err(format!("ollama {}: {}", resp.status(), resp.text().await.unwrap_or_default()));
         }
-        let raw: RawResp = resp.json().await.map_err(|e| format!("bad ollama json: {e}"))?;
-        Ok(Turn {
-            text: raw.message.content,
-            calls: raw
-                .message
-                .tool_calls
-                .into_iter()
-                .map(|c| Call { name: c.function.name, args: c.function.arguments })
-                .collect(),
-            tokens: raw.eval_count,
-            ms: raw.total_duration / 1_000_000,
-        })
+        let started = std::time::Instant::now();
+        let v: serde_json::Value =
+            resp.json().await.map_err(|e| format!("bad json: {e}"))?;
+        let msg = match self.dialect {
+            Dialect::Ollama => v.get("message").cloned().unwrap_or_default(),
+            Dialect::OpenAi => v
+                .pointer("/choices/0/message")
+                .cloned()
+                .ok_or_else(|| format!("no choices in response: {v}"))?,
+        };
+        let text = msg.get("content").and_then(|c| c.as_str()).unwrap_or_default().to_string();
+        let calls = msg
+            .get("tool_calls")
+            .and_then(|t| t.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|c| {
+                        let f = c.get("function")?;
+                        let name = f.get("name")?.as_str()?.to_string();
+                        // ollama gives arguments as an object; the
+                        // OpenAI-compatible shape gives a JSON *string*.
+                        let args = match f.get("arguments") {
+                            Some(serde_json::Value::String(s)) => {
+                                serde_json::from_str(s).unwrap_or(serde_json::Value::Null)
+                            }
+                            Some(other) => other.clone(),
+                            None => serde_json::Value::Null,
+                        };
+                        Some(Call { name, args })
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let tokens = v
+            .get("eval_count")
+            .or_else(|| v.pointer("/usage/completion_tokens"))
+            .and_then(|n| n.as_u64())
+            .unwrap_or(0) as u32;
+        let ms = v
+            .get("total_duration")
+            .and_then(|n| n.as_u64())
+            .map(|ns| ns / 1_000_000)
+            .unwrap_or_else(|| started.elapsed().as_millis() as u64);
+        Ok(Turn { text, calls, tokens, ms })
     }
 }
 

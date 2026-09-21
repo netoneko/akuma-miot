@@ -1,21 +1,53 @@
 use super::*;
 
-/// The operator's real key, from `~/.akuma/ssh/id_ed25519.pub`.
-const OPERATOR: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGADiMSbnANnXaUnxpgWBJKF2KfqmTyK80f0ApDVP4Vy netoneko@localhost";
+/// A throwaway operator identity, derived from a fixed seed at test time.
+///
+/// Deliberately **not** anybody's real key. An operator's public key belongs in
+/// their own `~/.akuma/ssh/id_ed25519.pub` and is read from there at startup;
+/// a repository is the wrong place to keep a person's identity, public or not.
+fn operator() -> Identity {
+    Identity::from_seed(&[0xA1; 32])
+}
 
+fn operator_line() -> String {
+    operator().ssh_public_line("operator@example")
+}
+
+/// An `authorized_keys` line round-trips to the account that produced it.
+///
+/// The writer and the parser are independent code paths — one builds the
+/// length-prefixed wire format, the other walks it — so agreement between them
+/// is evidence rather than tautology.
 #[test]
-fn the_operators_ssh_key_parses_to_an_account() {
-    let root = Account::from_ssh(OPERATOR).unwrap();
-    assert_eq!(root.as_bytes().len(), 32);
-    // The first bytes are visible in the base64 payload after the header, so
-    // this pins that we parsed the key field and not some adjacent bytes.
-    assert_eq!(root.short(), "6003_8c".replace('_', ""));
+fn an_ssh_key_line_parses_back_to_its_account() {
+    let id = operator();
+    let parsed = Account::from_ssh(&id.ssh_public_line("operator@example")).unwrap();
+    assert_eq!(parsed, id.account());
+    assert_eq!(parsed.as_bytes().len(), 32);
+}
+
+/// Pins the on-the-wire layout against a hand-built line: the header is
+/// `ssh-ed25519` at offset 4, and the key is the 32 bytes after its own
+/// big-endian length. A change in either field's framing fails here.
+#[test]
+fn the_wire_layout_is_two_length_prefixed_fields() {
+    let id = Identity::from_seed(&[9u8; 32]);
+    let line = id.ssh_public_line("x@y");
+    let b64 = line.split_whitespace().nth(1).unwrap();
+    let raw = base64::engine::general_purpose::STANDARD.decode(b64).unwrap();
+
+    assert_eq!(u32::from_be_bytes(raw[0..4].try_into().unwrap()), 11);
+    assert_eq!(&raw[4..15], b"ssh-ed25519");
+    assert_eq!(u32::from_be_bytes(raw[15..19].try_into().unwrap()), 32);
+    assert_eq!(&raw[19..51], id.account().as_bytes());
+    assert_eq!(raw.len(), 51, "nothing trailing");
 }
 
 #[test]
 fn the_comment_and_extra_whitespace_do_not_matter() {
-    let a = Account::from_ssh(OPERATOR).unwrap();
-    let b = Account::from_ssh(&format!("  {}  ", OPERATOR.rsplit_once(' ').unwrap().0)).unwrap();
+    let line = operator_line();
+    let a = Account::from_ssh(&line).unwrap();
+    let b = Account::from_ssh(&format!("  {}  ", line.rsplit_once(' ').unwrap().0)).unwrap();
     assert_eq!(a, b);
 }
 
@@ -29,8 +61,9 @@ fn only_ed25519_keys_are_accepted() {
 
 #[test]
 fn a_truncated_key_is_a_parse_error_not_a_short_account() {
-    let good = Account::from_ssh(OPERATOR).unwrap();
-    let b64 = OPERATOR.split_whitespace().nth(1).unwrap();
+    let line = operator_line();
+    let good = Account::from_ssh(&line).unwrap();
+    let b64 = line.split_whitespace().nth(1).unwrap();
     // Lop off the tail of the base64: the length prefix will now overrun.
     let cut = &b64[..b64.len() - 8];
     let line = format!("ssh-ed25519 {cut} user@host");
@@ -114,7 +147,7 @@ fn a_forged_sender_is_not_a_policy_failure_but_an_invalid_signature() {
 /// Root stops being a string anyone can type and becomes possession of a key.
 #[test]
 fn root_authority_is_possession_of_the_operator_key() {
-    let root = Account::from_ssh(OPERATOR).unwrap();
+    let root = Account::from_ssh(&operator_line()).unwrap();
     let impostor = Identity::generate();
 
     let call = SignedCall::new(&impostor, b"open t1".to_vec());

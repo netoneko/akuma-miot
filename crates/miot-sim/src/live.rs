@@ -123,12 +123,28 @@ pub struct Bench {
 }
 
 impl Bench {
+    /// `spec` is `name=endpoint,...` where an endpoint is either a model name
+    /// (served by the default host) or a full base URL, optionally
+    /// `url#model`.
+    ///
+    /// One endpoint per cat is the point: four cats against one server
+    /// **serialize**, and the whole design rests on turns being concurrent and
+    /// the chain ticking through them. A swarm that queues is not a swarm.
     pub fn new(host: &str, default_model: &str, spec: &str) -> Self {
         let mut by_cat = Vec::new();
         for part in spec.split(',').filter(|p| !p.trim().is_empty()) {
-            if let Some((n, m)) = part.split_once('=') {
+            if let Some((n, target)) = part.split_once('=') {
                 if let Some(a) = account(n) {
-                    by_cat.push((a, Ollama::new(host, m.trim()), m.trim().to_string()));
+                    let target = target.trim();
+                    let (h, m) = match target.split_once('#') {
+                        Some((u, m)) => (u.to_string(), m.to_string()),
+                        None if target.starts_with("http") => {
+                            (target.to_string(), default_model.to_string())
+                        }
+                        None => (host.to_string(), target.to_string()),
+                    };
+                    let label = format!("{m} @ {}", h.rsplit('/').next().unwrap_or(&h));
+                    by_cat.push((a, Ollama::new(&h, &m), label));
                 }
             }
         }

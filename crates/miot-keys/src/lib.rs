@@ -137,6 +137,25 @@ impl Identity {
     pub fn sign(&self, payload: &[u8]) -> [u8; 64] {
         self.key.sign(payload).to_bytes()
     }
+
+    /// This identity as an `authorized_keys` line.
+    ///
+    /// The inverse of [`Account::from_ssh`], which is what lets the parser be
+    /// tested on keys generated here rather than on somebody's real one —
+    /// a repository is the wrong place to keep a person's identity, public or
+    /// not.
+    pub fn ssh_public_line(&self, comment: &str) -> String {
+        let key = self.account().0;
+        let mut wire = Vec::with_capacity(51);
+        wire.extend_from_slice(&11u32.to_be_bytes());
+        wire.extend_from_slice(b"ssh-ed25519");
+        wire.extend_from_slice(&32u32.to_be_bytes());
+        wire.extend_from_slice(&key);
+        format!(
+            "ssh-ed25519 {} {comment}",
+            base64::engine::general_purpose::STANDARD.encode(&wire)
+        )
+    }
 }
 
 /// One act, with its signature.
