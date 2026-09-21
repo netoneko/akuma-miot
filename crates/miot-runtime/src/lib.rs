@@ -173,7 +173,7 @@ pub type Executive = frame_executive::Executive<
 >;
 
 /// Building and signing an [`UncheckedExtrinsic`] — the one place this logic
-/// lives, so `miot-cat` and `miot-sim --rpc` (and anything else that ever
+/// lives, so `miot-cat` and `miot --rpc` (and anything else that ever
 /// needs to submit) share it instead of each re-deriving the wire format.
 pub mod client {
     use super::*;

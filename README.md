@@ -31,13 +31,13 @@ ordinary clients that sign extrinsics. Nothing waits on anything.
 > is the design of record; `docs/MAPPING_REPORT.md` §6 is the roadmap.
 
 ```
-cargo test --workspace              # 61 tests, host-native
-cargo run -p miot-sim               # scripted litter: shows the recovery path
-cargo run -p miot-sim -- --live     # real models, via ollama
+cargo test --workspace              # 89 tests, host-native
+cargo run -p miot                   # scripted litter: shows the recovery path
+cargo run -p miot -- --live         # real models, via ollama
 
 # a swarm of four llama-servers, one per cat
 overlays/local/llama-swarm.sh up
-cargo run -p miot-sim -- --live \
+cargo run -p miot -- --live \
   --models "$(overlays/local/llama-swarm.sh spec)" \
   --brief path/to/document.md --task "the question"
 

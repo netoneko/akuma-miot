@@ -12,7 +12,7 @@ crates/
   pallet-litter      FRAME wrapper                     no_std   16 tests
   miot-runtime       construct_runtime!, 90 lines      no_std    2 tests
   miot-llm           Ollama provider, native tool calls std
-  miot-sim           the binary: scripted + --live      std
+  miot               the binary: scripted + --live + --rpc  std
 ```
 
 `cargo test --workspace` → **61 tests**, host-native, no Docker.
@@ -40,7 +40,7 @@ binary wants `mmap`'d sparse files or `PROT_EXEC`.
 
 ## Scripted run — the recovery path
 
-`cargo run -p miot-sim`. Cats are scripted policies; every state transition is
+`cargo run -p miot`. Cats are scripted policies; every state transition is
 the real pallet. `kuro` is deliberately dead and never answers.
 
 ```
@@ -188,7 +188,7 @@ a lone cat on a quiet machine is fast; four cats sharing a GPU are not.
 
 ## Chat: talking to the litter
 
-`miot-sim --chat` sends a line as a root-signed `say` extrinsic; every cat it
+`miot --chat` sends a line as a root-signed `say` extrinsic; every cat it
 wakes takes a turn and replies with `SendMessage`, which is another extrinsic.
 Everything on screen went through the chain.
 

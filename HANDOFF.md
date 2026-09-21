@@ -25,9 +25,9 @@ docker compose -f overlays/local/docker-compose.yml up -d   # node + 4 cats
 curl -s localhost:9944/head
 curl -s localhost:9944/meta                          # genesis hash + spec/tx version
 # there is no more unauthenticated /call — every act is a signed extrinsic.
-# --rpc is the same `miot-sim` binary (also shipped as dist/miot), pointed at
-# a real node instead of driving an in-process chain:
-cargo run -p miot-sim -- --rpc http://localhost:9944 --identity-seed 1 \
+# --rpc is the same `miot` binary (shipped as dist/miot), pointed at a real
+# node instead of driving an in-process chain:
+cargo run -p miot -- --rpc http://localhost:9944 --identity-seed 1 \
   --open "your question here"
 docker compose -f overlays/local/docker-compose.yml logs -f
 curl -s localhost:9944/artifact/t1 | python3 -m json.tool
@@ -36,9 +36,9 @@ curl -s localhost:9944/artifact/t1 | python3 -m json.tool
 Single-process simulation (no networking, much faster to iterate on):
 
 ```bash
-cargo run -p miot-sim                  # scripted, shows the recovery path
-cargo run -p miot-sim -- --live --models "$(overlays/local/llama-swarm.sh spec)"
-cargo run -p miot-sim -- --chat --models "$(overlays/local/llama-swarm.sh spec)"
+cargo run -p miot                  # scripted, shows the recovery path
+cargo run -p miot -- --live --models "$(overlays/local/llama-swarm.sh spec)"
+cargo run -p miot -- --chat --models "$(overlays/local/llama-swarm.sh spec)"
 ```
 
 Akuma-shippable binaries:
@@ -62,7 +62,7 @@ overlays/local/build-akuma.sh          # dist/miot (5.1 MB), dist/storeprobe (0.
 | `miot-llm` | provider layer on `genai` (15 providers, GLM included) | — |
 | `miot-node` | the chain as a process: HTTP, real block lifecycle (`Executive`) on its own clock, `/submit` verifies before it dispatches | — |
 | `miot-cat` | one cat, one container, signs its own extrinsics and talks to the node | — |
-| `miot-sim` | one binary, four modes: scripted / `--live` / `--chat` (in-process) / `--rpc` (a real node, signed) | — |
+| `miot` | one binary (ships as `dist/miot`), four modes: scripted / `--live` / `--chat` (in-process) / `--rpc` (a real node, signed) | — |
 
 **`miot-tasks` is the real thing.** Everything else hosts it. That is why the
 pallet is thin and why the same machine runs with or without a chain.
@@ -91,7 +91,7 @@ version is `account_from_ssh` — reading an OpenSSH **public** key, which
 polkadot-sdk does not do — so root is the operator's existing key, *"no new
 secret to manage."* Signing as that key from a client is not built: `miot-keys`
 has no OpenSSH **private**-key parser, only `Identity::from_seed`. Anything
-that isn't the real operator (every cat, and `miot-sim --rpc` for now) signs
+that isn't the real operator (every cat, and `miot --rpc` for now) signs
 with a deterministic seed instead — fine here, since a forged sender still
 can't happen without the matching private key, and one operator's own swarm
 already trusts every seed it configured.
@@ -181,8 +181,8 @@ into the node — see below).
 1. ~~**Signed extrinsics.**~~ **Done, 2026-09-21.** `AccountId` is
    `AccountId32`; `/call` is gone; `/submit` takes a signed
    `UncheckedExtrinsic` and `miot-node` verifies it for real through
-   `frame_executive::Executive` before dispatch. `miot-cat` and `miot-sim
-   --rpc` both sign through the shared `miot_runtime::client::sign`.
+   `frame_executive::Executive` before dispatch. `miot-cat` and `miot --rpc`
+   both sign through the shared `miot_runtime::client::sign`.
 2. **Wire `miot-store` into `miot-node`.** Persist blocks, replay on start.
    Now the actual most important gap.
 3. **Run `dist/storeprobe` on an Akuma guest.** Seven stages, exit status =

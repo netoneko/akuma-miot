@@ -45,7 +45,7 @@ GGUF sources (verified against the HF API before download, not guessed):
 - `miot-llm`'s `Ollama` struct (`crates/miot-llm/src/lib.rs`) still only
   speaks Ollama's `/api/chat` shape. A `llama-server` provider (OpenAI-
   compatible `/v1/chat/completions`, different `tool_calls`/`usage` envelope)
-  is not written yet — needed before any of this is wired into `miot-sim`.
+  is not written yet — needed before any of this is wired into `miot`.
 
 ## Honest gaps
 

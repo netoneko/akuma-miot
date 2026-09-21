@@ -2,7 +2,7 @@
 //!
 //! One writer, many readers. The node owns the state outright — no cat ever
 //! touches it — and cats reach it over HTTP, which is the whole difference
-//! between this and `miot-sim`: there, four cats were four integers inside one
+//! between this and `miot`'s in-process modes: there, four cats were four integers inside one
 //! process sharing one `TestExternalities`. Here they are four processes on
 //! four containers that have never heard of each other.
 //!

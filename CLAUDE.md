@@ -32,7 +32,8 @@ read that first, it is kept current and this file does not repeat it.
   clock. `AccountId = u64` today; calls arrive as JSON naming an account
   and are trusted, not verified.
 - `crates/miot-cat` — one cat, one container/process, talks to the node.
-- `crates/miot-sim` — single-process harness (scripted / `--live` / `--chat`).
+- `crates/miot` — single-process harness (scripted / `--live` / `--chat`) and,
+  via `--rpc`, a signing client of a real node. Ships as `dist/miot`.
 - `miot-cli` does not exist yet — `docs/CLI.md` is its design of record
   (Phase 3), including how a client resolves `@name` tags against the
   on-chain roster and submits over RPC without holding any local state.
@@ -65,7 +66,7 @@ read that first, it is kept current and this file does not repeat it.
 ## Build, run, test
 
 See `HANDOFF.md` § "Run it" for the current commands (host models, docker
-compose from `overlays/local/docker-compose.yml`, `miot-sim`, Akuma
+compose from `overlays/local/docker-compose.yml`, `miot`, Akuma
 binaries). Quick reference:
 
 ```bash

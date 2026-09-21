@@ -5388,6 +5388,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "miot"
+version = "0.1.0"
+dependencies = [
+ "getrandom 0.2.17",
+ "hex",
+ "miot-keys",
+ "miot-llm",
+ "miot-primitives",
+ "miot-runtime",
+ "pallet-litter",
+ "parity-scale-codec",
+ "polkadot-sdk",
+ "reqwest 0.12.28",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "miot-cat"
 version = "0.1.0"
 dependencies = [
@@ -5459,23 +5477,6 @@ dependencies = [
  "parity-scale-codec",
  "polkadot-sdk",
  "scale-info",
-]
-
-[[package]]
-name = "miot-sim"
-version = "0.1.0"
-dependencies = [
- "hex",
- "miot-keys",
- "miot-llm",
- "miot-primitives",
- "miot-runtime",
- "pallet-litter",
- "parity-scale-codec",
- "polkadot-sdk",
- "reqwest 0.12.28",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

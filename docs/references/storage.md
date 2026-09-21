@@ -33,7 +33,7 @@ nicety.
 
 Turso is not small. In our binary the marginal cost is lower — the agent
 already links tokio and reqwest — but it is still several megabytes, against a
-`miot-sim` that is currently 1.6 MB.
+`miot` binary (named `miot-sim` at measurement time) that was 1.6 MB.
 
 **Verified, not assumed:** the file Turso writes opens in the system `sqlite3`
 binary and returns the row. The format-compatibility claim holds.

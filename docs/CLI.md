@@ -2,8 +2,9 @@
 
 Design of record. The interactive shell below (§0-§4, §6-§8) is not built yet
 (Phase 3+). A slice of §5's non-interactive surface **is** built, 2026-09-21 —
-not as a separate `miot-cli` binary but as `miot-sim --rpc <url>`, since
-`miot-sim` already ships as `dist/miot` and already had the REPL (`--chat`)
+not as a separate `miot-cli` binary but as `miot --rpc <url>` — the crate
+used to be named `miot-sim` and was renamed once `--rpc` made it more than a
+simulator. It already ships as `dist/miot` and already had the REPL (`--chat`)
 and the effect-printer (the scripted mode) this needed reusing rather than
 reinventing. It signs and submits (`--open "<text>"`, `--say "<body>" [--to
 <name>]`), against real endpoints (`/meta`, `/account/:id`, `/submit`) that
