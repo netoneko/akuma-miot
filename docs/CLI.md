@@ -43,9 +43,14 @@ What exists:
   events) — matching this doc's "bounded (`--history N`, default small) so a
   fresh start is not a wall of text." The boundary it replays *since* is
   `since=0` (everything `miot-node`'s in-memory ring still holds, `LOG_CAP`
-  4096), not "since last compaction" — that boundary doesn't exist yet
-  (`miot-store` isn't wired into the node). Once it is, this call site is
-  where the real boundary lands; nothing about the client changes.
+  4096) — unaffected by `miot-store` being wired in (2026-09-22): that made
+  the node's *own* state survive a restart (`docs/PROTOCOL.md`), but this
+  client-facing `/events` ring is still bounded the same way it always was.
+  "Since last compaction" specifically still doesn't exist as a boundary —
+  `Store::compact` is built and tested but nothing calls it yet, so the store
+  only ever grows (append-only, no pruning). Once something does call it,
+  this call site is where the real boundary lands; nothing about the client
+  changes.
   **Rendering is rough** — `said` effects print as `name  body`, but every
   other effect (`assigned`, `nudge`, `directed`, `record`, `failed`, …)
   prints as the raw `{DIM}block N  <json>{OFF}` blob, not the scripted demo's

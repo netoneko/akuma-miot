@@ -46,10 +46,12 @@ display field only, never read for authorization) is stamped as the
 add a field later if that field ever needs to be exact; not worth it today
 for a value nothing but a listing reads.
 
-**Persistence** (`miot-store` → `miot-node`, HANDOFF item 2, not yet wired):
-the effect log described above *is* what gets persisted and replayed after a
-restart — `apply` was built to make that trustworthy rather than merely
-plausible.
+**Persistence** (`miot-store` → `miot-node`, HANDOFF item 2, done
+2026-09-22): the effect log described above *is* what gets persisted
+(`Node::persist`, one `Store::append` per block) and replayed on start
+(`Node::replay`, folding through `pallet_litter::Pallet::replay_effect` →
+`TaskTable::apply`) — `apply` was built to make that trustworthy rather than
+merely plausible, and it's now load-bearing, not just tested in isolation.
 
 ## Vocabulary (`crates/miot-primitives/src/lib.rs`)
 

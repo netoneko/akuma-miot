@@ -43,13 +43,14 @@ use axum::body::Bytes;
 use axum::extract::{Path, Query, State as AxState};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use codec::Decode;
+use codec::{Decode, Encode};
 use miot_primitives::{Effect, TaskId};
 use miot_runtime::{AccountId, Executive, Header, Litter, Runtime, System, UncheckedExtrinsic, VERSION};
 use polkadot_sdk::*;
 use serde::{Deserialize, Serialize};
 use sp_core::H256;
 use sp_runtime::traits::Header as HeaderT;
+use sp_runtime::traits::UniqueSaturatedInto;
 use tokio::sync::Mutex;
 
 /// How long a block takes. Six seconds — the Polkadot default, and a round
@@ -87,6 +88,16 @@ struct Node {
     /// it closes. Updated only in [`Node::advance`], which only the block
     /// timer calls.
     parent_hash: H256,
+    /// The chain's persisted block log — HANDOFF item 2. `None` means
+    /// running without persistence (state lost on restart, as this always
+    /// did before); `Some` means every block's effects are written to disk
+    /// as they close and replayed on the next start.
+    store: Option<miot_store::Store>,
+    /// Effects absorbed since the currently-open block began — what
+    /// [`Node::advance`] persists as that block's body when it closes.
+    /// State is a fold over effects (`docs/PROTOCOL.md`), so this is
+    /// literally the same log `apply` already knows how to replay.
+    pending: Vec<Effect<AccountId>>,
 }
 
 const LOG_CAP: usize = 4096;
@@ -156,6 +167,7 @@ impl Node {
                 self.log.pop_front();
             }
             self.log.push_back(entry);
+            self.pending.push(e);
         }
     }
 
@@ -180,7 +192,9 @@ impl Node {
     /// [`Executive::initialize_block`] for the new block, same as it always
     /// did, just through the real block lifecycle instead of a hand call.
     fn advance(&mut self) {
+        let closing = self.block;
         let header = self.ext.execute_with(Executive::finalize_block);
+        self.persist(closing);
         self.parent_hash = header.hash();
         self.block += 1;
         let b = self.block;
@@ -190,6 +204,66 @@ impl Node {
         });
         let fx = self.drain();
         self.absorb(fx);
+    }
+
+    /// Write `height`'s accumulated effects to the store as that block's
+    /// body, then clear the buffer. A no-op without persistence configured.
+    /// Effects, not raw extrinsics — `TaskTable::apply` folds this straight
+    /// back into state on replay, no re-validation needed (see
+    /// `docs/PROTOCOL.md`).
+    fn persist(&mut self, height: u64) {
+        let Some(store) = self.store.as_mut() else { return };
+        // Every block gets a row, even a quiet one with no effects at all —
+        // the store is append-only and gap-free (`Error::NotContiguous`),
+        // so skipping empty blocks isn't an option.
+        let body = self.pending.encode();
+        if let Err(e) = store.append(height, &body) {
+            eprintln!("[node] store append failed at block {height}: {e}");
+        }
+        self.pending.clear();
+    }
+
+    /// Rebuild state from the store on start, one block at a time, from
+    /// height 1 through `store.head()`. Block 1's `initialize_block` was
+    /// already run by [`genesis`] (needed either way, to install root/leader
+    /// and hand out `catnip`), so this only opens blocks 2 and up itself.
+    ///
+    /// Folds each stored effect through `pallet_litter::Pallet::replay_effect`
+    /// rather than re-applying the original extrinsics — no signatures, nonces
+    /// or mortality to re-check, because none of that touches state; only the
+    /// effect does (`docs/PROTOCOL.md`). Also rebuilds `self.log` (via the
+    /// same [`Node::absorb`] the live path uses) so `/events` has history
+    /// across a restart, then clears `self.pending` after each height — those
+    /// effects are already on disk, replaying them must not re-append them.
+    fn replay(&mut self, store: &miot_store::Store) {
+        let head = store.head();
+        if head == 0 {
+            return;
+        }
+        for h in 1..=head {
+            if h > 1 {
+                let next = Header::new(h, Default::default(), Default::default(), self.parent_hash, Default::default());
+                self.ext.execute_with(|| Executive::initialize_block(&next));
+            }
+            self.block = h;
+            let body = store.block(h).expect("store read").expect("contiguous store, height already validated by head()");
+            let effects: Vec<Effect<AccountId>> =
+                Decode::decode(&mut &body[..]).expect("corrupt block body in store");
+            self.ext.execute_with(|| {
+                let now: miot_primitives::BlockNumber =
+                    frame_system::Pallet::<Runtime>::block_number().unique_saturated_into();
+                for e in &effects {
+                    pallet_litter::Pallet::<Runtime>::replay_effect(e, now);
+                }
+            });
+            let header = self.ext.execute_with(Executive::finalize_block);
+            self.parent_hash = header.hash();
+            self.absorb(effects);
+            self.pending.clear();
+        }
+        self.block = head + 1;
+        let next = Header::new(self.block, Default::default(), Default::default(), self.parent_hash, Default::default());
+        self.ext.execute_with(|| Executive::initialize_block(&next));
     }
 
     /// Check and dispatch one signed extrinsic into the block that is
@@ -311,9 +385,27 @@ async fn main() {
     let root = account_env("MIOT_ROOT_PUBKEY", "MIOT_ROOT", 1);
     let leader = account_env("MIOT_LEADER_PUBKEY", "MIOT_LEADER", 2);
 
+    // `MIOT_DB` unset or unopenable → run exactly as this always did, state
+    // in memory only. Set it to persist across restarts — HANDOFF item 2.
+    let db_path = std::env::var("MIOT_DB").unwrap_or_else(|_| "miot-node.db".to_string());
+    let store = match miot_store::Store::open(&db_path) {
+        Ok(s) => Some(s),
+        Err(e) => {
+            eprintln!("[node] persistence disabled — could not open store at {db_path:?}: {e}");
+            None
+        }
+    };
+
     let (ext, genesis_hash) = genesis(root.clone(), leader.clone());
-    let node: Shared =
-        Arc::new(Mutex::new(Node { ext, log: VecDeque::new(), seq: 0, block: 1, parent_hash: genesis_hash }));
+    let mut node = Node { ext, log: VecDeque::new(), seq: 0, block: 1, parent_hash: genesis_hash, store: None, pending: Vec::new() };
+    if let Some(store) = store {
+        if !store.is_empty() {
+            println!("[node] replaying {} block(s) from {db_path}", store.head());
+            node.replay(&store);
+        }
+        node.store = Some(store);
+    }
+    let node: Shared = Arc::new(Mutex::new(node));
 
     // The block loop. Its own task, its own clock, and nothing in it waits for
     // a cat — that is the whole of Law I.

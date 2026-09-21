@@ -28,6 +28,9 @@ services:
     command: miot-node
     environment:
       MIOT_PORT: "9944"
+      MIOT_DB: /data/miot.db
+    volumes:
+      - node-db:/data         # survives `up -d --force-recreate`; `down -v` to reset
     ports:
       - "9944:9944"          # talk to the chain from your terminal
 
@@ -82,3 +85,6 @@ services:
       MIOT_LLM: http://host.docker.internal:8084
       MIOT_MODEL: qwen3:4b
       MIOT_PERSONA: /personas/sora.md
+
+volumes:
+  node-db:

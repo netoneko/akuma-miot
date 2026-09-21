@@ -396,6 +396,19 @@ pub mod pallet {
             Self::table().artifact(parent).cloned()
         }
 
+        /// Fold a previously-emitted effect into storage — the replay path,
+        /// not a new occurrence. Deliberately bypasses `deposit_event`: this
+        /// effect already happened and was already told to the litter once,
+        /// live; a node catching its own storage up after a restart is not
+        /// a fresh thing for `System::events()` to report. `miot-node` owns
+        /// telling clients about replayed history via its own `/events` log
+        /// instead — see `docs/PROTOCOL.md` and `HANDOFF.md` item 2.
+        pub fn replay_effect(effect: &Effect<T::AccountId>, now: BlockNumber) {
+            let mut table = Self::table();
+            table.apply(effect, now);
+            Litter::<T>::put(table.into_state());
+        }
+
         /// Authority is decided from the **recovered** caller, never from a
         /// field the caller filled in. This is the whole reason the litter
         /// moved onto a chain.

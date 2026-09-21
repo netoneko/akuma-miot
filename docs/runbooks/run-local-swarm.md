@@ -20,6 +20,10 @@ docker compose -f overlays/local/docker-compose.yml up -d
 curl -s localhost:9944/head               # sanity: node is answering
 ```
 
+The node's chain state persists in the `node-db` named volume (`MIOT_DB=/data/miot.db`
+in its container). `docker compose down` alone keeps it; `docker compose down -v`
+deletes it — that's a real, deliberate genesis reset, not an accident.
+
 `kuro` on the Lima VM is separate — see "kuro on Lima" below. If `fc` isn't
 running yet: `limactl start fc` (or `limactl list` to check).
 
@@ -73,13 +77,17 @@ even a small addition (e.g. a new dispatchable) means the running node's
 `RuntimeCall` enum doesn't have it, and calling it will fail oddly rather than
 clearly.
 
-**Whenever the node container is recreated, also restart `kuro`** (see
-below), even if nothing in `miot-cat` changed. The chain is in-memory only
-(`miot-store` isn't wired in yet — HANDOFF item 2), so a node restart resets
-to genesis. A `kuro` process that was already running still has its old event
-cursor in memory, now far past the new node's log — it doesn't error, it just
-goes quiet forever. This is the single most likely explanation for "a cat
-stopped responding" and is worth checking *before* debugging the protocol.
+**`kuro` no longer needs restarting just because the node did — fixed
+2026-09-22, `miot-store` is wired in now.** A node restart (`restart node` or
+even `up -d --force-recreate node`) replays its persisted log and comes back
+with the *same* state and a *continuing* `seq` count, not a reset to
+genesis — so a `kuro` process that was already running still has a valid
+cursor and keeps working without intervention. (This used to be the single
+most likely explanation for "a cat stopped responding" — it no longer is.
+Still restart `kuro` when its own binary changed, same as any code update.)
+If the node's data volume is ever actually wiped (`docker compose down -v`,
+or deleting `MIOT_DB`'s path outside docker), *that* genuinely resets to
+genesis and cats do need restarting again, same as before.
 
 Quick staleness check, given a report that something isn't working:
 

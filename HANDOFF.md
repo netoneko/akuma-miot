@@ -16,7 +16,7 @@ is imported**, only its behavioural findings, each now a named test.
 ## Run it
 
 ```bash
-cargo test --workspace                 # 91 tests, host-native, no docker
+cargo test --workspace                 # 92 tests, host-native, no docker
 
 # models on the HOST (Metal). Docker on macOS has no GPU passthrough.
 overlays/local/llama-swarm.sh up       # 4 llama-servers, ports 8081-8084
@@ -56,13 +56,13 @@ overlays/local/build-akuma.sh          # dist/miot (5.1 MB), dist/storeprobe (0.
 | crate | what | tests |
 |---|---|---|
 | `miot-primitives` | vocabulary: `TaskId`, `Act`, `Effect`, `Limits`, `Timers`. `no_std`. | 5 |
-| `miot-tasks` | **the lifecycle, as a pure state machine.** No clock, no I/O. | 40 |
+| `miot-tasks` | **the lifecycle, as a pure state machine.** No clock, no I/O. Event-sourced: `TaskTable::apply` is the only place state is written, live or replayed. | 41 |
 | `pallet-litter` | thin FRAME wrapper: `ensure_signed` → load → apply → store → emit | 16 |
 | `miot-runtime` | `construct_runtime!`; `AccountId32`/`MultiSignature`, real `UncheckedExtrinsic` + `Executive`, **executed natively — no wasm** | 2 |
 | `miot-store` | block log on ParityDB, compaction-boundary rewind, leader-wins | 14 |
 | `miot-keys` | ed25519 identity: seeds for cats, the operator's SSH *public* key → `AccountId32`, hex wire encoding | 14 |
 | `miot-llm` | provider layer on `genai` (15 providers, GLM included) | — |
-| `miot-node` | the chain as a process: HTTP, real block lifecycle (`Executive`) on its own clock, `/submit` verifies before it dispatches | — |
+| `miot-node` | the chain as a process: HTTP, real block lifecycle (`Executive`) on its own clock, `/submit` verifies before it dispatches, persists+replays via `miot-store` (`MIOT_DB`) | — |
 | `miot-cat` | one cat, signs its own extrinsics and talks to the node — a container today, or any process that can reach it (running on a Lima VM as of 2026-09-22, see below) | — |
 | `miot` | one binary (ships as `dist/miot`), five modes: scripted / `--live` / `--chat` (in-process) / `--rpc` (one-shot: open/say/clear against a real node) / `--rpc --chat` (the same REPL, real signed lines, replays history on start) | — |
 
@@ -173,8 +173,18 @@ authority from a signature that is now actually verified — `/submit` decodes
 and checks a real `UncheckedExtrinsic` (signature, nonce, mortality, genesis
 and spec/tx version) before anything dispatches; artifacts stored and read
 back from chain state; five containers on a network with the chain ticking in
-its own process; four llama-servers; ParityDB (built, tested, still not wired
-into the node — see below); **a cat running somewhere that isn't a container**
+its own process; four llama-servers; **ParityDB, wired in and proven,
+2026-09-22** — `miot-node` persists every block's effects and replays them
+on start (`MIOT_DB`, defaults to `miot-node.db`; the docker `node` service
+mounts a named volume at `/data`), verified both standalone (kill/restart a
+bare `miot-node`, `/events` and `/tasks` came back byte-identical) and
+through `docker compose restart node` / `up -d --force-recreate node` — a
+task opened before either survived it. Practical upshot: **cats no longer
+need restarting when the node does** — `seq` numbering is continuous across
+a restart now (the log is real, not reset to empty), so a cat's already-held
+cursor stays valid instead of pointing past a wiped log. See
+`docs/runbooks/run-local-swarm.md`, updated accordingly.
+**a cat running somewhere that isn't a container**
 — `kuro` moved from its docker container to the Lima VM (`fc`, aarch64 Linux)
 as of 2026-09-22: cross-compiled with the same `aarch64-unknown-linux-musl`
 toolchain `build-akuma.sh` already used, copied onto the VM's own disk with
@@ -185,11 +195,10 @@ rather than asserted.
 
 **Not yet real:**
 
-- **`miot-store` is wired to nothing.** Built, tested, probe ships; the node
-  keeps state in memory and loses it on restart. **This is now the single
-  most important gap** — signed extrinsics closed the previous one.
 - **No consensus.** One node owns the chain. `rewind_for_fork` has never run
   against a real disagreement because there is nothing to disagree with.
+  (`miot-store` itself is wired in now, see below — this gap is specifically
+  the *absence of a second node to disagree with*, not persistence.)
 - **Akuma is untested.** Every claim in the docs about Akuma is inference.
   `dist/storeprobe` exists to replace one of those paragraphs with a fact.
 - **No OpenSSH private-key signing.** `miot-keys` reads the operator's
@@ -272,8 +281,12 @@ rather than asserted.
    `UncheckedExtrinsic` and `miot-node` verifies it for real through
    `frame_executive::Executive` before dispatch. `miot-cat` and `miot --rpc`
    both sign through the shared `miot_runtime::client::sign`.
-2. **Wire `miot-store` into `miot-node`.** Persist blocks, replay on start.
-   Now the actual most important gap.
+2. ~~**Wire `miot-store` into `miot-node`.**~~ **Done, 2026-09-22.** Persists
+   every block's effects (not raw extrinsics — `TaskTable::apply`, the
+   event-sourcing decision above, is what made replay a matter of folding a
+   log rather than re-deriving one); replays on start. Verified: standalone
+   kill/restart and `docker compose restart|up --force-recreate node` both
+   reproduce identical `/events`/`/tasks`. Prerequisite for item 5, below.
 3. **Run `dist/storeprobe` on an Akuma guest.** Seven stages, exit status =
    stages completed. Replaces a paragraph of speculation with a fact. Note:
    `overlays/local/build-akuma.sh` cross-compiles for
@@ -285,8 +298,12 @@ rather than asserted.
    `llama-swarm.sh` binds `127.0.0.1` only, so this also needs a deliberate
    decision about exposing an inference port on the LAN, not just a bind-flag
    change.
-5. **A second node** — only then does `rewind_for_fork` get exercised.
-   Depends on 2: there's nothing to rewind without a real store.
+5. **A second node** — only then does `rewind_for_fork` get exercised. Item 2
+   is done, so this is now unblocked on that front, but still needs an actual
+   P2P/gossip layer between nodes — `miot-node` today has zero networking
+   beyond serving its own HTTP API to clients; every cat is a client of one
+   shared node, not a peer running its own. That's the gap this item is
+   really about, not persistence.
 
 ---
 
