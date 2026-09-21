@@ -24,6 +24,9 @@ use miot_keys::Identity;
 use miot_runtime::{client, AccountId, RuntimeCall};
 use polkadot_sdk::*;
 use sp_core::H256;
+use std::io::{BufRead, Write};
+
+use crate::{DIM, OFF};
 
 fn parse_seed(spec: &str) -> [u8; 32] {
     if let Ok(n) = spec.parse::<u8>() {
@@ -115,6 +118,22 @@ fn resolve(roster: &str, name: &str) -> Option<AccountId> {
     })
 }
 
+/// The reverse of [`resolve`] — every roster entry as `(name, account)`, so
+/// replies can be printed by name instead of a bare hex string.
+fn roster_map(roster: &str) -> Vec<(String, AccountId)> {
+    roster
+        .split(',')
+        .filter_map(|p| {
+            let (n, seed) = p.split_once('=')?;
+            Some((n.trim().to_string(), Identity::from_seed(&parse_seed(seed.trim())).account()))
+        })
+        .collect()
+}
+
+fn name_of(map: &[(String, AccountId)], who: &AccountId) -> String {
+    map.iter().find(|(_, a)| a == who).map(|(n, _)| n.clone()).unwrap_or_else(|| miot_keys::short(who))
+}
+
 async fn meta(http: &reqwest::Client, node: &str) -> client::Meta {
     let v: serde_json::Value = http
         .get(format!("{node}/meta"))
@@ -160,10 +179,17 @@ async fn submit(http: &reqwest::Client, node: &str, identity: &Identity, call: R
 /// Print the log from `since` forward, block/who/what — the same shape the
 /// scripted demo and `--chat` already print, so `--rpc` output reads like
 /// every other mode here rather than inventing a fourth spelling of it.
-async fn watch(http: &reqwest::Client, node: &str, since: u64, seconds: u64) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(seconds);
+/// `seconds: None` would watch indefinitely; nothing calls it that way today
+/// — `docker compose logs -f` / `curl .../events` already own that job.
+async fn watch(http: &reqwest::Client, node: &str, since: u64, seconds: Option<u64>) {
+    let deadline = seconds.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
     let mut cursor = since;
-    while tokio::time::Instant::now() < deadline {
+    loop {
+        if let Some(d) = deadline {
+            if tokio::time::Instant::now() >= d {
+                break;
+            }
+        }
         let batch: Vec<serde_json::Value> = match http.get(format!("{node}/events?since={cursor}")).send().await {
             Ok(r) => r.json().await.unwrap_or_default(),
             Err(_) => Vec::new(),
@@ -174,6 +200,140 @@ async fn watch(http: &reqwest::Client, node: &str, since: u64, seconds: u64) {
         }
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
+}
+
+fn prompt(label: &str) {
+    print!("\n{DIM}{label}{OFF} ▸ ");
+    let _ = std::io::stdout().flush();
+}
+
+/// Print each `said` addressed back to us or to the litter, from `since`,
+/// stopping once things go quiet rather than on a fixed clock — a real
+/// cat's turn is 30-150 s and there may be more than one of them replying.
+/// Hard-capped at `max_seconds` so a litter that never answers doesn't trap
+/// the prompt forever.
+async fn wait_for_replies(
+    http: &reqwest::Client,
+    node: &str,
+    since: u64,
+    roster: &[(String, AccountId)],
+    me: &AccountId,
+    max_seconds: u64,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(max_seconds);
+    let mut cursor = since;
+    let mut last_seen = tokio::time::Instant::now();
+    let mut got_one = false;
+    loop {
+        let now = tokio::time::Instant::now();
+        if now >= deadline || (got_one && now.duration_since(last_seen) > std::time::Duration::from_secs(3)) {
+            break;
+        }
+        let batch: Vec<serde_json::Value> = match http.get(format!("{node}/events?since={cursor}")).send().await {
+            Ok(r) => r.json().await.unwrap_or_default(),
+            Err(_) => Vec::new(),
+        };
+        for e in &batch {
+            cursor = cursor.max(e["seq"].as_u64().unwrap_or(cursor));
+            last_seen = tokio::time::Instant::now();
+            let eff = &e["effect"];
+            if eff["t"] != "said" {
+                continue;
+            }
+            let Some(from) = eff["from"].as_str().and_then(|s| miot_keys::from_hex(s).ok()) else { continue };
+            if from == *me {
+                continue; // our own line, echoed back through the log
+            }
+            got_one = true;
+            let body = eff["body"].as_str().unwrap_or("");
+            println!("{DIM}  {}{OFF}  {body}", name_of(roster, &from));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+    cursor
+}
+
+/// On start, print what the node still holds — `docs/CLI.md` §4's "replay of
+/// recent litter traffic... so scrollback has context," bounded to the last
+/// `n`. `since=0` is the honest boundary today: `miot-node` keeps an
+/// in-memory ring (`LOG_CAP`, 4096 entries) and nothing else, so this *is*
+/// everything since boot. Once `miot-store` is wired in (HANDOFF item 2),
+/// the real "since last compaction" boundary lands here unchanged — the
+/// node deciding what it still holds is the node's business, not this
+/// client's.
+///
+/// Returns the highest `seq` seen, so the caller's live polling starts
+/// exactly where the replay left off rather than re-printing it.
+async fn replay(http: &reqwest::Client, node: &str, roster: &[(String, AccountId)], n: usize) -> u64 {
+    let batch: Vec<serde_json::Value> = match http.get(format!("{node}/events?since=0")).send().await {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    };
+    let cursor = batch.iter().filter_map(|e| e["seq"].as_u64()).max().unwrap_or(0);
+    if batch.is_empty() {
+        return cursor;
+    }
+    println!("{DIM}  — replaying since boot ({} of {} events) —{OFF}", batch.len().min(n), batch.len());
+    for e in batch.iter().rev().take(n).rev() {
+        let eff = &e["effect"];
+        if eff["t"] == "said" {
+            let from = eff["from"].as_str().and_then(|s| miot_keys::from_hex(s).ok());
+            let label = from.map(|a| name_of(roster, &a)).unwrap_or_else(|| "?".into());
+            println!("{DIM}  {label}  {}{OFF}", eff["body"].as_str().unwrap_or(""));
+        } else {
+            println!("{DIM}  block {}  {eff}{OFF}", e["block"]);
+        }
+    }
+    println!("{DIM}  — end replay —{OFF}");
+    cursor
+}
+
+/// Interactive — `--rpc <url> --chat`. Same REPL as the in-process `--chat`
+/// (`chat.rs`): type a line, it becomes a `say`, `@name` tags, `/clear`
+/// fails every open task, blank line or `/quit` leaves. The difference is
+/// entirely underneath: every line is a real signed extrinsic, and replies
+/// come from whatever cats are actually running against this node, not a
+/// simulated turn in this process.
+pub async fn chat(node: &str, seed: Option<&str>, roster: &str) {
+    let identity = match seed {
+        Some(s) => Identity::from_seed(&parse_seed(s)),
+        None => load_or_create_identity(),
+    };
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap();
+    let me = identity.account();
+    let map = roster_map(roster);
+
+    println!("  {DIM}chat (remote) — {node}, /clear to fail every open task, blank line or /quit to leave{OFF}");
+    for (n, a) in &map {
+        if *a != me {
+            println!("    {n}  {DIM}{}{OFF}", miot_keys::short(a));
+        }
+    }
+
+    let mut cursor = match http.get(format!("{node}/head")).send().await {
+        Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|h| h["seq"].as_u64()).unwrap_or(0),
+        Err(_) => 0,
+    };
+
+    let stdin = std::io::stdin();
+    let mut lines = stdin.lock().lines();
+    loop {
+        prompt(&name_of(&map, &me));
+        let Some(Ok(line)) = lines.next() else { break };
+        let line = line.trim().to_string();
+        if line.is_empty() || line == "/quit" {
+            break;
+        }
+        if line == "/clear" {
+            submit(&http, node, &identity, RuntimeCall::Litter(pallet_litter::Call::clear_all {})).await;
+            continue;
+        }
+
+        let to = line.split_whitespace().find_map(|w| w.strip_prefix('@')).and_then(|n| resolve(roster, n));
+        submit(&http, node, &identity, RuntimeCall::Litter(pallet_litter::Call::say { to, body: line })).await;
+        cursor = wait_for_replies(&http, node, cursor, &map, &me, 200).await;
+    }
+    println!("\n{DIM}  bye.{OFF}");
 }
 
 /// One-shot: sign, submit, watch the log for a few seconds, exit.
@@ -223,5 +383,5 @@ pub async fn run(
         return;
     }
 
-    watch(&http, node, since, 8).await;
+    watch(&http, node, since, Some(8)).await;
 }

@@ -111,6 +111,10 @@ async fn main() {
     if let Some(node) = arg("--rpc") {
         let seed = arg("--identity-seed");
         let roster = arg("--roster").unwrap_or_else(|| "root=1,mimi=2,tama=3,kuro=4,sora=5".to_string());
+        if is_chat {
+            rpc::chat(&node, seed.as_deref(), &roster).await;
+            return;
+        }
         let open = arg("--open");
         let say = arg("--say");
         let to = arg("--to");
