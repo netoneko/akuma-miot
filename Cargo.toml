@@ -21,6 +21,8 @@ repository = "https://github.com/netoneko/akuma-miot"
 [workspace.dependencies]
 miot-primitives = { path = "crates/miot-primitives", default-features = false }
 miot-tasks = { path = "crates/miot-tasks", default-features = false }
+# One pin for the whole Substrate surface. See crates/pallet-litter/Cargo.toml.
+polkadot-sdk = { version = "2606", default-features = false }
 
 [profile.release]
 lto = true

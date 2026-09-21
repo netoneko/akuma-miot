@@ -43,7 +43,7 @@ use miot_primitives::{
 /// discriminator, and the accessors below refuse the wrong kind rather than
 /// quietly doing nothing.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo))]
 #[cfg_attr(feature = "codec", scale_info(skip_type_params(A)))]
 pub struct Task<A> {
     pub id: TaskId,
@@ -94,7 +94,7 @@ impl<A> Task<A> {
 /// upgrade instead of a migration, and every block does not pay to encode and
 /// decode a struct of constants that never change.
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, scale_info::TypeInfo))]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo))]
 #[cfg_attr(feature = "codec", scale_info(skip_type_params(A)))]
 pub struct State<A> {
     pub tasks: Vec<Task<A>>,

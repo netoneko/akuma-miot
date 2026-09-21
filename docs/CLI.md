@@ -185,6 +185,51 @@ events, it does not draw a composer. An agent has no keyboard.
 
 ---
 
+## 5a. Connecting: any node, no database
+
+The CLI is a **client of the chain**, never a peer of it. Three cases, one
+code path:
+
+| Case | What runs locally | State on disk |
+|---|---|---|
+| `miot run --as tama` | a full node **in-process** + the agent loop | the node's DB |
+| `miot task open "…"` on a cat's host | nothing | none |
+| `miot task open "…"` from a laptop | nothing | none |
+
+In every case the CLI reaches the chain over **RPC**, even when the node it is
+talking to is inside the very same process. That is deliberate: grabbing the
+embedded node's client handle directly would be faster and would create a
+second code path that only works when co-located — and then the remote case
+(an operator on a laptop, an agent on an Akuma guest) would be a port rather
+than a config change.
+
+```
+  miot --rpc ws://any-cat:9944 task open "debate & report"
+  miot --rpc ws://localhost:9944 artifact t42
+  miot                                   # interactive, default endpoint from config
+```
+
+- **Any swarm node will do.** There is no privileged endpoint; every cat runs
+  the same node. A dead endpoint is a reconnect to the next one in the list,
+  not an outage.
+- **No database is downloaded.** An operator CLI holds no state at all — it
+  submits an extrinsic or reads storage and exits.
+- The CLI **may** run a node (`miot run`), but only a cat needs to.
+
+### Trust
+
+Plain RPC means trusting the node you asked, and that is **correct here, not a
+compromise**. The litter is one operator and one trust domain, and the operator
+holds the root key — the key is what authority is checked against
+(`ensure_signed`, `EnsureRoot`), so trusting a swarm you own and key is not a
+gap to close.
+
+No light client, no storage proofs, no smoldot. Verifying a swarm against
+itself would buy nothing when the thing being verified and the thing verifying
+are both yours.
+
+---
+
 ## 6. Visual style
 
 Copied from Akuma. `assets/` holds the vendored art.

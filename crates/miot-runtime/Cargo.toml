@@ -1,0 +1,38 @@
+[package]
+name = "miot-runtime"
+description = "The Akuma Miot chain runtime — pallet-litter plus consensus"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+codec = { package = "parity-scale-codec", version = "3", default-features = false, features = ["derive"] }
+scale-info = { version = "2", default-features = false, features = ["derive"] }
+polkadot-sdk = { workspace = true, features = [
+  "frame-executive", "frame-support", "frame-system",
+  "pallet-aura", "pallet-balances", "pallet-grandpa", "pallet-sudo",
+  "pallet-timestamp", "pallet-transaction-payment",
+  "sp-api", "sp-block-builder", "sp-consensus-aura", "sp-consensus-grandpa",
+  "sp-core", "sp-genesis-builder", "sp-inherents", "sp-offchain", "sp-runtime",
+  "sp-session", "sp-transaction-pool", "sp-version",
+  "frame-system-rpc-runtime-api", "pallet-transaction-payment-rpc-runtime-api",
+] }
+pallet-litter = { path = "../pallet-litter", default-features = false }
+
+# Compiles the runtime to wasm. The blob is what the node executes and what a
+# forkless upgrade would replace — not needed *yet* (nobody is upgrading
+# anything), but it is how polkadot-sdk executes a runtime at all, since native
+# execution was removed. See docs/MAPPING_REPORT.md §5.2.
+[build-dependencies]
+substrate-wasm-builder = { version = "34", optional = true }
+
+[features]
+default = ["std"]
+std = [
+  "codec/std",
+  "scale-info/std",
+  "polkadot-sdk/std",
+  "pallet-litter/std",
+  "dep:substrate-wasm-builder",
+]

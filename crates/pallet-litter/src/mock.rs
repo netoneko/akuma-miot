@@ -1,5 +1,7 @@
 //! A minimal runtime: `frame_system` + this pallet, nothing else.
 
+use polkadot_sdk::*;
+
 use frame_support::{derive_impl, parameter_types};
 use sp_runtime::BuildStorage;
 
@@ -35,7 +37,6 @@ parameter_types! {
 }
 
 impl crate::Config for Test {
-    type RuntimeEvent = RuntimeEvent;
     type ClaimWindow = ClaimWindow;
     type Lease = Lease;
     type WorkNag = WorkNag;

@@ -32,10 +32,16 @@
 
 extern crate alloc;
 
+use polkadot_sdk::*;
+
 pub use pallet::*;
 
 #[frame_support::pallet]
 pub mod pallet {
+    // The umbrella re-exports every sub-crate as a module, and the glob at
+    // crate root does not reach inside this one.
+    use polkadot_sdk::*;
+
     use alloc::string::String;
     use alloc::vec::Vec;
     use frame_support::pallet_prelude::*;
@@ -66,9 +72,11 @@ pub mod pallet {
     pub struct Pallet<T>(_);
 
     #[pallet::config]
-    pub trait Config: frame_system::Config {
-        type RuntimeEvent: From<Event<Self>>
-            + IsType<<Self as frame_system::Config>::RuntimeEvent>;
+    pub trait Config: polkadot_sdk::frame_system::Config {
+        // `type RuntimeEvent` is deliberately absent. Since polkadot-sdk's
+        // 2412-era FRAME it is a reserved associated type inherited from
+        // `frame_system::Config`, and re-declaring it here is an error rather
+        // than a redundancy.
 
         // ---- timers, in BLOCKS ------------------------------------------
         //
