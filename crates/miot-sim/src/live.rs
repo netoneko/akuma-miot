@@ -16,20 +16,20 @@
 
 use miot_llm::{task_tools, Llm, Turn};
 use miot_primitives::{Act, Directive, Effect, PlanItem, TaskId, TaskStatus};
-use miot_runtime::{Litter, RuntimeOrigin, System};
+use miot_runtime::{AccountId, Litter, RuntimeOrigin, System};
 use polkadot_sdk::*;
 
 use frame_support::traits::OnInitialize;
 
 use crate::{colour, drain, name, new_ext, DIM, OFF};
 
-pub const ROOT: u64 = 1;
-const MIMI: u64 = 2;
-const TAMA: u64 = 3;
-const KURO: u64 = 4;
-const SORA: u64 = 5;
+pub const ROOT: AccountId = AccountId::new([1u8; 32]);
+const MIMI: AccountId = AccountId::new([2u8; 32]);
+const TAMA: AccountId = AccountId::new([3u8; 32]);
+const KURO: AccountId = AccountId::new([4u8; 32]);
+const SORA: AccountId = AccountId::new([5u8; 32]);
 
-pub fn account(n: &str) -> Option<u64> {
+pub fn account(n: &str) -> Option<AccountId> {
     match n.trim().trim_start_matches('@').to_ascii_lowercase().as_str() {
         "mimi" => Some(MIMI),
         "tama" => Some(TAMA),
@@ -64,7 +64,7 @@ fn host_facts() -> String {
 /// identical cats produces four identical answers and the leader learns nothing
 /// from having asked twice — heterogeneity is what makes a second opinion an
 /// opinion.
-fn character(who: u64) -> &'static str {
+fn character(who: AccountId) -> &'static str {
     match who {
         MIMI => include_str!("../personas/mimi.md"),
         TAMA => include_str!("../personas/tama.md"),
@@ -73,7 +73,7 @@ fn character(who: u64) -> &'static str {
     }
 }
 
-fn persona(who: u64, is_leader: bool, brief: &str) -> String {
+fn persona(who: AccountId, is_leader: bool, brief: &str) -> String {
     let protocol = format!(
         "{}\nThe litter coordinates over a blockchain: every act you take is an \
          extrinsic, and the chain decides what happens next.\n\n\
@@ -112,10 +112,10 @@ fn persona(who: u64, is_leader: bool, brief: &str) -> String {
     format!("{}{material}{protocol}{role}", character(who))
 }
 
-fn banner(block: u64, who: u64, t: &Turn, what: &str) {
+fn banner(block: u64, who: AccountId, t: &Turn, what: &str) {
     println!(
         "{DIM}{block:>4}{OFF}  {}{:>5}{OFF}  {what} {DIM}({} tok, {:.1}s){OFF}",
-        colour(who),
+        colour(who.clone()),
         name(who),
         t.tokens,
         t.ms as f64 / 1000.0
@@ -132,14 +132,14 @@ fn banner(block: u64, who: u64, t: &Turn, what: &str) {
 /// `--models mimi=gemma4-yolo-4b:latest,tama=gemma3:4b,...`, or one `--model`
 /// for all of them. A heterogeneous litter is the interesting case: the cats
 /// disagree for reasons other than sampling noise.
-pub const CATS: [u64; 4] = [MIMI, TAMA, KURO, SORA];
+pub const CATS: [AccountId; 4] = [MIMI, TAMA, KURO, SORA];
 
-pub fn cat_name(a: u64) -> &'static str { name(a) }
+pub fn cat_name(a: AccountId) -> &'static str { name(a) }
 
-pub fn personas(who: u64, is_leader: bool, brief: &str) -> String { persona(who, is_leader, brief) }
+pub fn personas(who: AccountId, is_leader: bool, brief: &str) -> String { persona(who, is_leader, brief) }
 
 pub struct Bench {
-    by_cat: Vec<(u64, Llm)>,
+    by_cat: Vec<(AccountId, Llm)>,
     fallback: Llm,
 }
 
@@ -171,10 +171,10 @@ impl Bench {
         Bench { by_cat, fallback: Llm::local(host, default_model) }
     }
 
-    pub fn for_cat(&self, who: u64) -> &Llm {
+    pub fn for_cat(&self, who: &AccountId) -> &Llm {
         self.by_cat
             .iter()
-            .find(|(a, _)| *a == who)
+            .find(|(a, _)| a == who)
             .map(|(_, l)| l)
             .unwrap_or(&self.fallback)
     }
@@ -184,7 +184,12 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
     let bench = Bench::new(host, model, models);
     println!("  {DIM}live via {host}{OFF}");
     for who in [MIMI, TAMA, KURO, SORA] {
-        println!("    {}{:>5}{OFF} {DIM}{}{OFF}", colour(who), name(who), bench.for_cat(who).label());
+        println!(
+            "    {}{:>5}{OFF} {DIM}{}{OFF}",
+            colour(who.clone()),
+            name(who.clone()),
+            bench.for_cat(&who).label()
+        );
     }
     println!("{DIM}block  who    what{OFF}");
     println!("{DIM}──────────────────────────────────────────────────────────────{OFF}");
@@ -248,7 +253,7 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                                         format!(
                                             "{} from {}: {}",
                                             t.id,
-                                            t.assignee.map(name).unwrap_or("?"),
+                                            t.assignee.clone().map(name).unwrap_or("?"),
                                             t.outcome.as_ref().map(|o| o.text()).unwrap_or("")
                                         )
                                     })
@@ -273,7 +278,7 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                                         format!(
                                             "{} ({}): {}",
                                             t.id,
-                                            t.assignee.map(name).unwrap_or("?"),
+                                            t.assignee.clone().map(name).unwrap_or("?"),
                                             t.outcome.as_ref().map(|o| o.text()).unwrap_or("")
                                         )
                                     })
@@ -303,7 +308,7 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                                         format!(
                                             "{} is stuck with {} (offered {} times, never claimed)",
                                             t.id,
-                                            t.assignee.map(name).unwrap_or("?"),
+                                            t.assignee.clone().map(name).unwrap_or("?"),
                                             t.reoffers
                                         )
                                     })
@@ -321,10 +326,10 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                         }
                         Directive::LeaderElected => continue,
                     };
-                    (*to, p)
+                    (to.clone(), p)
                 }
                 Effect::Assigned { to, task, what, .. } => (
-                    *to,
+                    to.clone(),
                     format!(
                         "The litter is working on this question:\n{question}\n\n\
                          [assigned: {task}] Your part: {what}\n\
@@ -336,7 +341,7 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                         Litter::task(*task).map(|t| t.text).unwrap_or_default()
                     });
                     (
-                        *to,
+                        to.clone(),
                         format!(
                             "The litter is working on this question:\n{question}\n\n\
                              [work: {task}] You claimed this part: {mine}\n\
@@ -356,8 +361,8 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
             };
 
             let turn = match bench
-                .for_cat(who)
-                .turn(&persona(who, who == MIMI, brief), &prompt, task_tools())
+                .for_cat(&who)
+                .turn(&persona(who.clone(), who == MIMI, brief), &prompt, task_tools())
                 .await
             {
                 Ok(t) => t,
@@ -372,7 +377,7 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
                 continue;
             }
             for c in &turn.calls {
-                apply(&mut ext, block, who, c, &turn);
+                apply(&mut ext, block, who.clone(), c, &turn);
             }
         }
     }
@@ -400,7 +405,7 @@ pub async fn run(host: &str, model: &str, models: &str, task: &str, brief: &str)
 fn apply(
     ext: &mut sp_io::TestExternalities,
     block: u64,
-    who: u64,
+    who: AccountId,
     c: &miot_llm::Call,
     turn: &Turn,
 ) {
@@ -417,7 +422,7 @@ fn apply(
     match c.name.as_str() {
         "TaskPlan" => {
             let Some(task) = c.str("task").and_then(|t| parse_task(&t)) else { return };
-            let items: Vec<PlanItem<u64>> = c
+            let items: Vec<PlanItem<AccountId>> = c
                 .args
                 .get("assignments")
                 .and_then(|a| a.as_array())
@@ -434,7 +439,7 @@ fn apply(
                 })
                 .unwrap_or_default();
             let n = items.len();
-            let r = ext.execute_with(|| Litter::plan(RuntimeOrigin::signed(who), task, items));
+            let r = ext.execute_with(|| Litter::plan(RuntimeOrigin::signed(who.clone()), task, items));
             match r {
                 Ok(()) => banner(block, who, turn, &format!("TaskPlan {task} → {n} sub-tasks")),
                 Err(e) => banner(block, who, turn, &format!("TaskPlan {task} REFUSED: {e:?}")),
@@ -446,7 +451,7 @@ fn apply(
                 banner(block, who, turn, "TaskReassign: unknown cat");
                 return;
             };
-            let r = ext.execute_with(|| Litter::reassign(RuntimeOrigin::signed(who), task, to));
+            let r = ext.execute_with(|| Litter::reassign(RuntimeOrigin::signed(who.clone()), task, to.clone()));
             match r {
                 Ok(()) => banner(block, who, turn, &format!("re-homed {task} → {}", name(to))),
                 Err(e) => banner(block, who, turn, &format!("reassign {task} REFUSED: {e:?}")),
@@ -466,7 +471,7 @@ fn apply(
             };
             let text = c.str("text").unwrap_or_default();
             let r = ext.execute_with(|| {
-                Litter::update(RuntimeOrigin::signed(who), task, act, text)
+                Litter::update(RuntimeOrigin::signed(who.clone()), task, act, text)
             });
             match r {
                 Ok(()) => banner(block, who, turn, &format!("{} {task}", act.as_str())),

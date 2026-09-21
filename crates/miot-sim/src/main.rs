@@ -17,18 +17,23 @@
 //!   4. clearance, and a markdown artifact committed on chain.
 
 use miot_primitives::{Act, Directive, Effect, PlanItem, TaskId};
-use miot_runtime::{Litter, Runtime, RuntimeOrigin, System};
+use miot_runtime::{AccountId, Litter, Runtime, RuntimeOrigin, System};
 use polkadot_sdk::*;
 
 use frame_support::traits::OnInitialize;
 
-const ROOT: u64 = 1;
-const MIMI: u64 = 2; // leader
-const TAMA: u64 = 3; // works
-const KURO: u64 = 4; // never answers — the cat we have to recover from
-const SORA: u64 = 5; // picks up what kuro dropped
+/// Fixed, reproducible byte patterns — not derived from a real
+/// `miot_keys::Identity` seed, because nothing in this file signs anything:
+/// every call here goes straight into `RuntimeOrigin::signed` in-process, the
+/// same way it always did. Only `--rpc` (a real node, which actually verifies
+/// a signature) needs a real keypair — see `rpc.rs`.
+const ROOT: AccountId = AccountId::new([1u8; 32]);
+const MIMI: AccountId = AccountId::new([2u8; 32]); // leader
+const TAMA: AccountId = AccountId::new([3u8; 32]); // works
+const KURO: AccountId = AccountId::new([4u8; 32]); // never answers — the cat we have to recover from
+const SORA: AccountId = AccountId::new([5u8; 32]); // picks up what kuro dropped
 
-pub fn name(a: u64) -> &'static str {
+pub fn name(a: AccountId) -> &'static str {
     match a {
         ROOT => "root",
         MIMI => "mimi",
@@ -41,7 +46,7 @@ pub fn name(a: u64) -> &'static str {
 
 /// One ANSI colour per sender, reused every time that cat acts — the thing that
 /// makes a scroll of the whole litter's back-and-forth readable at a glance.
-pub fn colour(a: u64) -> &'static str {
+pub fn colour(a: AccountId) -> &'static str {
     match a {
         ROOT => "\x1b[97m",
         MIMI => "\x1b[95m",
@@ -55,11 +60,11 @@ pub fn colour(a: u64) -> &'static str {
 pub const DIM: &str = "\x1b[2m";
 pub const OFF: &str = "\x1b[0m";
 
-fn who(a: u64) -> String {
-    format!("{}{:>5}{}", colour(a), name(a), OFF)
+fn who(a: AccountId) -> String {
+    format!("{}{:>5}{}", colour(a.clone()), name(a), OFF)
 }
 
-fn say(block: u64, actor: u64, what: String) {
+fn say(block: u64, actor: AccountId, what: String) {
     println!("{DIM}{block:>4}{OFF}  {}  {what}", who(actor));
 }
 
@@ -79,7 +84,7 @@ pub fn new_ext() -> sp_io::TestExternalities {
 }
 
 /// Everything the chain emitted since the last call.
-pub fn drain() -> Vec<Effect<u64>> {
+pub fn drain() -> Vec<Effect<AccountId>> {
     let out: Vec<_> = System::events()
         .into_iter()
         .filter_map(|r| match r.event {
@@ -238,7 +243,7 @@ async fn main() {
                             note(block, &format!("offer of {task} → kuro (no answer)"));
                             continue;
                         }
-                        Litter::update(RuntimeOrigin::signed(to), task, Act::Claim, String::new())
+                        Litter::update(RuntimeOrigin::signed(to.clone()), task, Act::Claim, String::new())
                             .expect("assignee may claim");
                         say(block, to, format!("claimed {task}"));
                     }
@@ -251,7 +256,7 @@ async fn main() {
                             _ => "done",
                         };
                         if Litter::update(
-                            RuntimeOrigin::signed(to),
+                            RuntimeOrigin::signed(to.clone()),
                             task,
                             Act::Done,
                             result.into(),
@@ -279,7 +284,7 @@ async fn main() {
                     "\n  {DIM}artifact for t1, read back out of chain state \
                      ({} bytes, by {}){OFF}\n",
                     a.body.len(),
-                    name(a.author)
+                    name(a.author.clone())
                 );
                 for line in a.body.lines() {
                     println!("  │ {line}");
@@ -305,7 +310,7 @@ fn render_report(parent: TaskId) -> String {
         s.push_str(&format!(
             "### {} — {}\n{}\n\n",
             t.id,
-            t.assignee.map(name).unwrap_or("?"),
+            t.assignee.clone().map(name).unwrap_or("?"),
             t.outcome.as_ref().map(|o| o.text()).unwrap_or("(none)")
         ));
     }

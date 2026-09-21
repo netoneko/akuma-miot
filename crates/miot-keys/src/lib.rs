@@ -166,5 +166,29 @@ pub fn short(a: &AccountId32) -> String {
     AsRef::<[u8]>::as_ref(a)[..4].iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// The full account, as it travels on every wire outside this crate: JSON
+/// bodies, `MIOT_ROSTER`, query params. Plain hex, no SS58 — SS58 buys a
+/// checksum and a network prefix, neither of which means anything for one
+/// operator's own chain.
+pub fn to_hex(a: &AccountId32) -> String {
+    AsRef::<[u8]>::as_ref(a).iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The inverse of [`to_hex`]. Rejects anything that is not exactly 32 bytes
+/// of hex — a truncated account must be a parse error, never a silently
+/// short one, the same rule [`public_from_ssh`] already follows.
+pub fn from_hex(s: &str) -> Result<AccountId32, KeyError> {
+    let s = s.trim().trim_start_matches("0x");
+    if s.len() != 64 {
+        return Err(KeyError::Malformed("account hex must be exactly 32 bytes"));
+    }
+    let mut out = [0u8; 32];
+    for (i, byte) in out.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&s[i * 2..i * 2 + 2], 16)
+            .map_err(|_| KeyError::Malformed("account hex is not valid hex"))?;
+    }
+    Ok(AccountId32::new(out))
+}
+
 #[cfg(test)]
 mod tests;

@@ -5391,7 +5391,14 @@ dependencies = [
 name = "miot-cat"
 version = "0.1.0"
 dependencies = [
+ "hex",
+ "miot-keys",
  "miot-llm",
+ "miot-primitives",
+ "miot-runtime",
+ "pallet-litter",
+ "parity-scale-codec",
+ "polkadot-sdk",
  "reqwest 0.12.28",
  "serde",
  "serde_json",
@@ -5421,10 +5428,13 @@ name = "miot-node"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "hex",
+ "miot-keys",
  "miot-primitives",
  "miot-runtime",
  "miot-store",
  "pallet-litter",
+ "parity-scale-codec",
  "polkadot-sdk",
  "serde",
  "serde_json",
@@ -5443,6 +5453,7 @@ dependencies = [
 name = "miot-runtime"
 version = "0.1.0"
 dependencies = [
+ "miot-keys",
  "miot-primitives",
  "pallet-litter",
  "parity-scale-codec",

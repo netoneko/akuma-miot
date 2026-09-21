@@ -111,3 +111,25 @@ fn short_form_is_the_leading_bytes() {
     assert_eq!(s.len(), 8);
     assert_eq!(s, hex::encode(&id.public().0[..4]));
 }
+
+#[test]
+fn to_hex_round_trips_through_from_hex() {
+    let id = Identity::from_seed(&[0x42; 32]);
+    let hex = to_hex(&id.account());
+    assert_eq!(hex.len(), 64);
+    assert_eq!(from_hex(&hex).unwrap(), id.account());
+    // Case and a leading 0x are both tolerated.
+    assert_eq!(from_hex(&format!("0x{}", hex.to_uppercase())).unwrap(), id.account());
+}
+
+#[test]
+fn from_hex_rejects_the_wrong_length() {
+    assert!(matches!(from_hex("ab"), Err(KeyError::Malformed(_))));
+    assert!(matches!(from_hex(""), Err(KeyError::Malformed(_))));
+}
+
+#[test]
+fn from_hex_rejects_non_hex_characters() {
+    let bad = "z".repeat(64);
+    assert!(matches!(from_hex(&bad), Err(KeyError::Malformed(_))));
+}

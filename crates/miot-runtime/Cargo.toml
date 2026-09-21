@@ -25,6 +25,10 @@ polkadot-sdk = { workspace = true, features = [
 ] }
 miot-primitives = { workspace = true, features = ["codec"] }
 pallet-litter = { path = "../pallet-litter", default-features = false }
+# Only for the `client` module (signing) — always std, same as `miot-node`'s
+# own dependency on it, since nothing builds this crate for a `no_std` target
+# today anyway (there is no wasm build).
+miot-keys = { path = "../miot-keys" }
 
 [features]
 default = ["std"]
