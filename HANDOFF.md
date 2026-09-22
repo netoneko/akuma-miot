@@ -192,13 +192,23 @@ toolchain `build-akuma.sh` already used, copied onto the VM's own disk with
 connected. The node never noticed it moved — which is the actual point of
 `docs/CLI.md` §5a and `overlays/local/README.md` Stage 1, now demonstrated
 rather than asserted.
+**a second node, replicated for real, 2026-09-22** — `node2` in
+`overlays/local/docker-compose.yml` runs `miot-node` as `MIOT_ROLE=replica`,
+pulling `node`'s block log over HTTP; `rewind_for_fork` has now run against a
+real disagreement, not a synthetic one (item 5, above, has the story). Six
+containers now, not five.
 
 **Not yet real:**
 
-- **No consensus.** One node owns the chain. `rewind_for_fork` has never run
-  against a real disagreement because there is nothing to disagree with.
-  (`miot-store` itself is wired in now, see below — this gap is specifically
-  the *absence of a second node to disagree with*, not persistence.)
+- **No election, no automatic failover.** A node's role (primary/replica) is
+  an operator-set env var, changed by restarting the process — deliberate,
+  same trust model as `set_leader`/`set_root`, but it means nothing detects
+  a dead primary and promotes a replica on its own. Fine for one operator's
+  swarm; would need real work for anything else.
+- **`compact()` is never called.** The store only grows, and — new
+  consequence as of item 5 — every replica reconciliation lands at genesis
+  rather than a partial rewind, because there is no checkpoint to land on
+  closer than that. See item 5's writeup and `docs/references/storage.md`.
 - **Akuma is untested.** Every claim in the docs about Akuma is inference.
   `dist/storeprobe` exists to replace one of those paragraphs with a fact.
 - **No OpenSSH private-key signing.** `miot-keys` reads the operator's
@@ -298,12 +308,40 @@ rather than asserted.
    `llama-swarm.sh` binds `127.0.0.1` only, so this also needs a deliberate
    decision about exposing an inference port on the LAN, not just a bind-flag
    change.
-5. **A second node** — only then does `rewind_for_fork` get exercised. Item 2
-   is done, so this is now unblocked on that front, but still needs an actual
-   P2P/gossip layer between nodes — `miot-node` today has zero networking
-   beyond serving its own HTTP API to clients; every cat is a client of one
-   shared node, not a peer running its own. That's the gap this item is
-   really about, not persistence.
+5. ~~**A second node.**~~ **Done, 2026-09-22.** `miot-node` gained a role
+   (`MIOT_ROLE=primary|replica`) rather than a full P2P/gossip layer — a
+   replica pulls its peer's block log over two new HTTP endpoints
+   (`GET /chain/head`, `GET /chain/blocks?from=N&limit=M`) and folds new
+   blocks in through the same `Node::apply_block` a local-store replay
+   already used, refusing `/submit` itself (read-only). Deliberately not
+   called "leader"/"follower" — `pallet-litter`'s `leader` is already the
+   *litter* leader (an agent role); this is a different axis and needed
+   different words: **primary**/**replica**. No election, no automatic
+   failover — an operator changes a node's role by restarting it with
+   different env vars, same trust model as everything else here.
+   Verified live: `node2` (`overlays/local/docker-compose.yml`) mirrors
+   `node`'s `/tasks`/`/events` within one sync interval and survives its own
+   restart. More importantly, `rewind_for_fork` finally ran against a real
+   disagreement rather than a synthetic one — a standalone third `miot-node`
+   was pointed at `node`'s peer as a replica, killed, restarted independently
+   as its own primary, given a submit that only it received (diverging its
+   log), then pointed back at `node` as a replica again. It printed `sync:
+   diverged from peer above block 481, rewound to 0 (dropped 485 block(s))`
+   and came back byte-for-field identical to `node`. One real bug found and
+   fixed doing this: an early version compared only the tip block for
+   divergence, which missed it — an empty `Vec<Effect>` (a "quiet" block,
+   the common case) encodes identically no matter which chain produced it,
+   so a diverged block sitting under a few agreeing quiet blocks above it
+   went undetected. Fixed by comparing the replica's *entire* local range
+   against the peer once, at (re)connect (`reconcile_if_diverged`), rather
+   than the tip on every tick — cheap because a replica that only ever
+   appends blocks it received from its peer cannot diverge from it again on
+   its own before the next restart. **Known limitation, not a regression**:
+   `compact()` is still never called anywhere (a separate, still-open item),
+   so `last_checkpoint` is always 0 and every reconciliation lands at
+   genesis today, full-replaying the peer's whole history rather than a
+   partial rewind — correct per the documented rule, just more expensive
+   than it will be once compaction is wired in.
 
 ---
 

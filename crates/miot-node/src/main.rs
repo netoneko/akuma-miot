@@ -79,25 +79,56 @@ struct Entry {
     wakes: Option<String>,
 }
 
+/// A node's role in chain replication — HANDOFF item 5. Deliberately not
+/// called "leader"/"follower": `pallet-litter`'s `leader` is already the
+/// *litter* leader, an agent role (`mimi`, `set_leader`). This is a
+/// different axis entirely — which process's block log is canonical — so it
+/// gets different words: **primary** (produces blocks, accepts `/submit`)
+/// and **replica** (pulls the primary's log over HTTP, read-only).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Primary,
+    Replica,
+}
+
+fn role_env() -> Role {
+    match std::env::var("MIOT_ROLE").as_deref() {
+        Ok("replica") => Role::Replica,
+        _ => Role::Primary,
+    }
+}
+
 struct Node {
     ext: sp_io::TestExternalities,
     log: VecDeque<Entry>,
     seq: u64,
     block: u64,
     /// The hash the block *currently open* for extrinsics will chain to when
-    /// it closes. Updated only in [`Node::advance`], which only the block
-    /// timer calls.
+    /// it closes. Updated only in [`Node::advance`] (primary) or
+    /// [`Node::apply_block`] (replica), never both for the same node.
     parent_hash: H256,
     /// The chain's persisted block log — HANDOFF item 2. `None` means
     /// running without persistence (state lost on restart, as this always
     /// did before); `Some` means every block's effects are written to disk
-    /// as they close and replayed on the next start.
+    /// as they close and replayed on the next start. A replica requires
+    /// `Some` — see `main`.
     store: Option<miot_store::Store>,
     /// Effects absorbed since the currently-open block began — what
     /// [`Node::advance`] persists as that block's body when it closes.
     /// State is a fold over effects (`docs/PROTOCOL.md`), so this is
     /// literally the same log `apply` already knows how to replay.
     pending: Vec<Effect<AccountId>>,
+    /// Primary or replica — HANDOFF item 5. See [`Role`].
+    role: Role,
+    /// The primary's base URL. `Some` only for a replica.
+    peer: Option<String>,
+    /// Used for the replica's sync loop; unused (but harmless) on a primary.
+    http: reqwest::Client,
+    /// Kept so a replica can rebuild genesis from scratch after
+    /// [`reconcile`] detects a real fork — see there for why that's always
+    /// a full rebuild today, not a partial rewind.
+    genesis_root: AccountId,
+    genesis_leader: AccountId,
 }
 
 const LOG_CAP: usize = 4096;
@@ -223,47 +254,60 @@ impl Node {
         self.pending.clear();
     }
 
+    /// Fold one already-decided block's effects into `self.ext`. Assumes
+    /// block `height` is the one currently open — either from [`genesis`]
+    /// (height 1) or from the previous call's own trailing
+    /// `initialize_block` (every height after). Finalizes it, absorbs the
+    /// effects into `self.log`/`/events`, clears `self.pending` (these
+    /// effects are already decided and, for a replay, already on disk — the
+    /// live block loop must not persist them a second time under some later
+    /// height), then opens the next block.
+    ///
+    /// The one place a stored or peer-fetched block gets folded back into
+    /// state — [`Node::replay`] (local store, on start) and the replica sync
+    /// loop (`sync_once`, over the network) both call this rather than each
+    /// having their own copy of the sequence, the same "one place, not two
+    /// paths to drift apart" principle `docs/PROTOCOL.md` already applies to
+    /// `TaskTable::apply`.
+    ///
+    /// Folds through `pallet_litter::Pallet::replay_effect` rather than
+    /// re-applying the original extrinsics — no signatures, nonces or
+    /// mortality to re-check, because none of that touches state; only the
+    /// effect does (`docs/PROTOCOL.md`).
+    fn apply_block(&mut self, height: u64, effects: Vec<Effect<AccountId>>) {
+        self.ext.execute_with(|| {
+            let now: miot_primitives::BlockNumber =
+                frame_system::Pallet::<Runtime>::block_number().unique_saturated_into();
+            for e in &effects {
+                pallet_litter::Pallet::<Runtime>::replay_effect(e, now);
+            }
+        });
+        let header = self.ext.execute_with(Executive::finalize_block);
+        self.parent_hash = header.hash();
+        self.absorb(effects);
+        self.pending.clear();
+        self.block = height + 1;
+        let next = Header::new(self.block, Default::default(), Default::default(), self.parent_hash, Default::default());
+        self.ext.execute_with(|| Executive::initialize_block(&next));
+    }
+
     /// Rebuild state from the store on start, one block at a time, from
     /// height 1 through `store.head()`. Block 1's `initialize_block` was
     /// already run by [`genesis`] (needed either way, to install root/leader
-    /// and hand out `catnip`), so this only opens blocks 2 and up itself.
-    ///
-    /// Folds each stored effect through `pallet_litter::Pallet::replay_effect`
-    /// rather than re-applying the original extrinsics — no signatures, nonces
-    /// or mortality to re-check, because none of that touches state; only the
-    /// effect does (`docs/PROTOCOL.md`). Also rebuilds `self.log` (via the
-    /// same [`Node::absorb`] the live path uses) so `/events` has history
-    /// across a restart, then clears `self.pending` after each height — those
-    /// effects are already on disk, replaying them must not re-append them.
+    /// and hand out `catnip`), which is what makes it safe for
+    /// [`Node::apply_block`] to assume the height it's given is already open.
     fn replay(&mut self, store: &miot_store::Store) {
         let head = store.head();
         if head == 0 {
             return;
         }
         for h in 1..=head {
-            if h > 1 {
-                let next = Header::new(h, Default::default(), Default::default(), self.parent_hash, Default::default());
-                self.ext.execute_with(|| Executive::initialize_block(&next));
-            }
             self.block = h;
             let body = store.block(h).expect("store read").expect("contiguous store, height already validated by head()");
             let effects: Vec<Effect<AccountId>> =
                 Decode::decode(&mut &body[..]).expect("corrupt block body in store");
-            self.ext.execute_with(|| {
-                let now: miot_primitives::BlockNumber =
-                    frame_system::Pallet::<Runtime>::block_number().unique_saturated_into();
-                for e in &effects {
-                    pallet_litter::Pallet::<Runtime>::replay_effect(e, now);
-                }
-            });
-            let header = self.ext.execute_with(Executive::finalize_block);
-            self.parent_hash = header.hash();
-            self.absorb(effects);
-            self.pending.clear();
+            self.apply_block(h, effects);
         }
-        self.block = head + 1;
-        let next = Header::new(self.block, Default::default(), Default::default(), self.parent_hash, Default::default());
-        self.ext.execute_with(|| Executive::initialize_block(&next));
     }
 
     /// Check and dispatch one signed extrinsic into the block that is
@@ -358,6 +402,192 @@ struct Since {
     since: u64,
 }
 
+/// One page of raw block bytes, as `/chain/blocks` renders them. Hex, not
+/// raw bytes, for the same reason `/meta`'s `genesis_hash` is — JSON has no
+/// native byte string.
+#[derive(Serialize, Deserialize)]
+struct BlockRow {
+    height: u64,
+    body_hex: String,
+}
+
+#[derive(Serialize, Deserialize)]
+struct ChainHead {
+    head: u64,
+    last_checkpoint: u64,
+}
+
+#[derive(Deserialize)]
+struct BlocksQuery {
+    from: u64,
+    limit: Option<u64>,
+}
+
+/// A page is bounded so one replica's catch-up request can't come back as
+/// one huge response; `sync_once` just asks again next tick for the rest.
+const SYNC_PAGE: u64 = 256;
+
+/// A replica's periodic pull from its peer (HANDOFF item 5): fetches
+/// whatever new blocks exist since our own head and folds them in through
+/// [`Node::apply_block`], the same step a local-store replay already uses.
+///
+/// Assumes we're not currently diverged from `peer` — [`reconcile_if_diverged`]
+/// is what checks and fixes that, and it only needs to run once, not on
+/// every tick (see its doc comment for why).
+async fn sync_once(shared: &Shared) {
+    let (http, peer) = {
+        let n = shared.lock().await;
+        (n.http.clone(), n.peer.clone().expect("sync_once only runs for a replica"))
+    };
+
+    let head = match http.get(format!("{peer}/chain/head")).send().await {
+        Ok(r) => match r.json::<ChainHead>().await {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("[node] sync: peer sent a bad /chain/head: {e}");
+                return;
+            }
+        },
+        Err(e) => {
+            eprintln!("[node] sync: peer unreachable: {e}");
+            return;
+        }
+    };
+
+    // Catch up / tail — the common case, every tick once caught up.
+    loop {
+        let from = {
+            let n = shared.lock().await;
+            n.store.as_ref().expect("replica always has a store").head() + 1
+        };
+        if from > head.head {
+            break;
+        }
+        let rows = fetch_blocks(&http, &peer, from, SYNC_PAGE).await;
+        if rows.is_empty() {
+            break;
+        }
+        let mut n = shared.lock().await;
+        for row in &rows {
+            let Ok(body) = hex::decode(&row.body_hex) else {
+                eprintln!("[node] sync: peer sent bad hex for block {}", row.height);
+                return;
+            };
+            if let Some(store) = n.store.as_mut() {
+                if let Err(e) = store.append(row.height, &body) {
+                    eprintln!("[node] sync: append failed at block {}: {e}", row.height);
+                    return;
+                }
+            }
+            let effects: Vec<Effect<AccountId>> =
+                Decode::decode(&mut &body[..]).expect("corrupt block body from peer");
+            n.apply_block(row.height, effects);
+        }
+    }
+}
+
+async fn fetch_blocks(http: &reqwest::Client, peer: &str, from: u64, limit: u64) -> Vec<BlockRow> {
+    match http.get(format!("{peer}/chain/blocks?from={from}&limit={limit}")).send().await {
+        Ok(r) => r.json().await.unwrap_or_default(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Compare our *entire* local block range against the peer's, once — at
+/// startup, before the periodic [`sync_once`] tail loop begins. A replica
+/// only ever appends blocks it received from this peer, so once this has
+/// run it cannot diverge from the peer again on its own before the next
+/// restart; there is no need to repeat it per tick.
+///
+/// Fetches `[1, our head]` from the peer rather than just comparing the
+/// tip. A "quiet" block — no effects that tick, the common case — encodes
+/// as the exact same bytes (an empty `Vec<Effect>`) no matter which chain
+/// produced it, so a tip-only comparison can find a false "agreement" while
+/// a real divergence sits at an earlier, non-quiet height beneath it
+/// (observed live standing this up: a tip check missed a diverged block
+/// holding a real `Opened` effect because both chains' *next* few blocks
+/// happened to be quiet). Comparing the whole range is the only reliable
+/// check without block hashes to compare instead of raw bodies.
+///
+/// This inherits the same cost `compact()` never being wired in already
+/// imposes elsewhere (see [`reconcile`]): with no checkpoint to start from,
+/// there is nowhere to begin this comparison but height 1, so a long-lived,
+/// never-compacted chain makes each reconnect proportionally more
+/// expensive. Wiring in `compact()` — a separate, still-open item — would
+/// let this start from the latest checkpoint instead of genesis.
+async fn reconcile_if_diverged(shared: &Shared) {
+    let (http, peer, my_head) = {
+        let n = shared.lock().await;
+        let peer = n.peer.clone().expect("reconcile_if_diverged only runs for a replica");
+        let my_head = n.store.as_ref().expect("replica always has a store").head();
+        (n.http.clone(), peer, my_head)
+    };
+    if my_head == 0 {
+        return;
+    }
+
+    let mut theirs = Vec::new();
+    let mut from = 1;
+    while from <= my_head {
+        let rows = fetch_blocks(&http, &peer, from, SYNC_PAGE).await;
+        if rows.is_empty() {
+            break;
+        }
+        let got = rows.len() as u64;
+        for row in &rows {
+            match hex::decode(&row.body_hex) {
+                Ok(body) => theirs.push(body),
+                Err(_) => break,
+            }
+        }
+        from += got;
+    }
+
+    let fork = {
+        let mut n = shared.lock().await;
+        let store = n.store.as_mut().expect("replica always has a store");
+        store.fork_point(1, &theirs).expect("fork_point")
+    };
+    if fork < my_head {
+        reconcile(shared, fork).await;
+    }
+}
+
+/// We diverged from the peer above `fork` (the true last-agreeing height,
+/// from [`reconcile_if_diverged`]). Reconcile the honest way: rewind to the
+/// latest compaction at or below it (`miot_store::Store::rewind_for_fork`),
+/// then rebuild `self.ext` from scratch and let `sync_once`'s catch-up loop
+/// replay everything the peer holds from there.
+///
+/// **`compact()` is never called anywhere in this node yet** (a known,
+/// separate gap — see HANDOFF's "not yet real" list), so `last_checkpoint`
+/// is always 0 and `rewind_for_fork` always lands at genesis today — this
+/// always means "wipe our log, rebuild state from nothing, and replay every
+/// block the peer holds," never a partial rewind. That is the documented
+/// rule working as designed for a litter with no compaction yet
+/// (`docs/references/storage.md`: "a fork below the last compaction lands
+/// at genesis"), not a bug here. Once compaction is wired in, this same
+/// call starts landing on whatever checkpoint the divergence allows, with
+/// no change needed in this function.
+async fn reconcile(shared: &Shared, fork: u64) {
+    let mut n = shared.lock().await;
+    let (genesis_root, genesis_leader) = (n.genesis_root.clone(), n.genesis_leader.clone());
+    let store = n.store.as_mut().expect("replica always has a store");
+    let rewind = store.rewind_for_fork(fork).expect("rewind_for_fork");
+    println!(
+        "[node] sync: diverged from peer above block {fork}, rewound to {} (dropped {} block(s))",
+        rewind.height, rewind.dropped
+    );
+
+    let (ext, genesis_hash) = genesis(genesis_root, genesis_leader);
+    n.ext = ext;
+    n.parent_hash = genesis_hash;
+    n.block = 1;
+    n.log.clear();
+    n.seq = 0;
+    n.pending.clear();
+}
+
 /// `MIOT_ROOT_PUBKEY` (an `authorized_keys` line — root's real identity, per
 /// `miot-keys`) wins; `MIOT_ROOT` (hex `AccountId32`) is the fallback for
 /// anything that isn't the real operator (tests, a throwaway litter). Same
@@ -385,11 +615,28 @@ async fn main() {
     let root = account_env("MIOT_ROOT_PUBKEY", "MIOT_ROOT", 1);
     let leader = account_env("MIOT_LEADER_PUBKEY", "MIOT_LEADER", 2);
 
+    // HANDOFF item 5: primary (default, today's only behavior) or replica.
+    // A replica pulls its peer's block log over HTTP instead of ticking its
+    // own clock — see `sync_once`.
+    let role = role_env();
+    let peer = std::env::var("MIOT_PEER").ok();
+    if role == Role::Replica && peer.is_none() {
+        eprintln!("[node] MIOT_ROLE=replica requires MIOT_PEER");
+        std::process::exit(1);
+    }
+
     // `MIOT_DB` unset or unopenable → run exactly as this always did, state
     // in memory only. Set it to persist across restarts — HANDOFF item 2.
+    // A replica has no in-memory-only mode: without a durable log it has
+    // nothing to compare against a peer's blocks, so it always rebuilds from
+    // genesis on every restart instead of resuming — defeating the point.
     let db_path = std::env::var("MIOT_DB").unwrap_or_else(|_| "miot-node.db".to_string());
     let store = match miot_store::Store::open(&db_path) {
         Ok(s) => Some(s),
+        Err(e) if role == Role::Replica => {
+            eprintln!("[node] a replica requires persistence — could not open store at {db_path:?}: {e}");
+            std::process::exit(1);
+        }
         Err(e) => {
             eprintln!("[node] persistence disabled — could not open store at {db_path:?}: {e}");
             None
@@ -397,7 +644,20 @@ async fn main() {
     };
 
     let (ext, genesis_hash) = genesis(root.clone(), leader.clone());
-    let mut node = Node { ext, log: VecDeque::new(), seq: 0, block: 1, parent_hash: genesis_hash, store: None, pending: Vec::new() };
+    let mut node = Node {
+        ext,
+        log: VecDeque::new(),
+        seq: 0,
+        block: 1,
+        parent_hash: genesis_hash,
+        store: None,
+        pending: Vec::new(),
+        role,
+        peer: peer.clone(),
+        http: reqwest::Client::new(),
+        genesis_root: root.clone(),
+        genesis_leader: leader.clone(),
+    };
     if let Some(store) = store {
         if !store.is_empty() {
             println!("[node] replaying {} block(s) from {db_path}", store.head());
@@ -407,17 +667,42 @@ async fn main() {
     }
     let node: Shared = Arc::new(Mutex::new(node));
 
-    // The block loop. Its own task, its own clock, and nothing in it waits for
-    // a cat — that is the whole of Law I.
-    {
-        let node = node.clone();
-        tokio::spawn(async move {
-            let mut iv = tokio::time::interval(std::time::Duration::from_millis(BLOCK_MS));
-            loop {
-                iv.tick().await;
-                node.lock().await.advance();
-            }
-        });
+    // A replica reconciles against its peer, then catches up, before
+    // serving its first request — the same way a primary's local-store
+    // replay above runs synchronously before this point — so `/tasks` etc.
+    // are never seen empty (or, worse, diverged) just because the sync loop
+    // hasn't ticked yet.
+    if role == Role::Replica {
+        reconcile_if_diverged(&node).await;
+        sync_once(&node).await;
+    }
+
+    // Primary: the block loop. Its own task, its own clock, and nothing in
+    // it waits for a cat — that is the whole of Law I.
+    // Replica: the sync loop instead — pulls the peer, never produces a
+    // block of its own.
+    match role {
+        Role::Primary => {
+            let node = node.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(std::time::Duration::from_millis(BLOCK_MS));
+                loop {
+                    iv.tick().await;
+                    node.lock().await.advance();
+                }
+            });
+        }
+        Role::Replica => {
+            let sync_ms: u64 = std::env::var("MIOT_SYNC_MS").ok().and_then(|s| s.parse().ok()).unwrap_or(BLOCK_MS);
+            let node = node.clone();
+            tokio::spawn(async move {
+                let mut iv = tokio::time::interval(std::time::Duration::from_millis(sync_ms));
+                loop {
+                    iv.tick().await;
+                    sync_once(&node).await;
+                }
+            });
+        }
     }
 
     let app = Router::new()
@@ -428,16 +713,59 @@ async fn main() {
         .route("/account/{id}", get(account))
         .route("/artifact/{id}", get(artifact))
         .route("/tasks", get(tasks))
+        .route("/chain/head", get(chain_head))
+        .route("/chain/blocks", get(chain_blocks))
         .with_state(node);
 
     let addr = format!("0.0.0.0:{port}");
+    let role_str = match role {
+        Role::Primary => "primary",
+        Role::Replica => "replica",
+    };
     println!(
-        "[node] chain on {addr}  root={}  leader={}  block={BLOCK_MS}ms",
+        "[node] chain on {addr}  root={}  leader={}  role={role_str}{}  block={BLOCK_MS}ms",
         miot_keys::short(&root),
-        miot_keys::short(&leader)
+        miot_keys::short(&leader),
+        peer.map(|p| format!("  peer={p}")).unwrap_or_default(),
     );
     let l = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     axum::serve(l, app).await.unwrap();
+}
+
+/// Peer-facing: what a replica's sync loop reads (`sync_once`). Deliberately
+/// under `/chain/*`, never `/head` — `/head`'s `leader` field is the
+/// *litter* leader, an unrelated concept, and conflating the two names would
+/// be exactly the trap `Role`'s doc comment warns about.
+async fn chain_head(AxState(n): AxState<Shared>) -> Json<ChainHead> {
+    let n = n.lock().await;
+    let (head, last_checkpoint) = match &n.store {
+        Some(s) => (s.head(), s.last_checkpoint()),
+        None => (0, 0),
+    };
+    Json(ChainHead { head, last_checkpoint })
+}
+
+/// Raw stored block bytes, by height — what a replica folds through
+/// [`Node::apply_block`] and what `fork_point`/`rewind_for_fork` compare
+/// against. Reads straight off `self.store`; a node with no store (never a
+/// replica — see `main` — only a primary run without `MIOT_DB`) has nothing
+/// to serve here.
+async fn chain_blocks(AxState(n): AxState<Shared>, Query(q): Query<BlocksQuery>) -> Json<Vec<BlockRow>> {
+    let n = n.lock().await;
+    let Some(store) = n.store.as_ref() else {
+        return Json(Vec::new());
+    };
+    let head = store.head();
+    let limit = q.limit.unwrap_or(SYNC_PAGE).min(SYNC_PAGE);
+    let mut out = Vec::new();
+    let mut h = q.from;
+    while h <= head && (out.len() as u64) < limit {
+        if let Some(body) = store.block(h).expect("store read") {
+            out.push(BlockRow { height: h, body_hex: hex::encode(body) });
+        }
+        h += 1;
+    }
+    Json(out)
 }
 
 async fn head(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
@@ -521,6 +849,12 @@ async fn submit(
         }
     };
     let mut n = n.lock().await;
+    if n.role == Role::Replica {
+        return (
+            axum::http::StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({"ok":false,"error":"read-only replica; submit to the primary"})),
+        );
+    }
     match n.submit(uxt) {
         Ok(()) => (axum::http::StatusCode::OK, Json(serde_json::json!({"ok":true}))),
         // A refusal is the chain's answer, not an error in the cat. It is

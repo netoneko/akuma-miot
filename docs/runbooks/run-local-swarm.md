@@ -5,7 +5,8 @@ The first runbook in this directory — modeled on the sibling `../akuma` repo's
 up, talk to it, redeploy it after a code change, and diagnose "a cat isn't
 responding" before assuming it's an application bug.
 
-Today's topology: `mimi`/`tama`/`sora` + the node in docker
+Today's topology: `mimi`/`tama`/`sora` + `node` (primary) + `node2` (a
+passive read replica, HANDOFF item 5 — see its own section below) in docker
 (`overlays/local/docker-compose.yml`), `kuro` on the Lima VM (`fc`) instead of
 docker — see `HANDOFF.md`'s "What is real" section for why. Models
 (`llama-server` ×4) run on the host, never in a container (no GPU passthrough
@@ -162,3 +163,33 @@ curl -s http://localhost:9944/head                                      # block,
 Useful for confirming what actually happened on chain when a client's own
 printer is in doubt — the event log's `wakes` field is the ground truth for
 "was this cat actually told to act," independent of whether it did.
+
+## `node2`, a read replica — HANDOFF item 5
+
+`overlays/local/docker-compose.yml` also brings up `node2`, running
+`miot-node` as `MIOT_ROLE=replica MIOT_PEER=http://node:9944` — it pulls
+`node`'s block log over HTTP (`docs/references/storage.md` has the wire
+mechanism) and mirrors it, but no cat talks to it and it refuses `/submit`.
+It comes up with the rest of `docker compose up -d`; nothing extra to do.
+
+Confirm it's actually mirroring `node` (a few seconds after any change,
+`MIOT_SYNC_MS` defaults to the block time, 6s):
+
+```bash
+diff <(curl -s localhost:9944/tasks) <(curl -s localhost:9945/tasks) && echo MATCH
+diff <(curl -s localhost:9944/events) <(curl -s localhost:9945/events) && echo MATCH
+curl -s localhost:9944/chain/head; curl -s localhost:9945/chain/head   # heads should agree
+```
+
+`node2` restarts the same way `node` does (`docker compose restart node2`)
+and resumes from its own persisted log, then keeps tailing `node` — same
+"cats don't need restarting" property item 2 gave `node` itself, now true of
+a replica catching back up too.
+
+If `node2`'s log ever shows `sync: diverged from peer above block N, rewound
+to 0 (...)`, that means its local log disagreed with `node`'s somewhere
+above block `N` and it just rebuilt itself from genesis to match — expected
+behavior if `node2` was ever run independently (e.g. `MIOT_ROLE=primary`
+against its own `MIOT_DB`, for testing), not something to debug. It should
+never happen in ordinary operation, where `node2` only ever appends blocks
+`node` gave it.

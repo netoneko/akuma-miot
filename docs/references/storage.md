@@ -191,6 +191,70 @@ Compaction drops the blocks below it in the same commit — after a compaction
 there is nothing to replay from below it, so keeping them would be keeping
 history nobody can use.
 
+## How a second node actually does this — HANDOFF item 5, 2026-09-22
+
+Everything above was designed and unit-tested (`crates/miot-store/src/tests.rs`,
+especially `a_cat_that_diverged_converges_on_the_leader`) before there was a
+second `miot-node` process for it to run against. There now is one.
+
+**Vocabulary note**: this section is about which node's block log is
+canonical — a different question from `pallet-litter`'s `leader`, which is
+the *litter* leader, an agent role (`mimi`). To keep the two apart, a node's
+role is **primary** (produces blocks, accepts `/submit`) or **replica**
+(pulls a primary's log, read-only) — never "leader"/"follower".
+
+`MIOT_ROLE=primary` (default, today's only behavior until this) or
+`MIOT_ROLE=replica` + `MIOT_PEER=<primary base URL>`. A replica requires
+`MIOT_DB` (persistence) — without a durable log of its own it has nothing to
+compare against a peer's blocks. Two endpoints exist only for this, kept
+under `/chain/*` and never on the cat-facing `/head` (whose `leader` field is
+the unrelated litter leader):
+
+- `GET /chain/head` → `{"head", "last_checkpoint"}`, straight off the store.
+- `GET /chain/blocks?from=N&limit=M` → raw stored block bytes, hex-encoded,
+  for heights `[N, min(head, N+M-1)]`.
+
+A replica does two things, in `crates/miot-node/src/main.rs`:
+
+1. **`reconcile_if_diverged`**, once, before it starts serving (covers both
+   a fresh replica and one restarting after having run independently).
+   Fetches its peer's blocks for its *entire* local range and runs
+   `Store::fork_point` over all of it, not just the tip. That "not just the
+   tip" is load-bearing, found live standing this up: an empty
+   `Vec<Effect>` — a "quiet" block, the common case — encodes identically no
+   matter which chain produced it, so a diverged block sitting under a few
+   agreeing quiet blocks above it is invisible to a tip-only comparison.
+   Comparing the whole range is what catches it. If `fork_point` comes back
+   below the local head, `Store::rewind_for_fork` runs for real and the
+   in-memory state rebuilds from `genesis()` — see below for why that's
+   always a full rebuild today, not a partial one.
+2. **`sync_once`**, on a timer thereafter (`MIOT_SYNC_MS`, default
+   `BLOCK_MS`): tails whatever new blocks the peer has, folding each one in
+   through `Node::apply_block` — the same step a local-store replay on
+   restart already used. No fork check here; a replica that only ever
+   appends blocks it received from its peer cannot diverge from it again on
+   its own before the next restart, so step 1 doesn't need repeating per
+   tick.
+
+**Because `compact()` is never called anywhere in this node yet** (a known,
+separate gap), `last_checkpoint` is always 0, so `rewind_for_fork`'s `land`
+is always genesis — any detected divergence today means "discard the whole
+local log and full-replay the peer's history from block 1," never a partial
+rewind to a nearby checkpoint. That is the documented rule above working
+exactly as designed for a chain with no compaction yet, not a bug in the
+replication code. Wiring in `compact()` (still a separate, open item) would
+let both `reconcile_if_diverged` and a real fork's rewind start from the
+latest checkpoint instead of genesis, with no change needed in either.
+
+Verified live: a standalone third `miot-node`, run first as a replica of
+`node` to build matching history, then killed and restarted as its own
+independent primary (same genesis, no peer) and given a submit only it
+received, then pointed back at `node` as a replica again — printed `sync:
+diverged from peer above block 481, rewound to 0 (dropped 485 block(s))` and
+came back with `/tasks`/`/events` byte-for-field identical to `node`'s. That
+is `a_cat_that_diverged_converges_on_the_leader` happening for real, not in
+a unit test.
+
 ## Risks accepted
 
 - **`0.8.0-pre.11` is a pre-release.** Acceptable *here* and not on the chain
