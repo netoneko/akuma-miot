@@ -132,6 +132,25 @@ symptom matrix ("I see X, what do I read?") — check there before forming a
 theory about anything that looks like a kernel-level oddity rather than an
 akuma-miot bug.
 
+**`../akuma/scripts/box/` is the pattern `overlays/deploy/deploy.sh` should
+eventually be rewritten on top of** (asked 2026-09-23; deliberately deferred,
+not started). It's the box's own build environment — five files
+(`akuma-dev.env`, `kbuild`, `ubuild`, `mbuild`, `kinstall`) checked into
+`../akuma` and copied onto the physical box rather than authored there, so
+the rig can be rebuilt from a checkout and can't silently drift from what
+the repo documents (`../akuma/scripts/box/README.md`). Two properties worth
+carrying over: an env file every wrapper sources (an sshd session inherits
+*no* environment — the same reason `deploy.sh`'s own `on()`/`put()` fight
+akuma's shell every time), and build/state kept out of the checkout's own
+tree so `git status` on the box stays clean. `deploy.sh`'s akuma/fcguest
+shape is currently the least reliable part of it — see HANDOFF's herd traps
+and the 2026-09-23 session that found `deploy.sh`'s fcguest identity check
+comparing against a key `mesh.env` no longer uses (relabeled to persona
+names 2026-09-22) and a `ryzen-akuma-amd64` crash loop (`[herd] Service kot
+exited with code 241`, herd retries a few times then stops) — exactly the
+kind of drift `scripts/box/`'s checked-in-and-copied model exists to
+prevent.
+
 ## Working with Claude Code in this repo
 
 Copied from `../akuma`'s own `CLAUDE.md`, which states it for that repo —

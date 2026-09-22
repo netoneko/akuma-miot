@@ -419,6 +419,56 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
   an old instance without it.
 - **`pkill -f <pattern>` over ssh can match the ssh session's own `bash -c`
   line and kill it** (exit 255). Kill by PID.
+- **A litter leader's WrongKind/SubtasksOutstanding/no-tool-call refusals can
+  be a prompt bug, not model flakiness — found live, 2026-09-23.** meow
+  (GLM, `dumpster-akuma-amd64`) was refused 7× `WrongKind`, 3×
+  `SubtasksOutstanding`, plus 3 wasted turns with no tool call at all, all
+  under the `ClearanceNeeded` directive. Root cause: `agent.rs`'s
+  `ClearanceNeeded` prompt told the leader "for EACH sub-task call
+  TaskUpdate" without ever naming a sub-task — no id, no result text,
+  nothing but the parent id in the header, which is exactly the id
+  `clear`/`reopen` refuse (`Error::WrongKind`). The model had nothing to act
+  on but guess. Fixed by having the prompt fetch `/tasks`, list every
+  sub-task actually `AwaitingClearance` under this parent with its id,
+  holder and result, and telling the model to use *that* id, never the
+  parent's — `/tasks` itself was missing the sub-task's `outcome` entirely,
+  also fixed. Also added an explicit id-shape/always-call-a-tool rule to
+  every persona (`AGENT_RULES` in `agent.rs`) and disambiguated
+  `TaskUpdate`'s `task` field in the tool schema (`miot-llm`). Redeployed
+  fleet-wide the same session; watch whether `WrongKind` on `ClearanceNeeded`
+  actually drops to zero over the next few live runs.
+- **`deploy.sh`'s fcguest identity check compares against a `mesh.env` key
+  that hasn't existed since 2026-09-22 — found live, 2026-09-23.** `mesh.env`
+  was relabeled that day to persona names (`mimi=pub:...`, `sora=pub:...`),
+  but `cmd_up`'s check still grepped for `$a=pub:...` (the deploy-script
+  agent id, e.g. `mac-akuma-aarch64=pub:...`), which never matched anything
+  — every fcguest identity check was silently comparing against an empty
+  string. Fixed (`field "$a" 5` → the persona name). **Caused a real
+  incident chasing it live**: running `kot --seed-file
+  ~/.akuma/kot/mac-akuma-aarch64.seed id` to see what was staged there
+  auto-generated a fresh random identity at that path (`kot id` calls
+  `load_or_create_identity`, which creates on a missing file — a nonobvious
+  side effect for what looked like a read-only check), and a subsequent
+  `deploy.sh up` hit a transient ssh hiccup on the `test -s
+  id_ed25519.seed` guard that made it copy that bogus seed onto the guest,
+  overwriting mimi's real identity. Recovered because the real seed was
+  never actually lost — just staged under the *pre-rename* name
+  (`~/.akuma/kot/mac-fc.seed`, `ryzen-fc.seed`), confirmed by matching its
+  derived pubkey against `mesh.env`. Both now also staged under their
+  current agent ids so `deploy.sh`'s `$HOME/.akuma/kot/$a.seed` path
+  actually resolves. **Lesson: never run `kot id` against a seed-file path
+  to "check" it — it writes.**
+- **`ryzen-akuma-amd64` is dead right now, pre-existing — confirmed live,
+  2026-09-23, not caused by anything this session touched.** `firecracker`
+  is up on ryzen and the guest boots, but `kot` crash-loops inside it:
+  `/home/netoneko/akuma/boot.log` on ryzen shows `[herd] Service kot exited
+  with code  241` three times, herd restarting it each time, then giving up
+  silently (no further "Started kot" after the third). This is the same
+  class already tracked in `../akuma/docs/archive/
+  AKUMA_AMD64_KOT_REPLICA_WEDGE.md` ("amd64 Akuma: kot goes deaf in
+  minutes"), not a new bug. `deploy.sh`'s `LIVE` array still lists this
+  agent; in practice the mesh runs fine at 4/5 (quorum is 3) without it.
+  `../akuma` territory — see that handoff before spending more time here.
 
 ---
 
