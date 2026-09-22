@@ -371,14 +371,18 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
   is an HTTP client and server at once, which is the one combination that
   has never stayed up on that kernel. Unconfirmed hypothesis, not
   root-caused. `../akuma` territory. See `docs/TOPOLOGY_TARGET.md`.
-- **ParityDB on aarch64 Akuma (`akuma-guest`)**: reopen died with ENOSYS
-  (no `fadvise64` arm in the aarch64 dispatcher; added in `../akuma`
-  2026-09-22). Behind it, a clean close appears to lose data (storeprobe
-  stage 6 reopens empty), probably missing `MAP_SHARED` write-back, the
-  other half of the amd64 fix. A crash keeps the logs and replays fine. The
-  write-up is `../akuma/docs/archive/MIOT_MESH_ON_AKUMA_2026-09-22.md`, which
-  also covers the metal-box replica wedge and PSTATS naming amd64 syscalls
-  from the aarch64 table.
+- **ParityDB on aarch64 Akuma (`akuma-guest`): fixed 2026-09-22, in
+  `../akuma`.** Two aarch64-only kernel bugs, found by running `kot` there:
+  (a) no `fadvise64` arm in the aarch64 dispatcher, so reopen failed with
+  ENOSYS; (b) the amd64 fix's change to the *shared* `mmap::plan` sent
+  writable `MAP_SHARED` down aarch64's lazy path, which never registered it
+  for write-back, so a clean close lost every write (storeprobe reopened
+  empty). Now `storeprobe` passes 7/7 on the guest, and `kot` survives
+  `kill -9` with its whole store (753 blocks replayed, no peers to sync
+  from). Full write-up: `../akuma/docs/archive/MIOT_MESH_ON_AKUMA.md`, which
+  also covers the metal-box replica wedge (open) and PSTATS naming amd64
+  syscalls from the aarch64 table (open). **Lesson:** a change to shared
+  kernel code must be checked against both dispatchers.
 - **Akuma's sshd merges stderr into stdout.** Anything parsed from `ssh
   akuma '…'` output needs `2>/dev/null` on the far side.
 - **The z.ai token is a coding-plan key**: `paas/v4` answers "insufficient

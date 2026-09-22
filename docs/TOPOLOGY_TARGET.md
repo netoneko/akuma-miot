@@ -69,7 +69,7 @@ them is a `MIOT_PEERS` change, not a new chain:
 | ryzen-linux | `192.168.1.126:9944` | direct, no NAT. **Live 2026-09-22.** Model: `llama-ryzen-linux.service`, 127.0.0.1:8081, Qwen3-4B-Instruct-2507 Q4_K_M, 6 threads (CPU; ollama disabled) |
 | ryzen-fc | `____` (guest address, behind ryzen's own NAT/tap — pattern TBD, no precedent yet; `run-on-firecracker.md`'s aarch64 path is the closest reference but is nested-virt-specific) | new — nothing has run an amd64 Firecracker Akuma guest yet |
 | mac-linux | `192.168.1.203:9944` from the LAN (Lima forwards `fc:9944-9949` on `0.0.0.0`; `fc` itself is `192.168.5.15`) | **Live 2026-09-22.** Model: the mac's llama-server at `192.168.5.2:8083` (qwen3:4b). systemd `kot.service` inside `fc`, no longer started by hand |
-| mac-fc | `10.0.2.15:9944` inside `fc`; mac-linux reaches it there directly, the LAN via `192.168.1.203:9945` (socat relay `kot-relay-mac-fc.service` in `fc`, exposed by Lima) | **Live 2026-09-22**, in akuma-metal's seat. 10 min as primary, 11 min as replica, no wedge. Reopen needed an aarch64 `fadvise64` arm (added in `../akuma`); a *clean* ParityDB close still loses data on aarch64 (`../akuma/docs/archive/MIOT_MESH_ON_AKUMA_2026-09-22.md`) |
+| mac-fc | `10.0.2.15:9944` inside `fc`; mac-linux reaches it there directly, the LAN via `192.168.1.203:9945` (socat relay `kot-relay-mac-fc.service` in `fc`, exposed by Lima) | **Live 2026-09-22**, in akuma-metal's seat. 10 min as primary, 11 min as replica, no wedge. ParityDB survives crash and clean close since two aarch64 kernel fixes in `../akuma` (`../akuma/docs/archive/MIOT_MESH_ON_AKUMA.md`) |
 
 `--peers` on each `kot run` invocation needs the other 4 agents' reachable
 addresses — from *that* agent's vantage point, which differs for the two

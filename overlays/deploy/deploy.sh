@@ -30,6 +30,7 @@ ROOT="$(cd "$HERE/../.." && pwd)"
 MESH_ENV="$HERE/mesh.env"
 MAC_LAN=192.168.1.203
 HTTP_PORT=8765   # the mac serves dist/ to the akuma box on this
+AKUMA_REPO="${AKUMA_REPO:-$ROOT/../akuma}"
 
 say() { printf '\033[1;36m[deploy]\033[0m %s\n' "$*" >&2; }
 die() { printf '\033[1;31m[deploy] %s\033[0m\n' "$*" >&2; exit 1; }
@@ -42,12 +43,12 @@ AGENTS=(
   "akuma-metal|akuma|akuma|x86_64|meow|glm|glm-5.3"
   "ryzen-linux|linux|ryzen|x86_64|tama|http://127.0.0.1:8081|qwen3-4b"
   "mac-linux|lima|fc|aarch64|kuro|http://192.168.5.2:8083|qwen3:4b"
-  "ryzen-fc|fc|ryzen|x86_64|sora|-|-"
+  "ryzen-fc|fcguest|ryzen|x86_64|sora|http://192.168.1.49:8082|qwen3-4b"
   "mac-fc|fcguest|fc|aarch64|mimi|http://192.168.5.2:8084|qwen3:4b"
 )
 # akuma-metal is out while its replica wedge is chased (HANDOFF traps);
 # mac-fc runs the same role on aarch64 Akuma to see if it wedges too.
-LIVE=(ryzen-linux mac-linux mac-fc)
+LIVE=(ryzen-linux mac-linux mac-fc ryzen-fc)
 
 # llama-server per agent, never ollama: its own process, its own port, its
 # thread count pinned, so an agent's turns get a known slice of the box and
@@ -55,7 +56,9 @@ LIVE=(ryzen-linux mac-linux mac-fc)
 # overlays/local/llama-swarm.sh (8081-8084, -t 1, Metal).
 # agent | gguf on its host | port | threads
 LLAMAS=(
-  "ryzen-linux|/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8081|6"
+  "ryzen-linux|/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8081|6|127.0.0.1"
+  # ryzen-fc's own, on ryzen's tap0 address (192.168.1.49) so the guest reaches it.
+  "ryzen-fc|/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8082|4|192.168.1.49"
 )
 
 # Every node's view of every *other* live node. Differs per vantage point:
@@ -72,6 +75,10 @@ route() { # route <from> <to>
     *">mac-linux") echo "http://$MAC_LAN:9944" ;;
     "mac-linux>mac-fc") echo http://10.0.2.15:9944 ;;
     *">mac-fc") echo "http://$MAC_LAN:9945" ;;
+    # ryzen-fc: Akuma/amd64 in Firecracker on ryzen's real KVM, on ryzen's
+    # existing guest network: tap0 + proxy-ARP, the guest's pinned lease is a
+    # real LAN address, so everyone reaches it directly. No relay.
+    *">ryzen-fc") echo http://192.168.1.50:9944 ;;
     *) die "no route to $2 yet" ;;
   esac
 }
@@ -85,8 +92,13 @@ on() { # on <agent> <shell command>, run as root on the agent's host
     akuma) ssh -o BatchMode=yes akuma "$2" ;;
     linux) ssh -o BatchMode=yes "$(field "$1" 3)" "$2" ;;
     lima)  limactl shell fc -- sudo sh -c "$2" ;;
-    fcguest) timeout 60 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-               -o LogLevel=ERROR -p 4444 root@localhost "$2" ;;
+    fcguest)
+      local o=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
+      case "$1" in
+        mac-fc)   timeout 60 ssh "${o[@]}" -p 4444 root@localhost "$2" ;;
+        # The amd64 image's sshd trusts mkdisk.sh's test key only.
+        ryzen-fc) timeout 60 ssh "${o[@]}" -i "$AKUMA_REPO/target/x86_64-unknown-none/release/amd64-ssh-test-key" root@192.168.1.50 "$2" ;;
+      esac ;;
     *) die "$1: shape $(field "$1" 2) not deployable yet" ;;
   esac
 }
@@ -102,7 +114,9 @@ put() { # put <agent> <local file> <remote path>
       # guest reaches the mac's loopback as 192.168.5.2 (Lima), so it
       # needs no LAN-facing listener; the metal box needs the LAN one.
       local bind=0.0.0.0 from=$MAC_LAN
-      [ "$(field "$a" 2)" = fcguest ] && { bind=127.0.0.1; from=192.168.5.2; }
+      # mac-fc reaches the mac's loopback as 192.168.5.2 (Lima); ryzen-fc
+      # comes out through ryzen's NAT onto the LAN like the metal box does.
+      [ "$a" = mac-fc ] && { bind=127.0.0.1; from=192.168.5.2; }
       local stage; stage="$(mktemp -d)"
       cp "$src" "$stage/f"
       if lsof -iTCP:$HTTP_PORT -sTCP:LISTEN -P >/dev/null 2>&1; then
@@ -217,9 +231,11 @@ cmd_up() {
     fi
     [ "$(account_of "$a")" = "$(grep -o "$a=pub:[0-9a-f]*" "$MESH_ENV" | cut -d: -f2)" ] \
       || die "$a: identity in the guest does not match mesh.env"
-    cat > "$tmp.relay" <<EOF
+    # Only the Lima guest needs a relay: Lima exposes only sockets listening
+    # in fc. ryzen-fc has a LAN address of its own.
+    [ "$a" = mac-fc ] && cat > "$tmp.relay" <<EOF
 [Unit]
-Description=LAN :9945 -> $a (akuma-guest 10.0.2.15:9944)
+Description=LAN :9945 -> $a (Akuma guest 10.0.2.15:9944)
 After=network-online.target
 
 [Service]
@@ -229,8 +245,10 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-    limactl copy "$tmp.relay" fc:/tmp/kot-relay.service
-    limactl shell fc -- sudo sh -c "mv /tmp/kot-relay.service /etc/systemd/system/kot-relay-$a.service && systemctl daemon-reload && systemctl enable --now kot-relay-$a.service >/dev/null 2>&1"
+    if [ "$a" = mac-fc ]; then
+      limactl copy "$tmp.relay" fc:/tmp/kot-relay.service
+      limactl shell fc -- sudo sh -c "mv /tmp/kot-relay.service /etc/systemd/system/kot-relay-$a.service && systemctl daemon-reload && systemctl enable --now kot-relay-$a.service >/dev/null 2>&1"
+    fi
   fi
   case "$(field "$a" 2)" in
     akuma|fcguest)
@@ -282,12 +300,14 @@ EOF
 }
 
 # ---- models --------------------------------------------------------------------
-cmd_llama() { # a systemd llama-server for one agent, on a linux-shape host
-  local a="$1" r="" x gguf port threads tmp
+cmd_llama() { # a systemd llama-server for one agent, on its (host's) linux side
+  local a="$1" r="" x gguf port threads bind tmp host_agent="$1"
+  # A Firecracker guest's model runs on the guest's Linux host.
+  [ "$a" = ryzen-fc ] && host_agent=ryzen-linux
   for x in "${LLAMAS[@]}"; do [ "${x%%|*}" = "$a" ] && r="$x"; done
   [ -n "$r" ] || die "$a has no llama-server row"
-  IFS='|' read -r _ gguf port threads <<<"$r"
-  on "$a" "test -x /root/llama.cpp/build/bin/llama-server" || die "$a: build llama.cpp first (/root/llama.cpp/build/bin/llama-server)"
+  IFS='|' read -r _ gguf port threads bind <<<"$r"
+  on "$host_agent" "test -x /root/llama.cpp/build/bin/llama-server" || die "$a: build llama.cpp first (/root/llama.cpp/build/bin/llama-server)"
   tmp="$(mktemp)"
   cat > "$tmp" <<EOF
 [Unit]
@@ -295,19 +315,19 @@ Description=llama-server for kot $a (port $port, $threads threads)
 After=network-online.target
 
 [Service]
-ExecStart=/root/llama.cpp/build/bin/llama-server -m $gguf --host 127.0.0.1 --port $port -c 8192 --jinja --parallel 1 -t $threads
+ExecStart=/root/llama.cpp/build/bin/llama-server -m $gguf --host $bind --port $port -c 8192 --jinja --parallel 1 -t $threads
 Restart=always
 RestartSec=3
 
 [Install]
 WantedBy=multi-user.target
 EOF
-  put "$a" "$tmp" "/etc/systemd/system/llama-$a.service"
+  put "$host_agent" "$tmp" "/etc/systemd/system/llama-$a.service"
   rm -f "$tmp"
   # ollama nowhere: it loads whatever it's asked for with its own thread
   # policy, which is exactly the unreserved sharing this setup avoids.
-  on "$a" "systemctl disable --now ollama.service 2>/dev/null; systemctl daemon-reload && systemctl enable llama-$a.service 2>/dev/null; systemctl restart llama-$a.service"
-  say "$a: llama-server on 127.0.0.1:$port ($threads threads)"
+  on "$host_agent" "systemctl disable --now ollama.service 2>/dev/null; systemctl daemon-reload && systemctl enable llama-$a.service 2>/dev/null; systemctl restart llama-$a.service"
+  say "$a: llama-server on $bind:$port ($threads threads)"
 }
 
 # ---- the old fleet -------------------------------------------------------------
