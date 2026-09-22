@@ -197,6 +197,14 @@ rather than asserted.
 pulling `node`'s block log over HTTP; `rewind_for_fork` has now run against a
 real disagreement, not a synthetic one (item 5, above, has the story). Six
 containers now, not five.
+**real compaction, 2026-09-22** — `Store::compact` fires on root's `/clear`
+(a genuine snapshot of the whole storage trie via `sp_io::TestExternalities`'s
+own `into_raw_snapshot`/`from_raw_snapshot`, not a hand-rolled subset); a
+reconciliation now lands on that checkpoint instead of genesis. See item 5's
+Part 1 writeup.
+**a fourth node, on the actual Akuma kernel, 2026-09-22** — item 3, below,
+used to be "run `storeprobe` on Akuma"; the bigger claim turned out true
+first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
 
 **Not yet real:**
 
@@ -204,13 +212,12 @@ containers now, not five.
   an operator-set env var, changed by restarting the process — deliberate,
   same trust model as `set_leader`/`set_root`, but it means nothing detects
   a dead primary and promotes a replica on its own. Fine for one operator's
-  swarm; would need real work for anything else.
-- **`compact()` is never called.** The store only grows, and — new
-  consequence as of item 5 — every replica reconciliation lands at genesis
-  rather than a partial rewind, because there is no checkpoint to land on
-  closer than that. See item 5's writeup and `docs/references/storage.md`.
-- **Akuma is untested.** Every claim in the docs about Akuma is inference.
-  `dist/storeprobe` exists to replace one of those paragraphs with a fact.
+  swarm; would need real work for anything else. (In progress this session —
+  Part 2 of item 5's plan: an N-way mesh with real leader election.)
+- **Akuma-on-the-real-hardware is still untested.** `docs/TOPOLOGY.md`'s
+  `node4` runs on a *Firecracker guest* nested in a Lima VM, not the
+  physical `akuma` box (`ssh akuma`) — item 4, below, is unchanged by this.
+  `dist/storeprobe` still exists and still hasn't been run anywhere.
 - **No OpenSSH private-key signing.** `miot-keys` reads the operator's
   *public* key (`account_from_ssh`) but cannot sign with the matching private
   one — nothing here has parsed an OpenSSH private key file. Signing as the
@@ -297,12 +304,23 @@ containers now, not five.
    log rather than re-deriving one); replays on start. Verified: standalone
    kill/restart and `docker compose restart|up --force-recreate node` both
    reproduce identical `/events`/`/tasks`. Prerequisite for item 5, below.
-3. **Run `dist/storeprobe` on an Akuma guest.** Seven stages, exit status =
-   stages completed. Replaces a paragraph of speculation with a fact. Note:
-   `overlays/local/build-akuma.sh` cross-compiles for
-   `aarch64-unknown-linux-musl`; the real reachable `akuma` host
-   (`ssh akuma`, port 2222) answers `x86_64 GNU/Linux` — fix the target before
-   this step, or the binary won't run there.
+3. ~~**Run `dist/storeprobe` on an Akuma guest.**~~ **Superseded, 2026-09-22
+   — the bigger claim turned out true first.** Rather than the diagnostic
+   probe, the *full* `miot-node` was run directly on the actual Akuma kernel
+   — not the real `akuma` host below, but `akuma-guest`, a Firecracker
+   microVM nested inside the Lima VM `fc` (`../akuma/overlays/
+   devbox-firecracker/`). Real multi-threaded tokio, real axum HTTP server,
+   real ParityDB (sparse mmap'd files — the exact thing `storeprobe` exists
+   to test, now proven live instead of by a diagnostic stand-in), real
+   `reqwest` client — running unmodified, as a herd-managed service
+   (`/etc/herd/enabled/miot-node.conf`, auto-starts on boot same as `sshd`).
+   Verified end to end: a task opened against the real docker `node` showed
+   up in this node's `/tasks` a few seconds later, over the same
+   primary/replica HTTP protocol every other node in the mesh speaks.
+   `docs/TOPOLOGY.md` has the full diagram and the honest caveat (one boot,
+   one binary, a specific syscall surface — not a general claim about
+   Akuma). Item 4 below is still genuinely open: this ran on a *Firecracker
+   guest*, not the real physical `akuma` host.
 4. **Ship `dist/miot` to Akuma** and run a cat there against a host model.
    Needs a host `llama-server` reachable from that box — today
    `llama-swarm.sh` binds `127.0.0.1` only, so this also needs a deliberate
@@ -336,12 +354,12 @@ containers now, not five.
    against the peer once, at (re)connect (`reconcile_if_diverged`), rather
    than the tip on every tick — cheap because a replica that only ever
    appends blocks it received from its peer cannot diverge from it again on
-   its own before the next restart. **Known limitation, not a regression**:
-   `compact()` is still never called anywhere (a separate, still-open item),
-   so `last_checkpoint` is always 0 and every reconciliation lands at
-   genesis today, full-replaying the peer's whole history rather than a
-   partial rewind — correct per the documented rule, just more expensive
-   than it will be once compaction is wired in.
+   its own before the next restart. **Follow-up, done same day**:
+   `compact()` was never called anywhere at the time this was written, so
+   every reconciliation landed at genesis rather than a partial rewind —
+   correct per the documented rule, just expensive. Wired up right after
+   (`compact()` fires on root's `/clear`; see "real compaction" in "What is
+   real," above) — reconciliation now lands on the checkpoint instead.
 
 ---
 

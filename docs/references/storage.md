@@ -213,47 +213,95 @@ the unrelated litter leader):
 - `GET /chain/head` → `{"head", "last_checkpoint"}`, straight off the store.
 - `GET /chain/blocks?from=N&limit=M` → raw stored block bytes, hex-encoded,
   for heights `[N, min(head, N+M-1)]`.
+- `GET /chain/checkpoint` → `{"height", "state_hex"}` (or `null`) — the
+  compaction state a replica adopts directly when it can't reach it by
+  replay (below).
 
-A replica does two things, in `crates/miot-node/src/main.rs`:
+A replica does three things, in `crates/miot-node/src/main.rs`:
 
 1. **`reconcile_if_diverged`**, once, before it starts serving (covers both
    a fresh replica and one restarting after having run independently).
-   Fetches its peer's blocks for its *entire* local range and runs
-   `Store::fork_point` over all of it, not just the tip. That "not just the
-   tip" is load-bearing, found live standing this up: an empty
+   Fetches its peer's blocks for its local range *above its own checkpoint*
+   and runs `Store::fork_point` over all of it, not just the tip. That "not
+   just the tip" is load-bearing, found live standing this up: an empty
    `Vec<Effect>` — a "quiet" block, the common case — encodes identically no
    matter which chain produced it, so a diverged block sitting under a few
    agreeing quiet blocks above it is invisible to a tip-only comparison.
    Comparing the whole range is what catches it. If `fork_point` comes back
-   below the local head, `Store::rewind_for_fork` runs for real and the
-   in-memory state rebuilds from `genesis()` — see below for why that's
-   always a full rebuild today, not a partial one.
-2. **`sync_once`**, on a timer thereafter (`MIOT_SYNC_MS`, default
-   `BLOCK_MS`): tails whatever new blocks the peer has, folding each one in
+   below the local head, `Store::rewind_for_fork` runs for real.
+2. **`adopt_peer_checkpoint_if_ahead`**, both at that same startup check
+   *and* every `sync_once` tick thereafter (not startup-only — see why
+   below). If the peer's `last_checkpoint` is ahead of our own — including a
+   fresh replica with nothing at all — there is no way to reach that point
+   by replaying blocks the peer already dropped, so this fetches
+   `/chain/checkpoint` and calls `Store::adopt_checkpoint` directly.
+3. **`sync_once`**, on a timer (`MIOT_SYNC_MS`, default `BLOCK_MS`): calls
+   step 2, then tails whatever new blocks the peer has, folding each one in
    through `Node::apply_block` — the same step a local-store replay on
-   restart already used. No fork check here; a replica that only ever
-   appends blocks it received from its peer cannot diverge from it again on
-   its own before the next restart, so step 1 doesn't need repeating per
-   tick.
+   restart already used.
 
-**Because `compact()` is never called anywhere in this node yet** (a known,
-separate gap), `last_checkpoint` is always 0, so `rewind_for_fork`'s `land`
-is always genesis — any detected divergence today means "discard the whole
-local log and full-replay the peer's history from block 1," never a partial
-rewind to a nearby checkpoint. That is the documented rule above working
-exactly as designed for a chain with no compaction yet, not a bug in the
-replication code. Wiring in `compact()` (still a separate, open item) would
-let both `reconcile_if_diverged` and a real fork's rewind start from the
-latest checkpoint instead of genesis, with no change needed in either.
+**Step 2 has to run every tick, not just at startup — found live, the hard
+way.** A replica that's already caught up and just tailing can't *diverge*
+from its peer on its own (that part of the reasoning above still holds), but
+the peer's checkpoint can advance at any time root calls `/clear`,
+completely independent of anything the replica does. The first version of
+this only checked at startup: a replica that had been happily tailing for a
+while got permanently stuck the moment its peer compacted, because
+`Store::append`'s contiguity check has no way to skip the gap a compaction
+leaves — it just failed forever, one block short of where the peer could
+still serve from. Restoring `Node::apply_block` from a checkpoint
+(`Node::restore_from_snapshot`, next section) fixed the mechanism; running
+the *check* every tick, not just once, is what actually closes the gap.
 
-Verified live: a standalone third `miot-node`, run first as a replica of
-`node` to build matching history, then killed and restarted as its own
-independent primary (same genesis, no peer) and given a submit only it
-received, then pointed back at `node` as a replica again — printed `sync:
-diverged from peer above block 481, rewound to 0 (dropped 485 block(s))` and
-came back with `/tasks`/`/events` byte-for-field identical to `node`'s. That
-is `a_cat_that_diverged_converges_on_the_leader` happening for real, not in
-a unit test.
+Verified live, twice. First (before compaction existed): a standalone third
+`miot-node`, run as a replica, killed, restarted as its own independent
+primary, given a submit only it received, then pointed back — printed
+`sync: diverged from peer above block 481, rewound to 0 (dropped 485
+block(s))`, full genesis replay, byte-for-field identical after. Second
+(after compaction shipped, same day): the same drill again, this time
+landing on the real checkpoint — `rewound to 5` instead of `0`, 21 blocks
+dropped instead of the whole chain. Both are
+`a_cat_that_diverged_converges_on_the_leader` happening for real, not in a
+unit test; the second is what that test's "coarser than the fork point, not
+genesis" case actually looks like live.
+
+### The checkpoint is a real snapshot, not a hand-rolled subset
+
+`Store::compact`'s `state` parameter was designed opaque from the start —
+`miot-store` has no idea what's inside it. What `miot-node` actually puts
+there: the *entire* FRAME storage trie, via
+`sp_io::TestExternalities::into_raw_snapshot`/`from_raw_snapshot` — every
+pallet's storage, not just `pallet-litter`'s own value, `frame_system`'s
+nonces (`providers`/`sufficients` from `catnip`) and `BlockHash` map
+included. `into_raw_snapshot` drains the externality's backend, so
+`Node::compact_at` immediately rebuilds an equivalent one from the same raw
+data to keep serving live traffic; `Node::restore_from_snapshot` is the
+inverse, used both by a local restart (`Node::replay`, once a checkpoint
+exists) and by `reconcile`/`adopt_peer_checkpoint_if_ahead` on a replica.
+
+**One real bug this surfaced**: `into_raw_snapshot` drains the backend
+*only* — not the pending overlay `execute_with` accumulates, and nothing
+here had ever called `commit_all()` before. The first live `/clear` test
+crashed the node on the very next block with `frame_system`'s own "block
+number must be strictly increasing" panic — the snapshot had silently
+captured genesis-era state (block 1), because roughly a thousand blocks'
+worth of overlay writes had never been flushed to the backend at all. Fixed
+by calling `ext.commit_all()` immediately before `into_raw_snapshot()`.
+
+**The one trigger wired up: root's `/clear`.** `clear_all` already fails
+every open parent and sweeps them immediately (`gc(now, keep_for: 0)`) — the
+one point in the system that already means "nothing above here is worth
+keeping," and the natural, and only, compaction trigger this project uses.
+`Node::submit` recognizes `RuntimeCall::Litter(Call::clear_all {})` before
+dispatch and sets `pending_compaction`; `Node::advance` takes the actual
+snapshot right after that block closes and persists (`clear_all`'s effects
+land in the *currently open* block, which `Store::compact` can't target
+until it's closed — `compact` requires `height <= store.head()`).
+
+Verified live: `/clear` against the real docker `node`, next block logs
+`compacted at block N (N block(s) pruned)`, `/chain/head` reports a
+non-zero `last_checkpoint`, and a restart logs `restoring from checkpoint
+at block N` rather than replaying from block 1.
 
 ## Risks accepted
 

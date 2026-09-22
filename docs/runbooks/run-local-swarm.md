@@ -10,7 +10,11 @@ passive read replica, HANDOFF item 5 — see its own section below) in docker
 (`overlays/local/docker-compose.yml`), `kuro` on the Lima VM (`fc`) instead of
 docker — see `HANDOFF.md`'s "What is real" section for why. Models
 (`llama-server` ×4) run on the host, never in a container (no GPU passthrough
-on Docker Desktop for macOS).
+on Docker Desktop for macOS). Two more replicas exist outside this
+docker-compose file entirely — `node3` on `fc`'s own Linux userspace and
+`node4` on the actual Akuma kernel, nested one level deeper via Firecracker —
+started manually, not yet scripted into this runbook's everyday loop.
+`docs/TOPOLOGY.md` has the full diagram.
 
 ## Bring it up from nothing
 
@@ -186,10 +190,16 @@ and resumes from its own persisted log, then keeps tailing `node` — same
 "cats don't need restarting" property item 2 gave `node` itself, now true of
 a replica catching back up too.
 
+**`adopted peer's checkpoint at block N` is normal, not an error** — it
+prints every time `node` compacts (root ran `/clear`) and `node2` picks up
+the new checkpoint on its next sync tick. Expected, routine, no action
+needed.
+
 If `node2`'s log ever shows `sync: diverged from peer above block N, rewound
-to 0 (...)`, that means its local log disagreed with `node`'s somewhere
-above block `N` and it just rebuilt itself from genesis to match — expected
-behavior if `node2` was ever run independently (e.g. `MIOT_ROLE=primary`
-against its own `MIOT_DB`, for testing), not something to debug. It should
-never happen in ordinary operation, where `node2` only ever appends blocks
+to M (...)` (`M` is the last checkpoint if one exists, genesis/`0` if not),
+that means its local log disagreed with `node`'s somewhere above block `N`
+and it rebuilt itself from `M` to match — expected behavior if `node2` was
+ever run independently (e.g. `MIOT_ROLE=primary` against its own `MIOT_DB`,
+for testing), not something to debug. It should never happen in ordinary
+operation, where `node2` only ever appends blocks
 `node` gave it.
