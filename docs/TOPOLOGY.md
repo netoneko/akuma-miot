@@ -47,8 +47,10 @@ macOS host (192.168.1.203)
 └── akuma (192.168.1.123:2222, the real Akuma kernel on hardware) ──
       node5  (PRIMARY of its own chain — fresh genesis, not migrated
               into mac's log) :9944 ── bare /root/miot/bin/miot, same
-              x86_64 musl binary, nohup'd with no supervisor. Runs,
-              but is NOT durably up — see the storeprobe section.
+              x86_64 musl binary, supervised by herd
+              (/etc/herd/enabled/miot.conf), MIOT_DB at
+              /root/miot/db/miot.db. Durably up: survives kill and
+              full reboot, replaying the persisted log each time.
 ```
 
 Every replica (`node2`, `node3`, `node4`) pulls from *its own* primary the
@@ -80,61 +82,74 @@ sync interval. The docker `node2` service was stopped, removed, and deleted
 from `docker-compose.yml` (volume dropped too) — one replica identity, one
 process, not two.
 
-## `node5` on the real akuma host — runs, but the store has a wall
+## `node5` on the real akuma host — durably up, after three kernel fixes
 
 First time anything from this repo touched the physical `akuma` box
 (`ssh akuma`, port 2222 — an x86_64 Akuma-kernel host, not the Firecracker
-guest and not a Lima VM). `dist/storeprobe` finally ran somewhere, plus a
-bare-syscall `mmapprobe` built on the spot to pin the finding down. The
-facts, in order:
+guest and not a Lima VM). **As of later the same day, `node5` is durably
+up**: herd-supervised, survives `kill` and full reboot, replays its
+persisted log (1000+ blocks) on every start, and takes signed extrinsics
+from the mac. Getting here took fixing the Akuma kernel, not akuma-miot —
+the whole chain of findings, in order:
 
 - **Transfer**: no scp (no SFTP subsystem, same as the guest), but HTTP out
   works — busybox `wget` pulling from a `python3 -m http.server` on the mac
-  over the LAN moved both binaries fine. (Watch for a stale `http.server`
-  already squatting on the port — 404s that look like a wrong path but
-  aren't.)
-- **`storeprobe` stages 1–5 pass**: fresh ParityDB open, 256 appends, read
-  back, compact, rewind — on real hardware, not nested in anything.
-- **Stage 6 fails**: reopen of the existing store dies with
-  `Function not implemented (os error 38)`.
-- **`mmapprobe`** (crates/miot-store/src/bin/mmapprobe.rs, raw `mmap`
-  syscalls, 4 pages): anonymous RW ok, file `MAP_PRIVATE` RO ok, file
-  `MAP_SHARED` RO ok, file `MAP_SHARED` RW — **segfault** (exit 139), not
-  even a clean errno.
-- **Root cause, in the kernel's own words** (../akuma
-  `amd64/src/mm.rs`, the `sys_mmap` doc comment): a **writable
-  `MAP_SHARED` file mapping is refused** — the one deliberate gap in
-  akuma's mmap surface ("writes would need a coherent path back to the
-  file"). ParityDB's `MmapMut` is exactly that shape, needed exactly at
-  reopen/growth.
+  over the LAN moved both binaries and later the kernel ELF itself. (Watch
+  for a stale `http.server` already squatting on the port — 404s that look
+  like a wrong path but aren't.)
+- **`storeprobe`, first run**: stages 1–5 passed (fresh ParityDB open,
+  256 appends, read-back, compact, rewind); stage 6 — **reopen across a
+  process boundary** — died with `Function not implemented (os error 38)`.
+- **`mmapprobe`** (`crates/miot-store/src/bin/mmapprobe.rs`, raw `mmap`
+  syscalls, 4 shapes) pinned it: anonymous RW, file `MAP_PRIVATE` RO, file
+  `MAP_SHARED` RO all map; file `MAP_SHARED` **RW segfaulted**. Root cause
+  in ../akuma's own words (`sys_mmap` doc comment): a writable
+  `MAP_SHARED` file mapping was *deliberately refused* — the one gap in
+  akuma's mmap surface.
+- **Catch-up sync wedged** (the interim state this section used to
+  describe): pointed at mac's primary as a replica, the box adopted the
+  checkpoint, then froze mid-catch-up — all threads `R`, zero CPU, HTTP
+  never bound. That wedge is what the kernel fixes below removed; the
+  replica path itself has not been re-tested on the fixed kernel and
+  remains the one unverified direction.
+- **The fix, in ../akuma** (see `docs/reference/subsystems/
+  amd64-shared-write-mmap.md` there): writable `MAP_SHARED` file mappings
+  are now served — demand-paged (parity-db maps `len + 1 GiB` of reserve
+  VA, so eager fill was a non-starter) with whole-region write-back on
+  `munmap`/`msync`/`MADV_DONTNEED`, `msync` routed at x86_64 nr 26 before
+  the shared syscall table. Two more kernel bugs stood behind it:
+  **ext2 `truncate` answered `Ok(())` for extend** (a silent no-op that
+  zeroed parity-db's `set_len`-before-write pattern — flushes correctly
+  found a zero-byte file), and **`posix_fadvise` had no syscall row**
+  (parity-db `try_io!`s it; ENOSYS aborted every open).
+- **After the fixes**: `storeprobe` completes **all 7 stages on real
+  hardware** (exit status 7), the amd64 boot suite matches the stock
+  baseline, and the node survives restart over its grown database — the
+  thing this section's first draft called fatal.
 
-So a **fresh** `miot node` boots and serves on real akuma — real tokio
-workers (`ps` shows `{tokio-rt-worker}` threads), HTTP up, blocks ticking,
-a signed `--say` landing and persisting (DB grew, head advanced). But the
-wall is close behind:
+**Deployed state**: kernel built on the mac
+(`cargo build -p akuma-amd64 --target x86_64-unknown-none --release`),
+pushed over HTTP to `/boot/akuma-amd64` (md5 + multiboot2-header checked,
+`.prev`/`.good` fallbacks kept), `/bin/herd` updated the same way (the
+box's previous herd predated config reload — it never picked up a service
+added after boot; see below). The node runs as herd service `miot`
+(`/etc/herd/enabled/miot.conf` → `/root/miot/start.sh`, which sets
+`MIOT_PORT`/`MIOT_DB` and execs the binary — `env =` lines exist in herd's
+parser but a wrapper script is the version-proof shape).
 
-- **Restart over an existing DB is fatal**: the reopened ParityDB hits the
-  same `os error 38` and the node exits. Fresh DB every boot, or no boot.
-- **Catch-up sync wedges**: pointed at mac's primary as a replica with a
-  fresh DB, `node5` adopted the checkpoint at block 1061, established its
-  peer connection — and then froze for 90+ observed seconds with all
-  threads reported `R` but **zero accumulated CPU time**, HTTP never bound,
-  DB size stuck at 13.5K. Consistent with the writable-`MAP_SHARED` path
-  wedging in the kernel rather than returning; not chased further, same
-  call as node4's panic. (An akuma-kernel bug, if it is one, belongs in
-  ../akuma, not here.)
-- **node4's exact panic** (`parity-db index.rs:237 slice range`) did **not**
-  reproduce here — the host hits its own wall earlier, in mmap, before any
-  index growth question can come up. Useful asymmetry: same kernel, two
-  environments, two different ParityDB failure modes, one shared suspect.
+**Herd trap, cost an hour**: a service whose spawn failed a few times under
+the box's previous herd stays wedged in that herd's state even after its
+conf is fixed — a *renamed* service (`miot2.conf`) started on the first
+reload where the repaired `miot.conf` never did. A reboot with a clean
+conf resolves it; don't debug the config when the state, not the config,
+is what's broken.
 
-**Verdict: `node5` is up and reachable (`http://192.168.1.123:9944`) but
-not durably so** — nohup'd, no supervisor (the box has no herd here), and
-one restart away from the mmap wall. "Durable node on real Akuma hardware"
-needs either akuma gaining writable `MAP_SHARED` file mappings, or
-`miot-store` growing a plain-file-I/O fallback behind a feature flag so
-ParityDB never mmaps. Neither is small; both are now precisely scoped,
-which is what the probe was for.
+**What's still honest**: this is one boot, one binary, one workload —
+node4's exact index-growth panic did *not* reproduce here (the host hits
+the mmap wall earlier, or rather: did, until the wall moved), and the
+replica-catch-up wedge has not been re-tested since the kernel fix. The
+node is a primary of its own chain — a replica of mac's log on this box is
+the obvious next experiment.
 
 ## What `node4` actually proves
 

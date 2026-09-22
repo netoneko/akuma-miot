@@ -206,21 +206,21 @@ x86_64 twin of `build-akuma.sh`'s aarch64 toolchain. Verified converged
 one sync interval). The docker `node2` container was stopped, removed and
 deleted from the compose file — one replica identity, not two running under
 it. `docs/TOPOLOGY.md` has the details.
-**a fifth node, on the real akuma hardware, 2026-09-22 — but not durably.**
+**a fifth node, durably up on the real akuma hardware, 2026-09-22.**
 `node5` (`ssh akuma`, the physical Akuma-kernel box) runs a *fresh-genesis
-primary* of its own (not migrated into mac's log), from the same
-x86_64-unknown-linux-musl binary, transferred over busybox `wget` + HTTP.
-Fresh boot works end to end (tokio workers, HTTP, ticking, a signed
-extrinsic landing and persisting) — but ParityDB hits a wall the moment it
-needs a **writable `MAP_SHARED` file mapping**: reopen over an existing DB
-exits with `os error 38`, and a bare-syscall probe of exactly that mmap
-shape **segfaults**. `storeprobe` stages 1–5 pass there; stage 6 (reopen)
-is where it dies. Repointing the box at mac's primary as a replica wedged
-it mid-catch-up instead (threads `R` with zero CPU, HTTP never bound).
-All of this — including the root cause, stated in ../akuma's own
-`sys_mmap` doc comment — is written up in `docs/TOPOLOGY.md`'s `node5`
-section. First akuma-miot contact with the physical box; `storeprobe`
-finally earned its keep.
+primary* of its own as a **herd service**, survives `kill` and full reboot
+(replaying 1000+ persisted blocks each start), and takes signed extrinsics
+from the mac. The same day it started, it also forced three **kernel** fixes
+in ../akuma — none of them akuma-miot bugs: writable `MAP_SHARED` file
+mappings went from refused-by-design (ParityDB's `MmapMut` died at every
+reopen, `os error 38`) to demand-paged with whole-region write-back;
+ext2 `truncate` stopped answering `Ok(())` for extend (a silent no-op that
+made `set_len`-before-write a zero-byte file); and `posix_fadvise` got its
+table row (parity-db `try_io!`s it). `storeprobe` completes **all 7 stages
+on real hardware** — the diagnostic this project shipped and never ran,
+now green where it was built to run. Full story and the honest residual
+(replica-catch-up not re-tested post-fix): `docs/TOPOLOGY.md`'s `node5`
+section.
 **real compaction, 2026-09-22** — `Store::compact` fires on root's `/clear`
 (a genuine snapshot of the whole storage trie via `sp_io::TestExternalities`'s
 own `into_raw_snapshot`/`from_raw_snapshot`, not a hand-rolled subset); a
@@ -238,14 +238,12 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
   a dead primary and promotes a replica on its own. Fine for one operator's
   swarm; would need real work for anything else. (In progress this session —
   Part 2 of item 5's plan: an N-way mesh with real leader election.)
-- **Akuma-on-the-real-hardware: partially tested, not durable.** `node5`
-  (above) now *runs* on the physical `akuma` box — fresh boot verified —
-  but a restart over a grown ParityDB is fatal (writable `MAP_SHARED` file
-  mmap refused by the kernel; `docs/TOPOLOGY.md` `node5` section). `node4`
-  on the Firecracker guest remains intermittent for a different reason
-  (index-growth panic). `storeprobe` and the newer `mmapprobe`
-  (`crates/miot-store/src/bin/mmapprobe.rs`) are the two diagnostics; both
-  have now actually run on the real host.
+- **Akuma-on-the-real-hardware: tested, durable, still one boot.** `node5`
+  (above) runs on the physical `akuma` box as a herd service and survives
+  restart over a grown ParityDB. `node4` on the Firecracker guest remains
+  intermittent for a different reason (index-growth panic). `storeprobe`
+  and `mmapprobe` (`crates/miot-store/src/bin/mmapprobe.rs`) are the two
+  diagnostics; both have run on the real host.
 - **No OpenSSH private-key signing.** `miot-keys` reads the operator's
   *public* key (`account_from_ssh`) but cannot sign with the matching private
   one — nothing here has parsed an OpenSSH private key file. Signing as the
@@ -317,15 +315,25 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
   changed between the directive being issued and the reply landing — `curl
   .../tasks` or `.../events` will show it.
 
-- **Akuma refuses writable `MAP_SHARED` file mappings — and it costs more
-  than an errno.** Stated as a deliberate gap in ../akuma's `sys_mmap` doc
-  comment; observed from here as a ParityDB reopen failing with
-  `os error 38` and a raw probe of the same mmap shape **segfaulting**
-  (2026-09-22, real `akuma` host). Any "just restart the node" story on
-  Akuma is dead until this changes or `miot-store` grows a no-mmap
-  fallback. Also: restarting a process on akuma leaves zombies (nothing
-  reaps) — `ps` there fills with dead `miot node` entries; cosmetic, but
-  don't read them as live.
+- **Akuma's writable-`MAP_SHARED` gap: found, fixed upstream, same day.**
+  The 2026-09-22 session that first touched the physical box found ParityDB
+  un-restartable there (`os error 38` at reopen; a raw mmap probe of the
+  shape **segfaulted**). The fix landed in ../akuma, not here — writable
+  `MAP_SHARED` file mappings are now demand-paged with write-back, ext2
+  `truncate` really extends, and `posix_fadvise` exists
+  (`docs/reference/subsystems/amd64-shared-write-mmap.md` in ../akuma).
+  Residuals to keep honest: replica-catch-up sync from this box has not
+  been re-tested on the fixed kernel (it wedged mid-sync pre-fix), and
+  node4's Firecracker-guest index panic is a *different*, still-open
+  failure. Both probes (`storeprobe`, `mmapprobe`) run on the metal now.
+- **Herd on the trashcan wedges failed services, not configs.** A service
+  whose spawn failed a few times under the box's previous herd stayed dead
+  after its conf was repaired — a renamed service started on the first
+  reload where the fixed one never did; a reboot cleared it. Also: the
+  box's previous `/bin/herd` predated config reload entirely (never picked
+  up services added after boot) — the laptop-built herd is installed now.
+- **Restarting a process on akuma leaves zombies** (nothing reaps) — `ps`
+  fills with dead entries; don't read them as live.
 - **A stale `python3 -m http.server` on the mac squatted port 8123** and
   served 404s that looked like a wrong URL. `lsof -i :PORT -sTCP:LISTEN`
   + `ps -p <pid> -o command=` before blaming the client side.
@@ -372,15 +380,13 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
    now.
 4. **Ship `dist/miot` to Akuma** and run a cat there against a host model.
    ~~Needs a host `llama-server` reachable from that box~~ — updated
-   2026-09-22: the *node* now runs there (`node5`, fresh genesis, see
-   "What is real"), and the x86_64-unknown-linux-musl build + busybox-wget
-   transfer path is proven. What's still open for a *cat* on akuma is
-   unchanged (an exposed inference port decision) **plus** the store wall:
-   a long-running cat is fine (no ParityDB in `kot`), but anything that
-   restarts the akuma node over a grown DB dies — see `docs/TOPOLOGY.md`.
-   Remaining genuinely-open question on the box: nothing yet exercises the
-   akuma host's `reqwest`-as-client path for long (the replica sync wedged
-   before it could).
+   2026-09-22, twice: the *node* now runs there **durably** (`node5`,
+   herd-supervised, restart-proven over a grown DB — see "What is real"),
+   the x86_64-unknown-linux-musl build + busybox-wget transfer path is
+   proven, and the kernel's mmap/`truncate`/`fadvise` blockers are fixed.
+   What's still open: a cat on the box (an exposed inference port decision —
+   unchanged), and the replica direction (node5 as a replica of mac's log —
+   it wedged mid-catch-up on the pre-fix kernel and is worth one retry now).
 5. ~~**A second node.**~~ **Done, 2026-09-22.** `miot` gained a role
    (`MIOT_ROLE=primary|replica`) rather than a full P2P/gossip layer — a
    replica pulls its peer's block log over two new HTTP endpoints

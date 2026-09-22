@@ -58,15 +58,17 @@ GGUF sources (verified against the HF API before download, not guessed):
   builds cause. No mechanism for that exists yet — this doc only covers the
   local inference split, not that persistence design.
 - **akuma isn't a normal Linux userland — checked, not assumed.** `uname -a`:
-  `Akuma akuma 0.0.8 d565985c-release-smp-shared x86_64 GNU/Linux`. This is
-  Kirill's own kernel, not stock Linux. `whoami` fails (`unknown uid 0`, no
-  `/etc/passwd`) — the userland is minimal. **Update 2026-09-22, from the
-  real box:** the pthread/socket surface a multi-threaded Rust network
-  service needs is now *verified* — a real `miot` node ran there (tokio
-  workers, axum HTTP — `docs/TOPOLOGY.md` `node5`). mmap is the gap:
-  writable `MAP_SHARED` file mappings are refused (worse than refused —
-  the probe segfaults), which is fatal to ParityDB across a restart. Fine
-  for a stateless cat; disqualifying for a durable node until it changes.
+  `Akuma akuma 0.0.8 x86_64 GNU/Linux` — Kirill's own kernel, not stock
+  Linux. `whoami` fails (`unknown uid 0`, no `/etc/passwd`) — the userland
+  is minimal. **Update 2026-09-22, late:** the syscall surface a Rust
+  network-plus-database service needs is now *verified on the metal* — a
+  real `miot` node runs there durably (tokio workers, axum HTTP, ParityDB
+  surviving restart — `docs/TOPOLOGY.md` `node5`), after three kernel fixes
+  (writable `MAP_SHARED` mmap, ext2 truncate-extend, `fadvise64`). `mmap`
+  coherence is write-back-shaped, not page-cache-shaped: fine for a
+  single-process DB owner like the node, the caveat a second mapper of the
+  same file would hit. Local inference on akuma is still a someday-maybe
+  for other reasons (RAM budget, GLM-over-API already works there).
 - **`--jinja` tool-call parsing with Qwen3/GLM on `llama-server` is unverified
   live.** RESULTS.md's zero-malformed-calls finding is against Ollama +
   gemma4-yolo-4b/qwen3:4b, not against `llama-server`'s parser.
