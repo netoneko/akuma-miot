@@ -126,8 +126,11 @@ ones that matter. At `BLOCK_MS = 6000` (`miot`):
 | `MaxDirectiveNudges` | 3 | — |
 | `GcKeepFor` | 14,400 | 24h |
 
-`MaxText=4096, MaxResult=16KiB, MaxArtifact=64KiB, MaxTitle=128,
+`MaxText=4096, MaxResult=16KiB, MaxArtifact=16KiB, MaxTitle=128,
 MaxSubtasks=8, MaxTasks=512, MaxMessage=2048` — byte/row caps, not timers.
+`MaxArtifact` is `ARTIFACT_PAGES` (4) × `ARTIFACT_PAGE_BYTES` (4 KiB, about
+1k tokens) in `miot-runtime`: a report has to fit a local model's 32k window
+alongside everything else, so it's budgeted in pages.
 
 `HANDOFF.md`'s "Traps" section already flags these as "~50× too
 conservative" for the turn lengths actually observed (3-60s, not 120-200s) —

@@ -140,6 +140,16 @@ parameter_types! {
     pub const GcKeepFor: u32 = 14_400;
 }
 
+/// An artifact is sized in **pages of about 1k tokens** (4 KiB of English
+/// is roughly 1,000 tokens), because whoever reads it next is often a local
+/// model with a 32k context at best, and the report has to share that
+/// window with the persona, the question and the tools. Four pages. Change
+/// the page count, not the byte math. (Was a flat 64 KiB, about 16k tokens,
+/// half such a model's whole window; cut 2026-09-22.)
+pub const ARTIFACT_PAGE_BYTES: u32 = 4 * 1024;
+pub const ARTIFACT_PAGES: u32 = 4;
+pub const MAX_ARTIFACT_BYTES: u32 = ARTIFACT_PAGES * ARTIFACT_PAGE_BYTES;
+
 impl pallet_litter::Config for Runtime {
     type ClaimWindow = ClaimWindow;
     type Lease = Lease;
@@ -153,7 +163,7 @@ impl pallet_litter::Config for Runtime {
     // A forcing function, not a safety rail: a cat that cannot publish a 40 KB
     // build log has to say what happened instead of pasting what scrolled by.
     type MaxResult = ConstU32<{ 16 * 1024 }>;
-    type MaxArtifact = ConstU32<{ 64 * 1024 }>;
+    type MaxArtifact = ConstU32<MAX_ARTIFACT_BYTES>;
     type MaxTitle = ConstU32<128>;
     type MaxSubtasks = ConstU32<8>;
     type MaxTasks = ConstU32<512>;

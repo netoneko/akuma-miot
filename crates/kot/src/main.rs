@@ -1,397 +1,274 @@
-//! One cat.
-//!
-//! A process that knows two addresses — a node and a model — and nothing else.
-//! It has never heard of the other cats. Everything it learns about them
-//! arrives as an event from the chain, which is the litter's oldest rule kept
-//! intact: *the chain is the only channel between agents.*
-//!
-//! # It signs its own acts now
-//!
-//! There used to be a `who` field in a JSON body the node trusted. There
-//! isn't one any more: every act this cat takes is a real
-//! [`miot_runtime::UncheckedExtrinsic`], signed with its own
-//! [`miot_keys::Identity`], and the node recovers the sender from the
-//! signature instead of being told it.
-//!
-//! # The agent loop is the loose one
-//!
-//! It polls, it thinks for as long as thinking takes, and it submits. Nothing
-//! it does can make the node late — the block loop is in another process on
-//! another container, ticking on its own clock. A turn here spanning twenty
-//! blocks is normal and costs the chain nothing.
-//!
-//! # It is told when to think
-//!
-//! The node marks each event with `wakes`. A cat acts on events addressed to
-//! it and ignores the rest, because waking on every broadcast turns one record
-//! into four LLM turns — which the litter learned the expensive way.
+//! `kot` — see `lib.rs` for the parts, `docs/CLEANUP.md` item 2 for the
+//! agreed interface.
 //!
 //! ```text
-//!   MIOT_NAME    which cat this is        MIOT_NODE     http://node:9944
-//!   MIOT_SEED    its identity              MIOT_LLM      http://host:8081
-//!   MIOT_MODEL   model name                MIOT_PERSONA  path to a persona file
-//!   MIOT_ROSTER  name=seed,name=seed,...   (seed: a small int, or 64 hex chars)
+//! kot run --as <name> [--peers ...] [--llm URL | --glm]   node + agent loop
+//! kot task open "<text>" | kot task list
+//! kot artifact <id>
+//! kot say "<body>" [--to <name>]
+//! kot clear                                               root only
+//! kot peers                                               roster + mesh
+//! kot log [--task <id>] [--follow]
+//! kot id --seed-file <path>                               make/show an identity
+//! kot                                                     interactive REPL
 //! ```
+//!
+//! Every flag has an env twin (`MIOT_*`). Flags are for interactive use,
+//! env vars for a service unit or a herd conf — the same split the old
+//! `miot` binary had.
 
-use codec::Encode;
+use clap::{Args, Parser, Subcommand};
+use kot::common::{self, expand_home, parse_account, Roster, DIM, OFF};
+use kot::{agent, client, node};
 use miot_keys::Identity;
-use miot_llm::{task_tools, Llm};
-use miot_runtime::{client, AccountId, RuntimeCall};
-use polkadot_sdk::*;
-use serde::Deserialize;
-use sp_core::H256;
-use std::collections::HashSet;
+use miot_runtime::RuntimeCall;
 
-#[derive(Debug, Deserialize, Clone)]
-struct Entry {
-    seq: u64,
-    block: u64,
-    effect: serde_json::Value,
-    wakes: Option<String>,
+const DEV_ROSTER: &str = "root=1,mimi=2,tama=3,kuro=4,sora=5";
+
+#[derive(Parser)]
+#[command(name = "kot", version, about = "The litter's binary: a mesh node + agent loop (`kot run`), or a client of any node")]
+struct Cli {
+    /// A node to talk to. Falls back to each of --nodes in turn.
+    #[arg(long, env = "MIOT_NODE", global = true)]
+    node: Option<String>,
+    /// More nodes to try, comma-separated: any swarm node will do.
+    #[arg(long, env = "MIOT_NODES", global = true, value_delimiter = ',')]
+    nodes: Vec<String>,
+    /// `run`: this node's mesh name, and the cat it runs. Anything else:
+    /// sign as this roster member instead of the operator's own identity.
+    #[arg(long = "as", env = "MIOT_NAME", global = true)]
+    as_: Option<String>,
+    /// Sign with this seed (small int or 64 hex) instead.
+    #[arg(long, env = "MIOT_SEED", global = true, hide_env_values = true)]
+    seed: Option<String>,
+    /// Sign with the seed in this file instead.
+    #[arg(long, env = "MIOT_SEED_FILE", global = true)]
+    seed_file: Option<String>,
+    /// name=seed or name=pub:<hex>, comma-separated.
+    #[arg(long, env = "MIOT_ROSTER", global = true, default_value = DEV_ROSTER)]
+    roster: String,
+    #[command(subcommand)]
+    cmd: Option<Cmd>,
 }
 
-/// `MIOT_SEED`/a roster entry is either a small int (a deterministic seed
-/// byte, `[n; 32]` — fine for one operator's own trusted litter, same
-/// reasoning `miot-keys`'s `Identity::from_seed` doc already gives) or 64
-/// hex characters, a real 32-byte seed.
-fn parse_seed(spec: &str) -> [u8; 32] {
-    if let Ok(n) = spec.parse::<u8>() {
-        return [n; 32];
-    }
-    let bytes = hex::decode(spec.trim_start_matches("0x"))
-        .unwrap_or_else(|_| panic!("seed {spec:?} is neither a small int nor 64 hex chars"));
-    bytes.try_into().unwrap_or_else(|_| panic!("seed {spec:?} is not 32 bytes"))
+#[derive(Subcommand)]
+enum Cmd {
+    /// A mesh node, plus this cat's agent loop if given a model.
+    Run(RunArgs),
+    /// Open or list tasks.
+    Task {
+        #[command(subcommand)]
+        cmd: TaskCmd,
+    },
+    /// A closed parent's report, as markdown on stdout.
+    Artifact { id: String },
+    /// Say something to the litter, or one cat.
+    Say {
+        body: String,
+        #[arg(long)]
+        to: Option<String>,
+    },
+    /// Fail every open task: a new session, same chain. Root only.
+    Clear,
+    /// The litter roster, and the mesh as the connected node sees it.
+    Peers,
+    /// The event log.
+    Log {
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long, short)]
+        follow: bool,
+    },
+    /// Create an identity at --seed-file if there isn't one, and print it.
+    Id {
+        /// Comment for the `.pub` line.
+        #[arg(long, default_value = "kot")]
+        comment: String,
+    },
 }
 
-struct Cat {
-    name: String,
-    identity: Identity,
-    account: AccountId,
-    node: String,
-    http: reqwest::Client,
-    llm: Llm,
-    persona: String,
-    roster: Vec<(String, AccountId)>,
+#[derive(Subcommand)]
+enum TaskCmd {
+    Open { text: String },
+    List,
 }
 
-impl Cat {
-    fn who(&self, id: &AccountId) -> String {
-        self.roster
-            .iter()
-            .find(|(_, i)| i == id)
-            .map(|(n, _)| n.clone())
-            .unwrap_or_else(|| miot_keys::short(id))
-    }
+#[derive(Args)]
+struct RunArgs {
+    /// The other mesh members, as this node reaches them.
+    #[arg(long, env = "MIOT_PEERS", value_delimiter = ',')]
+    peers: Vec<String>,
+    #[arg(long, env = "MIOT_PORT", default_value_t = 9944)]
+    port: u16,
+    #[arg(long, env = "MIOT_BIND", default_value = "0.0.0.0")]
+    bind: String,
+    /// The block log. Default: kot-<name>.db
+    #[arg(long, env = "MIOT_DB")]
+    db: Option<String>,
+    /// A llama-server (or any OpenAI-compatible) base URL.
+    #[arg(long, env = "MIOT_LLM", conflicts_with = "glm")]
+    llm: Option<String>,
+    /// GLM on z.ai, key read from --glm-token-file.
+    #[arg(long, env = "MIOT_GLM")]
+    glm: bool,
+    #[arg(long, env = "MIOT_GLM_TOKEN_FILE", default_value = "~/.akuma/z.ai/token")]
+    glm_token_file: String,
+    /// Default: qwen3:4b, or glm-4.6 with --glm.
+    #[arg(long, env = "MIOT_MODEL")]
+    model: Option<String>,
+    #[arg(long, env = "MIOT_PERSONA")]
+    persona: Option<String>,
+    /// Root: an authorized_keys line, 64-hex account, or dev seed. Genesis.
+    #[arg(long, env = "MIOT_ROOT_PUBKEY", default_value = "1")]
+    root: String,
+    /// The litter leader (who plans) at genesis. Not the mesh primary.
+    #[arg(long, env = "MIOT_LEADER", default_value = "2")]
+    leader: String,
+    /// Accounts that exist at genesis (hex or dev seeds). Genesis.
+    #[arg(long, env = "MIOT_MEMBERS", value_delimiter = ',', default_value = "1,2,3,4,5")]
+    members: Vec<String>,
+    #[arg(long, env = "MIOT_BLOCK_MS", default_value_t = node::BLOCK_MS)]
+    block_ms: u64,
+    #[arg(long, env = "MIOT_SYNC_MS", default_value_t = 2000)]
+    sync_ms: u64,
+    #[arg(long, env = "MIOT_POLL_MS", default_value_t = 1000)]
+    poll_ms: u64,
+    #[arg(long, env = "MIOT_ELECTION_MIN_MS", default_value_t = 4000)]
+    election_min_ms: u64,
+    #[arg(long, env = "MIOT_ELECTION_MAX_MS", default_value_t = 8000)]
+    election_max_ms: u64,
+}
 
-    fn account_of(&self, name: &str) -> Option<AccountId> {
-        let n = name.trim().trim_start_matches('@').to_ascii_lowercase();
-        self.roster.iter().find(|(r, _)| *r == n).map(|(_, i)| i.clone())
-    }
+fn die(msg: impl std::fmt::Display) -> ! {
+    eprintln!("kot: {msg}");
+    std::process::exit(2)
+}
 
-    async fn head(&self) -> Option<serde_json::Value> {
-        self.http.get(format!("{}/head", self.node)).send().await.ok()?.json().await.ok()
+/// Who a command signs as: --seed, then --seed-file, then --as <roster
+/// member>, then the operator's own persisted identity.
+fn signer(cli: &Cli) -> Identity {
+    if let Some(s) = &cli.seed {
+        return Identity::from_seed(&common::parse_seed(s).unwrap_or_else(|e| die(e)));
     }
+    if let Some(f) = &cli.seed_file {
+        return common::read_seed_file(&expand_home(f)).unwrap_or_else(|e| die(e));
+    }
+    if let Some(name) = &cli.as_ {
+        return common::roster_seed(&cli.roster, name)
+            .unwrap_or_else(|| die(format!("--as {name}: no seed for {name} in the roster (a pub: entry can't sign)")));
+    }
+    common::load_or_create_identity(&common::root_identity_path(), "miot-root")
+}
 
-    async fn events(&self, since: u64) -> Vec<Entry> {
-        match self.http.get(format!("{}/events?since={since}", self.node)).send().await {
-            Ok(r) => r.json().await.unwrap_or_default(),
-            // A node that is not answering is not an error to hang on. Fail
-            // fast, keep polling — the litter's WAYWARD rule, which exists
-            // because a stalled tool call wastes a whole turn.
-            Err(_) => Vec::new(),
+async fn connect(cli: &Cli) -> client::Client {
+    let mut candidates: Vec<String> = cli.node.iter().cloned().collect();
+    candidates.extend(cli.nodes.iter().filter(|n| !n.is_empty()).cloned());
+    if candidates.is_empty() {
+        candidates.push("http://127.0.0.1:9944".into());
+    }
+    let roster = Roster::parse(&cli.roster).unwrap_or_else(|e| die(e));
+    client::Client::connect(candidates, signer(cli), roster).await.unwrap_or_else(|e| die(e))
+}
+
+async fn run(cli: &Cli, a: &RunArgs) {
+    let name = cli.as_.clone().unwrap_or_else(|| die("run needs --as <name> (or MIOT_NAME)"));
+    let account = |s: &str| parse_account(s).unwrap_or_else(|e| die(e));
+    let cfg = node::NodeConfig {
+        name: name.clone(),
+        bind: a.bind.clone(),
+        port: a.port,
+        db: expand_home(a.db.as_deref().unwrap_or(&format!("kot-{name}.db"))),
+        peers: a.peers.iter().map(|p| p.trim().trim_end_matches('/').to_string()).filter(|p| !p.is_empty()).collect(),
+        root: account(&a.root),
+        leader: account(&a.leader),
+        members: a.members.iter().filter(|m| !m.trim().is_empty()).map(|m| account(m)).collect(),
+        block_ms: a.block_ms,
+        sync_ms: a.sync_ms,
+        poll_ms: a.poll_ms,
+        timing: miot_mesh::Timing { election_min_ms: a.election_min_ms, election_max_ms: a.election_max_ms },
+    };
+    let running = node::start(cfg).await.unwrap_or_else(|e| die(e));
+
+    let llm = match (&a.llm, a.glm) {
+        (Some(url), _) => Some(miot_llm::Llm::local(url, a.model.as_deref().unwrap_or("qwen3:4b"))),
+        (None, true) => {
+            let path = expand_home(&a.glm_token_file);
+            let token = std::fs::read_to_string(&path).unwrap_or_else(|e| die(format!("--glm: {}: {e}", path.display())));
+            Some(miot_llm::Llm::glm(&token, a.model.as_deref().unwrap_or("glm-4.6")))
+        }
+        (None, false) => None,
+    };
+    match llm {
+        None => println!("[{name}] no --llm/--glm: node only, no agent loop"),
+        Some(llm) => {
+            let identity = if cli.seed.is_some() || cli.seed_file.is_some() {
+                signer(cli)
+            } else {
+                common::roster_seed(&cli.roster, &name)
+                    .unwrap_or_else(|| die(format!("the agent loop needs an identity: --seed-file, --seed, or a seed for {name} in the roster")))
+            };
+            let persona = a
+                .persona
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(expand_home(p)).ok())
+                .unwrap_or_else(|| format!("You are {name}, a cat in the Akuma Miot litter."));
+            let cfg = agent::AgentConfig {
+                name: name.clone(),
+                identity,
+                // Over HTTP even though it's this process (docs/CLI.md §5a).
+                node: format!("http://127.0.0.1:{}", running.addr.port()),
+                llm,
+                persona,
+                roster: Roster::parse(&cli.roster).unwrap_or_else(|e| die(e)),
+            };
+            tokio::spawn(agent::run(cfg));
         }
     }
-
-    async fn meta(&self) -> Option<client::Meta> {
-        let v: serde_json::Value = self.http.get(format!("{}/meta", self.node)).send().await.ok()?.json().await.ok()?;
-        let genesis_hash = H256::from_slice(&hex::decode(v.get("genesis_hash")?.as_str()?).ok()?);
-        Some(client::Meta {
-            genesis_hash,
-            spec_version: v.get("spec_version")?.as_u64()? as u32,
-            tx_version: v.get("tx_version")?.as_u64()? as u32,
-        })
-    }
-
-    async fn nonce(&self) -> u32 {
-        let url = format!("{}/account/{}", self.node, miot_keys::to_hex(&self.account));
-        match self.http.get(url).send().await {
-            Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| v.get("nonce")?.as_u64()).unwrap_or(0) as u32,
-            Err(_) => 0,
-        }
-    }
-
-    /// Sign `call` and submit it. Fetches `/meta` and its own nonce fresh
-    /// every time — an extra two requests per act, against a turn that costs
-    /// tens of seconds of LLM time, is not the bottleneck here.
-    async fn submit(&self, call: RuntimeCall) -> bool {
-        let Some(meta) = self.meta().await else {
-            println!("  [{}] node unreachable (meta)", self.name);
-            return false;
-        };
-        let nonce = self.nonce().await;
-        let uxt = client::sign(&self.identity, call, nonce, &meta);
-        match self.http.post(format!("{}/submit", self.node)).body(uxt.encode()).send().await {
-            Ok(r) if r.status().is_success() => true,
-            Ok(r) => {
-                let e: serde_json::Value = r.json().await.unwrap_or_default();
-                println!("  [{}] refused: {}", self.name, e.get("error").unwrap_or(&e));
-                false
-            }
-            Err(e) => {
-                println!("  [{}] node unreachable: {e}", self.name);
-                false
-            }
-        }
-    }
-
-    /// Build the prompt for one woken event. The parent question is carried
-    /// into every one of them: a turn is stateless, so the chain is the only
-    /// memory there is.
-    async fn prompt(&self, e: &Entry, question: &str) -> Option<(String, Vec<miot_llm::Tool>)> {
-        let t = e.effect.get("t")?.as_str()?;
-        let task = e.effect.get("task").and_then(|v| v.as_str()).unwrap_or("t1");
-        let p = match t {
-            "assigned" => {
-                let what = e.effect.get("what")?.as_str().unwrap_or("");
-                format!(
-                    "The litter is working on:\n{question}\n\n[assigned: {task}] Your part: {what}\n\
-                     Call TaskUpdate with task={task} and status=claim to take it."
-                )
-            }
-            "nudge" => format!(
-                "The litter is working on:\n{question}\n\n[work: {task}] You claimed this.\n\
-                 Do it now. Call TaskUpdate with task={task}, status=done, and text set to your \
-                 findings — concrete and specific. If you cannot, use status=failed."
-            ),
-            "directed" => {
-                let d = e.effect.get("directive")?.as_str().unwrap_or("");
-                match d {
-                    "PlanNeeded" => format!(
-                        "[plan-needed: {task}]\nThe operator asked:\n{question}\n\n\
-                         Call TaskPlan on {task} now. One assignment each to: {}. All in ONE call.",
-                        self.roster
-                            .iter()
-                            .filter(|(n, i)| *i != self.account && n != "root")
-                            .map(|(n, _)| n.as_str())
-                            .collect::<Vec<_>>()
-                            .join(", ")
-                    ),
-                    "ClearanceNeeded" => format!(
-                        "[clearance-needed: {task}]\nThe question: {question}\n\n\
-                         Results are in. For EACH sub-task call TaskUpdate with status=clear if it \
-                         helps answer the question, or status=reopen with text saying why not."
-                    ),
-                    "ArtifactNeeded" => format!(
-                        "[artifact-needed: {task}]\nTHE QUESTION YOU MUST ANSWER:\n{question}\n\n\
-                         Every sub-task is cleared. Call TaskUpdate with task={task}, \
-                         status=artifact, and text set to the final report in markdown. The '# ' \
-                         heading must restate the question, and the report must answer it."
-                    ),
-                    "ReassignNeeded" => format!(
-                        "[reassign-needed: {task}]\nA sub-task has been offered repeatedly and \
-                         never claimed — that cat cannot do it. Call TaskReassign to move it to \
-                         another cat. The litter is: {}",
-                        self.roster.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>().join(", ")
-                    ),
-                    _ => return None,
-                }
-            }
-            "said" => {
-                let from = e.effect.get("from")?.as_str()?;
-                let body = e.effect.get("body")?.as_str().unwrap_or("");
-                format!(
-                    "{} said to the litter:\n\"{body}\"\n\nReply with SendMessage. \
-                     Two sentences at most.",
-                    self.who(&miot_keys::from_hex(from).unwrap_or_else(|_| self.account.clone()))
-                )
-            }
-            _ => return None,
-        };
-        let tools = if t == "said" { miot_llm::chat_tools() } else { task_tools() };
-        Some((p, tools))
-    }
-
-    async fn act(&self, c: &miot_llm::Call) {
-        let task = c.str("task").unwrap_or_default();
-        let call = match c.name.as_str() {
-            "TaskPlan" => {
-                let assignments: Vec<miot_primitives::PlanItem<AccountId>> = c
-                    .args
-                    .get("assignments")
-                    .and_then(|a| a.as_array())
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|it| {
-                                let who = self.account_of(it.get("who")?.as_str()?)?;
-                                Some(miot_primitives::PlanItem {
-                                    who,
-                                    what: it.get("what")?.as_str()?.to_string(),
-                                    expect: String::new(),
-                                })
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let Some(parent) = parse_task(&task) else { return };
-                RuntimeCall::Litter(pallet_litter::Call::plan { parent, assignments })
-            }
-            "TaskUpdate" => {
-                let Some(id) = parse_task(&task) else { return };
-                let act = match c.str("status").unwrap_or_default().as_str() {
-                    "claim" => miot_primitives::Act::Claim,
-                    "done" => miot_primitives::Act::Done,
-                    "failed" => miot_primitives::Act::Failed,
-                    "clear" => miot_primitives::Act::Clear,
-                    "reopen" => miot_primitives::Act::Reopen,
-                    "artifact" => miot_primitives::Act::Artifact,
-                    _ => return,
-                };
-                let text = c.str("text").unwrap_or_default();
-                RuntimeCall::Litter(pallet_litter::Call::update { task: id, act, text })
-            }
-            "TaskReassign" => {
-                let Some(to) = c.str("to").and_then(|n| self.account_of(&n)) else { return };
-                let Some(id) = parse_task(&task) else { return };
-                RuntimeCall::Litter(pallet_litter::Call::reassign { task: id, to })
-            }
-            "SendMessage" => RuntimeCall::Litter(pallet_litter::Call::say {
-                to: None,
-                body: c.str("body").unwrap_or_default(),
-            }),
-            _ => return,
-        };
-        self.submit(call).await;
-    }
-}
-
-fn parse_task(s: &str) -> Option<miot_primitives::TaskId> {
-    let s = s.trim().trim_start_matches('t');
-    let mut it = s.split('.');
-    let p: u32 = it.next()?.parse().ok()?;
-    match it.next() {
-        None => Some(miot_primitives::TaskId::parent(p)),
-        Some(sub) => Some(miot_primitives::TaskId::sub(p, sub.parse().ok()?)),
-    }
+    running.wait().await;
 }
 
 #[tokio::main]
 async fn main() {
-    let env = |k: &str, d: &str| std::env::var(k).unwrap_or_else(|_| d.to_string());
-    let name = env("MIOT_NAME", "tama");
-    let identity = Identity::from_seed(&parse_seed(&env("MIOT_SEED", "3")));
-    let account = identity.account();
-    let node = env("MIOT_NODE", "http://node:9944");
-    let model = env("MIOT_MODEL", "qwen3:4b");
-    let llm_url = env("MIOT_LLM", "http://host.docker.internal:8081");
-    let persona = std::fs::read_to_string(env("MIOT_PERSONA", "/personas/tama.md"))
-        .unwrap_or_else(|_| format!("You are {name}, a cat in the Akuma Miot litter."));
-
-    let roster: Vec<(String, AccountId)> =
-        env("MIOT_ROSTER", "root=1,mimi=2,tama=3,kuro=4,sora=5")
-            .split(',')
-            .filter_map(|p| {
-                let (n, seed) = p.split_once('=')?;
-                Some((n.trim().to_string(), Identity::from_seed(&parse_seed(seed.trim())).account()))
-            })
-            .collect();
-
-    let cat = Cat {
-        name: name.clone(),
-        identity,
-        account: account.clone(),
-        node: node.clone(),
-        http: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(900))
-            .build()
-            .unwrap(),
-        llm: Llm::local(&llm_url, &model),
-        persona,
-        roster,
-    };
-
-    println!("[{name}] id={} node={node} llm={} model={model}", miot_keys::short(&account), llm_url);
-
-    // Wait for the node. A cat that starts first is normal in a compose file.
-    let mut cursor = 0u64;
-    loop {
-        if cat.head().await.is_some() {
-            break;
+    let cli = Cli::parse();
+    match &cli.cmd {
+        Some(Cmd::Run(a)) => run(&cli, a).await,
+        Some(Cmd::Id { comment }) => {
+            let path = expand_home(cli.seed_file.as_deref().unwrap_or_else(|| die("id needs --seed-file <path>")));
+            let id = common::load_or_create_identity(&path, comment);
+            println!("{}", miot_keys::to_hex(&id.account()));
+            println!("{}", id.ssh_public_line(comment));
         }
-        println!("[{name}] waiting for the node...");
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
-    println!("[{name}] connected.");
-
-    let mut question = String::new();
-    let mut seen: HashSet<u64> = HashSet::new();
-
-    loop {
-        let batch = cat.events(cursor).await;
-        for e in &batch {
-            cursor = cursor.max(e.seq);
-            if e.effect.get("t").and_then(|v| v.as_str()) == Some("said")
-                && e.effect.get("root").and_then(|v| v.as_bool()) == Some(true)
-            {
-                // Root speaking sets the subject if nothing else has.
-                if question.is_empty() {
-                    question = e.effect.get("body").and_then(|v| v.as_str()).unwrap_or("").into();
-                }
+        Some(Cmd::Task { cmd: TaskCmd::Open { text } }) => {
+            let mut c = connect(&cli).await;
+            let since = c.head_seq().await;
+            if c.submit(RuntimeCall::Litter(pallet_litter::Call::open { text: text.clone() })).await {
+                c.log(since, None, true, Some(8)).await;
             }
         }
-
-        // COALESCE. A turn takes minutes; the chain ticks in seconds. By the
-        // time a cat finishes thinking, several more wakes for the same task
-        // are waiting, and every one of them is superseded by the newest.
-        // Acting on each in turn is how a cat spends two minutes submitting a
-        // result the chain already has — observed live, as a string of
-        // `AlreadySubmitted` refusals.
-        //
-        // This is the `Coalesce` aggregation policy from docs/CLI.md: fold
-        // repeats of one thing into the latest one. Keep the newest wake per
-        // (task, kind) and drop the rest unread.
-        let my_hex = miot_keys::to_hex(&account);
-        let mut mine: Vec<Entry> = batch.into_iter().filter(|e| e.wakes.as_deref() == Some(my_hex.as_str())).collect();
-        let mut latest: std::collections::HashMap<(String, String), Entry> =
-            std::collections::HashMap::new();
-        for e in mine.drain(..) {
-            let k = (
-                e.effect.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-                e.effect.get("t").and_then(|v| v.as_str()).unwrap_or("").to_string(),
-            );
-            latest
-                .entry(k)
-                .and_modify(|cur| {
-                    if e.seq > cur.seq {
-                        *cur = e.clone();
-                    }
-                })
-                .or_insert(e);
-        }
-        let mut mine: Vec<Entry> = latest.into_values().collect();
-        mine.sort_by_key(|e| e.seq);
-
-        for e in mine {
-            if !seen.insert(e.seq) {
-                continue;
-            }
-            let Some((prompt, tools)) = cat.prompt(&e, &question).await else { continue };
-            let t = e.effect.get("t").and_then(|v| v.as_str()).unwrap_or("");
-            println!("[{name}] block {} {t} — thinking", e.block);
-
-            match cat.llm.turn(&cat.persona, &prompt, tools).await {
-                Ok(turn) => {
-                    if turn.calls.is_empty() {
-                        println!("[{name}]   no tool call ({} tok) — turn wasted", turn.tokens);
-                    }
-                    for c in &turn.calls {
-                        println!("[{name}]   {} ({} tok, {:.0}s)", c.name, turn.tokens, turn.ms as f64 / 1000.0);
-                        cat.act(c).await;
-                    }
-                }
-                Err(e) => println!("[{name}]   llm error: {e}"),
+        Some(Cmd::Task { cmd: TaskCmd::List }) => connect(&cli).await.print_tasks().await,
+        Some(Cmd::Artifact { id }) => {
+            if !connect(&cli).await.print_artifact(id).await {
+                std::process::exit(1);
             }
         }
-
-        tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+        Some(Cmd::Say { body, to }) => {
+            let mut c = connect(&cli).await;
+            let to = to.as_ref().map(|n| c.roster.account(n).unwrap_or_else(|| die(format!("no such cat: {n}"))));
+            let since = c.head_seq().await;
+            if c.submit(client::say_call(to, body)).await {
+                c.log(since, None, true, Some(8)).await;
+            }
+        }
+        Some(Cmd::Clear) => {
+            let mut c = connect(&cli).await;
+            c.submit(RuntimeCall::Litter(pallet_litter::Call::clear_all {})).await;
+        }
+        Some(Cmd::Peers) => connect(&cli).await.print_peers().await,
+        Some(Cmd::Log { task, follow }) => connect(&cli).await.log(0, task.as_deref(), *follow, None).await,
+        None => {
+            println!("{}", include_str!("../../../assets/akuma_40.txt"));
+            println!("  {DIM}akuma // distributed cat system{OFF}\n");
+            client::repl(connect(&cli).await).await;
+        }
     }
 }

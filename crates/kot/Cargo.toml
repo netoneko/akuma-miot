@@ -1,25 +1,36 @@
 [package]
 name = "kot"
-description = "One cat's agentic loop. Talks to a node over the network. Polish for \"cat\" (Miot Kotow, HANDOFF: cat=node convergence)."
+description = "The litter's one binary: a mesh node plus a cat's agent loop (`kot run`), and the operator's client of any node (`kot task`, `kot say`, bare `kot` for the REPL). Polish for \"cat\"."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+
+[lib]
+path = "src/lib.rs"
 
 [[bin]]
 name = "kot"
 path = "src/main.rs"
 
 [dependencies]
-miot-llm = { path = "../miot-llm" }
+polkadot-sdk = { workspace = true, default-features = true, features = ["frame-support", "frame-system", "sp-io", "sp-runtime", "sp-core", "sp-storage"] }
+codec = { package = "parity-scale-codec", version = "3", features = ["std"] }
 miot-primitives = { workspace = true, features = ["codec"] }
 miot-runtime = { path = "../miot-runtime" }
 miot-keys = { path = "../miot-keys" }
+miot-store = { path = "../miot-store" }
+miot-mesh = { path = "../miot-mesh" }
+miot-llm = { path = "../miot-llm" }
 pallet-litter = { path = "../pallet-litter" }
-polkadot-sdk = { workspace = true, default-features = true, features = ["sp-core"] }
-codec = { package = "parity-scale-codec", version = "3", features = ["std"] }
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync", "net", "io-util", "io-std"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+getrandom = "0.2"
+clap = { version = "4", features = ["derive", "env"] }
+
+[dev-dependencies]
+tempfile = "3"

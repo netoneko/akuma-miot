@@ -251,3 +251,24 @@ fn a_cat_that_diverged_converges_on_the_leader() {
     assert_eq!(s.block(5).unwrap(), Some(blk(5, "-leader")), "theirs is canonical");
     assert_eq!(s.last_checkpoint(), 4, "the agreed compaction survived the whole thing");
 }
+
+/// The election's vote must outlive both a restart and anything that
+/// happens to the log: a rewind that forgot a vote would let a node vote
+/// twice in one term.
+#[test]
+fn aux_survives_reopen_rewind_and_adopted_checkpoints() {
+    let d = tempfile::tempdir().unwrap();
+    {
+        let mut s = Store::open(d.path()).unwrap();
+        fill(&mut s, 5, "a");
+        s.put_aux("mesh", b"term=7").unwrap();
+        s.compact(3, &st(3)).unwrap();
+        s.rewind_for_fork(1).unwrap();
+        s.adopt_checkpoint(9, &st(9)).unwrap();
+        assert_eq!(s.aux("mesh").unwrap().as_deref(), Some(&b"term=7"[..]));
+        assert_eq!(s.aux("head").unwrap(), None, "aux names are namespaced away from the log's own keys");
+    }
+    let s = Store::open(d.path()).unwrap();
+    assert_eq!(s.aux("mesh").unwrap().as_deref(), Some(&b"term=7"[..]));
+    assert_eq!(s.head(), 9);
+}

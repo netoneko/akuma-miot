@@ -1,0 +1,12 @@
+[package]
+name = "miot-mesh"
+description = "Who produces blocks: leader election for the mesh, as a pure state machine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# No clock, no I/O, no chain — same rule as miot-tasks. The HTTP glue lives in
+# `kot`; this crate is what a simulated network drives in tests.
+[dependencies]
+serde = { version = "1", features = ["derive"] }

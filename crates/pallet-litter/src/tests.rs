@@ -341,3 +341,70 @@ fn a_stuck_subtask_reaches_the_leader_as_reassign_needed() {
         );
     });
 }
+
+/// Produce `to` blocks live, recording each block's effects the way a node
+/// persists them (tick effects first, then whatever was submitted in it).
+fn produce_log(to: u64) -> (Vec<(u64, Vec<Effect<u64>>)>, miot_tasks::State<u64>) {
+    use frame_support::traits::OnInitialize;
+    let mut blocks = Vec::new();
+    let state = new_test_ext().execute_with(|| {
+        let mut seen = 0;
+        for b in 1..=to {
+            if b > 1 {
+                System::set_block_number(b);
+                <Litter as OnInitialize<u64>>::on_initialize(b);
+            }
+            match b {
+                // Never planned: nagged with PlanNeeded until the budget
+                // runs out and the parent fails — `Directed` every time.
+                1 => assert_ok!(Litter::open(RuntimeOrigin::signed(ROOT), "never planned".into())),
+                3 => {
+                    assert_ok!(Litter::open(RuntimeOrigin::signed(ROOT), "planned".into()));
+                    plan_two(TaskId::parent(2));
+                }
+                5 => assert_ok!(Litter::update(RuntimeOrigin::signed(TAMA), TaskId::sub(2, 1), Act::Claim, String::new())),
+                _ => {}
+            }
+            let all = effects();
+            blocks.push((b, all[seen..].to_vec()));
+            seen = all.len();
+        }
+        crate::pallet::Litter::<Test>::get()
+    });
+    (blocks, state)
+}
+
+/// Fold a recorded log into a fresh chain, as a follower or a restarting
+/// node does: open each block (running `on_initialize`), then
+/// `replay_effect` its recorded body.
+fn fold_log(blocks: &[(u64, Vec<Effect<u64>>)], replaying: bool) -> miot_tasks::State<u64> {
+    use frame_support::traits::OnInitialize;
+    new_test_ext().execute_with(|| {
+        crate::Pallet::<Test>::set_replaying(replaying);
+        for (b, fx) in blocks {
+            if *b > 1 {
+                System::set_block_number(*b);
+                <Litter as OnInitialize<u64>>::on_initialize(*b);
+            }
+            for e in fx {
+                Litter::replay_effect(e, *b as u32);
+            }
+        }
+        crate::pallet::Litter::<Test>::get()
+    })
+}
+
+/// A follower's state must equal the producer's field for field — it is
+/// what a promoted follower keeps producing from. With the tick running
+/// locally as well (the pre-`Replaying` behaviour), every `Directed`
+/// counted twice and the states drifted.
+#[test]
+fn a_folded_block_log_reproduces_the_producers_state_exactly() {
+    let (blocks, live) = produce_log(60);
+    assert!(
+        blocks.iter().flat_map(|(_, fx)| fx).any(|e| matches!(e, Effect::Directed { .. })),
+        "the scenario must exercise directive nags"
+    );
+    assert_eq!(fold_log(&blocks, true), live);
+    assert_ne!(fold_log(&blocks, false), live, "control: double-ticking must visibly diverge");
+}

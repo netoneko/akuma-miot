@@ -150,6 +150,29 @@ pub mod pallet {
     /// both ends of the wire — and [`Effect::wakes`] means an agent's
     /// aggregator consults the type rather than re-deriving the waking rule
     /// from an event name.
+    /// Set by a node that is **folding someone else's blocks** — a follower
+    /// syncing from the mesh leader, or any node replaying its own store on
+    /// start. While set, [`Pallet::on_initialize`] does *not* run
+    /// `TaskTable::tick`: the block being folded already carries the tick's
+    /// effects (the producer drained them into that block's body), and
+    /// [`Pallet::replay_effect`] applies them. Running the tick locally as
+    /// well applied every tick effect twice — harmless for the set-style
+    /// ones (`Nudge` recomputes from `remaining`), but `Directed` *increments*
+    /// `directive_nudges_used`, so every replica, and every primary after a
+    /// restart, burned a leader's directive budget at double speed. Found
+    /// wiring election (2026-09-22): a promoted follower would have failed
+    /// parents early. `/tasks` never shows that counter, which is why the
+    /// "byte-identical" replica checks never caught it.
+    ///
+    /// `gc` still runs either way: it drops rows without emitting an
+    /// effect, so a folding node has no other way to learn about it.
+    ///
+    /// Node-local by intent, but it lives in storage (and so in a
+    /// compaction snapshot) because the hook has no other channel to the
+    /// host — a node must re-assert it after replacing its externalities.
+    #[pallet::storage]
+    pub type Replaying<T: Config> = StorageValue<_, bool, ValueQuery>;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -223,7 +246,7 @@ pub mod pallet {
         fn on_initialize(n: BlockNumberFor<T>) -> Weight {
             let now: BlockNumber = n.unique_saturated_into();
             let mut table = Self::table();
-            let effects = table.tick(now);
+            let effects = if Replaying::<T>::get() { Vec::new() } else { table.tick(now) };
             let dropped = table.gc(now, T::GcKeepFor::get());
             if !effects.is_empty() || dropped > 0 {
                 Self::commit(table, effects);
@@ -407,6 +430,25 @@ pub mod pallet {
             let mut table = Self::table();
             table.apply(effect, now);
             Litter::<T>::put(table.into_state());
+        }
+
+        /// See [`Replaying`]. Plain function, not a call: whether this node
+        /// is producing or folding blocks is the host's business.
+        pub fn set_replaying(on: bool) {
+            Replaying::<T>::put(on);
+        }
+
+        /// Run the tick for the block that is currently open, as
+        /// `on_initialize` would have if [`Replaying`] had been off when it
+        /// opened. A node promoted to block producer mid-block calls this
+        /// once so the first block it closes isn't missing its tick.
+        pub fn tick_now() {
+            let now: BlockNumber = frame_system::Pallet::<T>::block_number().unique_saturated_into();
+            let mut table = Self::table();
+            let effects = table.tick(now);
+            if !effects.is_empty() {
+                Self::commit(table, effects);
+            }
         }
 
         /// Authority is decided from the **recovered** caller, never from a

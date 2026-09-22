@@ -107,6 +107,10 @@ fn key(n: u64) -> Vec<u8> {
     n.to_be_bytes().to_vec()
 }
 
+fn aux_key(name: &str) -> Vec<u8> {
+    [b"aux:".as_slice(), name.as_bytes()].concat()
+}
+
 fn be(v: Vec<u8>) -> Option<u64> {
     v.try_into().ok().map(u64::from_be_bytes)
 }
@@ -228,6 +232,21 @@ impl Store {
 
     pub fn block(&self, height: u64) -> Result<Option<Vec<u8>>> {
         Ok(self.db.get(COL_BLOCK, &key(height))?)
+    }
+
+    /// A small node-local value that must survive restart but isn't part of
+    /// the block log — today, the mesh election's term and vote
+    /// (`miot-mesh::Hard`). Prefixed so it can never collide with `head`/
+    /// `last_checkpoint`. Untouched by compaction, rewind and
+    /// [`Store::adopt_checkpoint`]: a vote cast is cast whatever happens to
+    /// the log.
+    pub fn aux(&self, name: &str) -> Result<Option<Vec<u8>>> {
+        Ok(self.db.get(COL_META, &aux_key(name))?)
+    }
+
+    pub fn put_aux(&mut self, name: &str, value: &[u8]) -> Result<()> {
+        self.db.commit(vec![(COL_META, aux_key(name), Some(value.to_vec()))])?;
+        Ok(())
     }
 
     /// The state at the latest compaction, if there is one.

@@ -98,6 +98,23 @@ impl Llm {
         }
     }
 
+    /// GLM on z.ai, with the key handed in rather than read from
+    /// `ZAI_API_KEY` — `kot run --glm` reads it from a token file
+    /// (`~/.akuma/z.ai/token` by default) so a service unit never has to
+    /// carry the secret in its environment. `model` takes genai's spelling:
+    /// `glm-4.6` for the per-token API, `zai-coding::glm-4.6` for the
+    /// coding-plan endpoint.
+    pub fn glm(token: &str, model: &str) -> Self {
+        let token = token.trim().to_string();
+        let client = Client::builder()
+            .with_auth_resolver_fn(move |_: genai::ModelIden| -> Result<Option<AuthData>, genai::resolver::Error> {
+                Ok(Some(AuthData::from_single(token.clone())))
+            })
+            .build();
+        let model = if model.contains("::") { model.to_string() } else { format!("zai::{model}") };
+        Llm { client, label: model.clone(), model }
+    }
+
     pub fn label(&self) -> &str {
         &self.label
     }
