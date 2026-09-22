@@ -540,9 +540,13 @@ const SYNC_PAGE: u64 = 256;
 /// whatever new blocks exist since our own head and folds them in through
 /// [`Node::apply_block`], the same step a local-store replay already uses.
 ///
-/// Assumes we're not currently diverged from `peer` — [`reconcile_if_diverged`]
+/// Assumes we're not currently *diverged* from `peer` — [`reconcile_if_diverged`]
 /// is what checks and fixes that, and it only needs to run once, not on
-/// every tick (see its doc comment for why).
+/// every tick (see its doc comment for why). It does, however, check every
+/// tick whether the peer's checkpoint has moved past our own
+/// (`adopt_peer_checkpoint_if_ahead`) — unlike divergence, that can happen
+/// at any time root calls `/clear`, independent of anything this replica
+/// does, so it can't be a startup-only check.
 async fn sync_once(shared: &Shared) {
     let (http, peer) = {
         let n = shared.lock().await;
@@ -562,6 +566,8 @@ async fn sync_once(shared: &Shared) {
             return;
         }
     };
+
+    adopt_peer_checkpoint_if_ahead(shared, &http, &peer, head.last_checkpoint).await;
 
     // Catch up / tail — the common case, every tick once caught up.
     loop {
@@ -609,26 +615,54 @@ async fn fetch_checkpoint(http: &reqwest::Client, peer: &str) -> Option<(u64, Ve
     Some((row.height, state))
 }
 
+/// If the peer has compacted further than we have — including a fresh node
+/// with no log at all — there is no way to reach that point by replaying
+/// blocks the peer already dropped (`Store::compact` deletes them, same as
+/// ours would), so adopt its checkpoint directly (`Store::adopt_checkpoint`)
+/// instead. Returns whether it did.
+///
+/// Called from both [`reconcile_if_diverged`] (startup) *and* every
+/// [`sync_once`] tick — unlike a real divergence, the peer's checkpoint can
+/// advance at any time root calls `/clear`, independent of anything this
+/// replica does, so it isn't a startup-only concern. Found live: a replica
+/// that had already caught up got stuck permanently once its peer compacted
+/// past blocks the ordinary tail loop still needed — `Store::append`'s
+/// contiguity check has no way to skip the gap a compaction leaves, so
+/// without this running every tick it just fails forever, one block short
+/// of where the peer can still serve from.
+async fn adopt_peer_checkpoint_if_ahead(shared: &Shared, http: &reqwest::Client, peer: &str, peer_last_checkpoint: u64) -> bool {
+    let my_cp = {
+        let n = shared.lock().await;
+        n.store.as_ref().expect("replica always has a store").last_checkpoint()
+    };
+    if peer_last_checkpoint <= my_cp {
+        return false;
+    }
+    let Some((cp_height, cp_state)) = fetch_checkpoint(http, peer).await else {
+        eprintln!("[node] sync: peer reports a checkpoint but didn't serve one");
+        return false;
+    };
+    let mut n = shared.lock().await;
+    let store = n.store.as_mut().expect("replica always has a store");
+    store.adopt_checkpoint(cp_height, &cp_state).expect("adopt_checkpoint");
+    println!("[node] adopted peer's checkpoint at block {cp_height}");
+    n.restore_from_snapshot(cp_height, &cp_state);
+    true
+}
+
 /// Compare our local block range against the peer's, once — at startup,
 /// before the periodic [`sync_once`] tail loop begins. A replica only ever
 /// appends blocks it received from this peer, so once this has run it
 /// cannot diverge from the peer again on its own before the next restart;
-/// there is no need to repeat it per tick.
+/// there is no need to repeat *this specific check* per tick (unlike
+/// [`adopt_peer_checkpoint_if_ahead`], which does run every tick).
 ///
-/// Two cases, handled separately:
-///
-/// 1. **The peer has compacted further than we have** (`peer.last_checkpoint
-///    > our own`) — including a fresh node with no log at all. There is no
-///    way to reach that point by replaying blocks the peer already dropped,
-///    so adopt its checkpoint directly (`Store::adopt_checkpoint`) rather
-///    than trying to compare byte ranges we can't get.
-/// 2. **Otherwise**, compare the range above our own checkpoint (or from
-///    block 1, if we have none yet) against the peer's. A "quiet" block —
-///    no effects that tick, the common case — encodes as the exact same
-///    bytes (an empty `Vec<Effect>`) no matter which chain produced it, so
-///    comparing only the tip can find a false "agreement" while a real
-///    divergence sits at an earlier, non-quiet height beneath it (observed
-///    live standing this up, before compaction existed to bound the range).
+/// A "quiet" block — no effects that tick, the common case — encodes as the
+/// exact same bytes (an empty `Vec<Effect>`) no matter which chain produced
+/// it, so comparing only the tip can find a false "agreement" while a real
+/// divergence sits at an earlier, non-quiet height beneath it (observed live
+/// standing this up, before compaction existed to bound the range this has
+/// to cover).
 async fn reconcile_if_diverged(shared: &Shared) {
     let (http, peer, my_head, my_cp) = {
         let n = shared.lock().await;
@@ -646,16 +680,7 @@ async fn reconcile_if_diverged(shared: &Shared) {
         return;
     };
 
-    if peer_head.last_checkpoint > my_cp {
-        let Some((cp_height, cp_state)) = fetch_checkpoint(&http, &peer).await else {
-            eprintln!("[node] reconcile: peer reports a checkpoint but didn't serve one");
-            return;
-        };
-        let mut n = shared.lock().await;
-        let store = n.store.as_mut().expect("replica always has a store");
-        store.adopt_checkpoint(cp_height, &cp_state).expect("adopt_checkpoint");
-        println!("[node] adopted peer's checkpoint at block {cp_height}");
-        n.restore_from_snapshot(cp_height, &cp_state);
+    if adopt_peer_checkpoint_if_ahead(shared, &http, &peer, peer_head.last_checkpoint).await {
         return; // sync_once's tail loop catches up from here next.
     }
 

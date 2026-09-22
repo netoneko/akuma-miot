@@ -113,3 +113,28 @@ debugging anything on that hardware rather than re-deriving it:
 symptom matrix ("I see X, what do I read?") — check there before forming a
 theory about anything that looks like a kernel-level oddity rather than an
 akuma-miot bug.
+
+## Working with Claude Code in this repo
+
+Copied from `../akuma`'s own `CLAUDE.md`, which states it for that repo —
+adopted here too, and it applies doubly when work in this repo reaches into
+`../akuma` (reading its docs, building against it, deploying to a Lima/
+Firecracker guest it owns):
+
+Never use the `fork` subagent type (or any multi-agent fan-out) for work that
+touches `../akuma` — do it directly instead. Forking copies the whole
+conversation context into a background agent, which costs far more tokens
+than doing it inline, and `../akuma` is explicitly a "read the docs, don't
+re-derive them" repo (see above) where that context is rarely worth paying
+for twice.
+
+**Commit vocabulary describes the user's actions, not a request for yours.**
+When the user says "committed", "checkpoint", "committed checkpoint",
+"pushed", "landed", "stashed" or similar, they are *reporting what they just
+did* so you know the state of the tree — not asking you to do it. Treat such
+a line as context, not an instruction. The same goes for a bare noun phrase
+on its own line in a longer message; it is a status note.
+
+If you genuinely believe a commit is warranted, say so and stop. Only an
+unambiguous imperative addressed to you — "commit this", "please commit",
+"make a commit" — is a request.

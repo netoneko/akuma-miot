@@ -163,40 +163,52 @@ fn name_of(map: &[(String, AccountId)], who: &AccountId) -> String {
     map.iter().find(|(_, a)| a == who).map(|(n, _)| n.clone()).unwrap_or_else(|| miot_keys::short(who))
 }
 
-async fn meta(http: &reqwest::Client, node: &str) -> client::Meta {
-    let v: serde_json::Value = http
-        .get(format!("{node}/meta"))
-        .send()
-        .await
-        .expect("node unreachable (meta)")
-        .json()
-        .await
-        .expect("bad /meta response");
+/// `None` on an unreachable node — printed and handed back to the caller to
+/// bail out of cleanly, the same "node unreachable: {e}" shape `print_tasks`
+/// already uses, rather than taking the whole `--chat` REPL down over a
+/// transient connection failure (observed live: a node restart mid-session
+/// used to panic the entire process instead of just failing that one turn).
+async fn meta(http: &reqwest::Client, node: &str) -> Option<client::Meta> {
+    let resp = match http.get(format!("{node}/meta")).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("  node unreachable: {e}");
+            return None;
+        }
+    };
+    let v: serde_json::Value = resp.json().await.expect("bad /meta response");
     let genesis_hash = H256::from_slice(&hex::decode(v["genesis_hash"].as_str().unwrap()).unwrap());
-    client::Meta {
+    Some(client::Meta {
         genesis_hash,
         spec_version: v["spec_version"].as_u64().unwrap() as u32,
         tx_version: v["tx_version"].as_u64().unwrap() as u32,
-    }
+    })
 }
 
-async fn nonce(http: &reqwest::Client, node: &str, who: &AccountId) -> u32 {
-    let v: serde_json::Value = http
-        .get(format!("{node}/account/{}", miot_keys::to_hex(who)))
-        .send()
-        .await
-        .expect("node unreachable (nonce)")
-        .json()
-        .await
-        .expect("bad /account response");
-    v["nonce"].as_u64().unwrap_or(0) as u32
+/// See [`meta`] — same reachability handling.
+async fn nonce(http: &reqwest::Client, node: &str, who: &AccountId) -> Option<u32> {
+    let resp = match http.get(format!("{node}/account/{}", miot_keys::to_hex(who))).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("  node unreachable: {e}");
+            return None;
+        }
+    };
+    let v: serde_json::Value = resp.json().await.expect("bad /account response");
+    Some(v["nonce"].as_u64().unwrap_or(0) as u32)
 }
 
 async fn submit(http: &reqwest::Client, node: &str, identity: &Identity, call: RuntimeCall) {
-    let m = meta(http, node).await;
-    let n = nonce(http, node, &identity.account()).await;
+    let Some(m) = meta(http, node).await else { return };
+    let Some(n) = nonce(http, node, &identity.account()).await else { return };
     let uxt = client::sign(identity, call, n, &m);
-    let r = http.post(format!("{node}/submit")).body(uxt.encode()).send().await.expect("submit failed");
+    let r = match http.post(format!("{node}/submit")).body(uxt.encode()).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            println!("  node unreachable: {e}");
+            return;
+        }
+    };
     if r.status().is_success() {
         println!("  submitted, signed as {}", miot_keys::short(&identity.account()));
     } else {
