@@ -5063,6 +5063,24 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a4933f3f57a8e9d9da04db23fb153356ecaf00cbd14aee46279c33dc80925c37"
 
 [[package]]
+name = "kot"
+version = "0.1.0"
+dependencies = [
+ "hex",
+ "miot-keys",
+ "miot-llm",
+ "miot-primitives",
+ "miot-runtime",
+ "pallet-litter",
+ "parity-scale-codec",
+ "polkadot-sdk",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5391,29 +5409,13 @@ dependencies = [
 name = "miot"
 version = "0.1.0"
 dependencies = [
+ "axum",
  "getrandom 0.2.17",
  "hex",
  "miot-keys",
- "miot-llm",
  "miot-primitives",
  "miot-runtime",
- "pallet-litter",
- "parity-scale-codec",
- "polkadot-sdk",
- "reqwest 0.12.28",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "miot-cat"
-version = "0.1.0"
-dependencies = [
- "hex",
- "miot-keys",
- "miot-llm",
- "miot-primitives",
- "miot-runtime",
+ "miot-store",
  "pallet-litter",
  "parity-scale-codec",
  "polkadot-sdk",
@@ -5437,25 +5439,6 @@ name = "miot-llm"
 version = "0.1.0"
 dependencies = [
  "genai",
- "serde_json",
- "tokio",
-]
-
-[[package]]
-name = "miot-node"
-version = "0.1.0"
-dependencies = [
- "axum",
- "hex",
- "miot-keys",
- "miot-primitives",
- "miot-runtime",
- "miot-store",
- "pallet-litter",
- "parity-scale-codec",
- "polkadot-sdk",
- "reqwest 0.12.28",
- "serde",
  "serde_json",
  "tokio",
 ]

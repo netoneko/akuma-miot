@@ -1,13 +1,13 @@
 [package]
-name = "miot-cat"
-description = "One cat. One container. Talks to the node over the network."
+name = "kot"
+description = "One cat's agentic loop. Talks to a node over the network. Polish for \"cat\" (Miot Kotow, HANDOFF: cat=node convergence)."
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
 
 [[bin]]
-name = "miot-cat"
+name = "kot"
 path = "src/main.rs"
 
 [dependencies]

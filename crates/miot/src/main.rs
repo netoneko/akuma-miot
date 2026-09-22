@@ -53,79 +53,21 @@ use sp_runtime::traits::Header as HeaderT;
 use sp_runtime::traits::UniqueSaturatedInto;
 use tokio::sync::Mutex;
 
-// The `--rpc`/`--live`/`--chat` client modes — this binary's other job,
-// merged in from the crate formerly named `miot` (HANDOFF: cat=node
-// convergence, `docs/CLI.md` §5a). The hardcoded scripted-cats demo that
-// used to live here too was dropped — redundant with `cargo test`'s own
-// coverage, unlike `--live`/`--chat`, which hit a real model.
-// `run_node` below (dispatched as `miot node`) is unrelated to any of
-// these; see `main` at the bottom for the split.
-mod chat;
-mod live;
+// `--rpc` — this binary's other job, merged in from the crate formerly
+// named `miot` (HANDOFF: cat=node convergence, `docs/CLI.md` §5a). The
+// hardcoded scripted-cats demo, `--live`, and the in-process simulated
+// `--chat` that used to live here too were all dropped: the demo is
+// redundant with `cargo test`'s own coverage, and agents don't chat with
+// each other — the chain is still the only channel between them. `rpc.rs`
+// keeps its existing interactive session capability (an operator's REPL
+// against a real node); it just isn't called "chat" for a simulated
+// multi-cat conversation, because that's not a thing this binary does.
+// `run_node` below (dispatched as `miot node`) is unrelated to any of this;
+// see `main` at the bottom for the split.
 mod rpc;
-
-/// Fixed, reproducible byte patterns for the in-process demo modes
-/// (`--live`/`--chat`) — not derived from a real `miot_keys::Identity` seed,
-/// because nothing here signs anything; every call goes straight into
-/// `RuntimeOrigin::signed` against an in-process `TestExternalities`, never
-/// a real node. Only `--rpc` (rpc.rs) signs for real.
-const ROOT: AccountId = AccountId::new([1u8; 32]);
-const MIMI: AccountId = AccountId::new([2u8; 32]);
-const TAMA: AccountId = AccountId::new([3u8; 32]);
-const KURO: AccountId = AccountId::new([4u8; 32]);
-const SORA: AccountId = AccountId::new([5u8; 32]);
-
-pub fn name(a: AccountId) -> &'static str {
-    match a {
-        ROOT => "root",
-        MIMI => "mimi",
-        TAMA => "tama",
-        KURO => "kuro",
-        SORA => "sora",
-        _ => "?",
-    }
-}
-
-/// One ANSI colour per sender, reused every time that cat acts.
-pub fn colour(a: AccountId) -> &'static str {
-    match a {
-        ROOT => "\x1b[97m",
-        MIMI => "\x1b[95m",
-        TAMA => "\x1b[96m",
-        KURO => "\x1b[91m",
-        SORA => "\x1b[92m",
-        _ => "\x1b[0m",
-    }
-}
 
 pub const DIM: &str = "\x1b[2m";
 pub const OFF: &str = "\x1b[0m";
-
-pub fn new_ext() -> sp_io::TestExternalities {
-    use sp_runtime::BuildStorage;
-    let mut t = frame_system::GenesisConfig::<Runtime>::default().build_storage().unwrap();
-    pallet_litter::GenesisConfig::<Runtime> { root: Some(ROOT), leader: Some(MIMI) }
-        .assimilate_storage(&mut t)
-        .unwrap();
-    let mut ext: sp_io::TestExternalities = t.into();
-    ext.execute_with(|| System::set_block_number(1));
-    ext
-}
-
-/// Everything the chain emitted since the last call — the in-process demo
-/// modes' own drain, distinct from [`Node::drain`] (the real node's, a
-/// method, not a free function — no collision, different namespaces).
-pub fn drain() -> Vec<Effect<AccountId>> {
-    let out: Vec<_> = System::events()
-        .into_iter()
-        .filter_map(|r| match r.event {
-            miot_runtime::RuntimeEvent::Litter(pallet_litter::Event::Happened(e)) => Some(e),
-            _ => None,
-        })
-        .collect();
-    System::reset_events();
-    out
-}
 
 /// How long a block takes. Six seconds — the Polkadot default, and a round
 /// number to reason in.
@@ -1140,4 +1082,39 @@ async fn artifact(
         }
         None => serde_json::json!({"found":false}),
     })
+}
+
+/// `miot node` runs the chain (`run_node`, above). Anything else is the
+/// `--rpc` client: an operator's one-shot command (`--open`/`--say`/
+/// `--clear`) or, with none of those given, its existing interactive
+/// session (`rpc::chat` — a real REPL against a real node, kept; not a
+/// simulated conversation between cats, which isn't a thing this binary
+/// does).
+#[tokio::main]
+async fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("node") {
+        run_node().await;
+        return;
+    }
+
+    println!("{}", include_str!("../../../assets/akuma_40.txt"));
+    println!("  {DIM}akuma // distributed cat system{OFF}\n");
+
+    let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned());
+    let Some(node) = arg("--rpc") else {
+        println!("usage: miot node | miot --rpc <url> [--identity-seed S] [--roster R] [--repl | --open TEXT | --say TEXT [--to NAME] | --clear]");
+        return;
+    };
+    let seed = arg("--identity-seed");
+    let roster = arg("--roster").unwrap_or_else(|| "root=1,mimi=2,tama=3,kuro=4,sora=5".to_string());
+    if args.iter().any(|a| a == "--repl") {
+        rpc::chat(&node, seed.as_deref(), &roster).await;
+        return;
+    }
+    let open = arg("--open");
+    let say = arg("--say");
+    let to = arg("--to");
+    let clear = args.iter().any(|a| a == "--clear");
+    rpc::run(&node, seed.as_deref(), &roster, open.as_deref(), say.as_deref(), to.as_deref(), clear).await;
 }
