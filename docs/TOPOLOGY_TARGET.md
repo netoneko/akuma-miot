@@ -20,11 +20,11 @@ numbering — named by placement instead.
 
 | agent | host | environment | arch | LLM backend | node role |
 |---|---|---|---|---|---|
-| **akuma-metal** | akuma trashcan (`ssh akuma`, physical box) | bare metal, no Firecracker | amd64 | GLM via `~/.akuma/z.ai/token` (`kot run --glm`) | mesh member, election-eligible |
-| **ryzen-linux** | ryzen (192.168.1.126, Pop!_OS) | bare process | amd64 | host `llama-server` on ryzen | mesh member, election-eligible |
-| **ryzen-fc** | ryzen (same host) | Firecracker guest, real `/dev/kvm` — no nested virt, unlike the mac path | amd64 (guest kernel) | host `llama-server` on ryzen, reached from inside the guest | mesh member, election-eligible |
-| **mac-linux** | macbook (this mac, arm64) → Lima VM `fc` | bare process inside `fc`'s Linux userspace | aarch64 | host `llama-server` on the mac | mesh member, election-eligible |
-| **mac-fc** | macbook → `fc` → nested Firecracker guest `akuma-guest` | Firecracker guest on nested virt (Apple Silicon M3+, macOS 15+) | aarch64 (guest kernel) | host `llama-server` on the mac, four NAT hops out | mesh member, election-eligible — **blocked on the ParityDB index-growth panic, see below** |
+| **dumpster-akuma-amd64** | akuma trashcan (`ssh akuma`, physical box) | bare metal, no Firecracker | amd64 | GLM via `~/.akuma/z.ai/token` (`kot run --glm`) | mesh member, election-eligible |
+| **ryzen-linux-amd64** | ryzen (192.168.1.126, Pop!_OS) | bare process | amd64 | host `llama-server` on ryzen | mesh member, election-eligible |
+| **ryzen-akuma-amd64** | ryzen (same host) | Firecracker guest, real `/dev/kvm` — no nested virt, unlike the mac path | amd64 (guest kernel) | host `llama-server` on ryzen, reached from inside the guest | mesh member, election-eligible |
+| **mac-linux-aarch64** | macbook (this mac, arm64) → Lima VM `fc` | bare process inside `fc`'s Linux userspace | aarch64 | host `llama-server` on the mac | mesh member, election-eligible |
+| **mac-akuma-aarch64** | macbook → `fc` → nested Firecracker guest `akuma-guest` | Firecracker guest on nested virt (Apple Silicon M3+, macOS 15+) | aarch64 (guest kernel) | host `llama-server` on the mac, four NAT hops out | mesh member, election-eligible — **blocked on the ParityDB index-growth panic, see below** |
 
 Every agent is a full mesh member — no operator-designated primary/replica.
 Leadership is elected; any agent can become primary if it wins, any agent
@@ -43,11 +43,11 @@ into `kot` per the merge) rather than writing a second generator.
 
 | agent | identity file (per-host) | public key shared as |
 |---|---|---|
-| akuma-metal | `/root/kot/id_ed25519.seed` on the akuma box | pasted into every agent's `MIOT_ROSTER`/membership config |
-| ryzen-linux | `/root/kot/id_ed25519.seed` on ryzen (native path) | " |
-| ryzen-fc | its own seed file *inside* the Firecracker guest's rootfs | " |
-| mac-linux | its own seed file inside `fc`'s Linux userspace | " |
-| mac-fc | its own seed file inside `akuma-guest`'s rootfs | " |
+| dumpster-akuma-amd64 | `/root/kot/id_ed25519.seed` on the akuma box | pasted into every agent's `MIOT_ROSTER`/membership config |
+| ryzen-linux-amd64 | `/root/kot/id_ed25519.seed` on ryzen (native path) | " |
+| ryzen-akuma-amd64 | its own seed file *inside* the Firecracker guest's rootfs | " |
+| mac-linux-aarch64 | its own seed file inside `fc`'s Linux userspace | " |
+| mac-akuma-aarch64 | its own seed file inside `akuma-guest`'s rootfs | " |
 
 Root (the operator) is a sixth identity, not one of the 5 — `~/.akuma/miot/
 id_ed25519.seed` on the mac, already generated (see `docs/CLEANUP.md`,
@@ -65,11 +65,11 @@ them is a `MIOT_PEERS` change, not a new chain:
 
 | agent | address | notes |
 |---|---|---|
-| akuma-metal | `192.168.1.123:9944` (host already has this address; port matches today's `node5`) | direct, no NAT. GLM: `zai-coding::glm-5.3`. **Joins, then wedges within minutes** (2026-09-22, twice, once per boot): replays its store, follows the primary, the agent connects, then `:9944` refuses even from `127.0.0.1` and replica sync stops, while every thread sits in `R` accruing CPU. This is CLEANUP's stability item #2 (replica catch-up on this box) re-tested on the post-fix kernel: **still open**, and it belongs to `../akuma`, not here |
-| ryzen-linux | `192.168.1.126:9944` | direct, no NAT. **Live 2026-09-22.** Model: `llama-ryzen-linux.service`, 127.0.0.1:8081, Qwen3-4B-Instruct-2507 Q4_K_M, 6 threads (CPU; ollama disabled) |
-| ryzen-fc | `____` (guest address, behind ryzen's own NAT/tap — pattern TBD, no precedent yet; `run-on-firecracker.md`'s aarch64 path is the closest reference but is nested-virt-specific) | new — nothing has run an amd64 Firecracker Akuma guest yet |
-| mac-linux | `192.168.1.203:9944` from the LAN (Lima forwards `fc:9944-9949` on `0.0.0.0`; `fc` itself is `192.168.5.15`) | **Live 2026-09-22.** Model: the mac's llama-server at `192.168.5.2:8083` (qwen3:4b). systemd `kot.service` inside `fc`, no longer started by hand |
-| mac-fc | `10.0.2.15:9944` inside `fc`; mac-linux reaches it there directly, the LAN via `192.168.1.203:9945` (socat relay `kot-relay-mac-fc.service` in `fc`, exposed by Lima) | **Live 2026-09-22**, in akuma-metal's seat. 10 min as primary, 11 min as replica, no wedge. ParityDB survives crash and clean close since two aarch64 kernel fixes in `../akuma` (`../akuma/docs/archive/MIOT_MESH_ON_AKUMA.md`) |
+| dumpster-akuma-amd64 | `192.168.1.123:9944` (host already has this address; port matches today's `node5`) | direct, no NAT. GLM: `zai-coding::glm-5.3`. **Joins, then wedges within minutes** (2026-09-22, twice, once per boot): replays its store, follows the primary, the agent connects, then `:9944` refuses even from `127.0.0.1` and replica sync stops, while every thread sits in `R` accruing CPU. This is CLEANUP's stability item #2 (replica catch-up on this box) re-tested on the post-fix kernel: **still open**, and it belongs to `../akuma`, not here |
+| ryzen-linux-amd64 | `192.168.1.126:9944` | direct, no NAT. **Live 2026-09-22.** Model: `llama-ryzen-linux-amd64.service`, 127.0.0.1:8081, Qwen3-4B-Instruct-2507 Q4_K_M, 6 threads (CPU; ollama disabled) |
+| ryzen-akuma-amd64 | `____` (guest address, behind ryzen's own NAT/tap — pattern TBD, no precedent yet; `run-on-firecracker.md`'s aarch64 path is the closest reference but is nested-virt-specific) | new — nothing has run an amd64 Firecracker Akuma guest yet |
+| mac-linux-aarch64 | `192.168.1.203:9944` from the LAN (Lima forwards `fc:9944-9949` on `0.0.0.0`; `fc` itself is `192.168.5.15`) | **Live 2026-09-22.** Model: the mac's llama-server at `192.168.5.2:8083` (qwen3:4b). systemd `kot.service` inside `fc`, no longer started by hand |
+| mac-akuma-aarch64 | `10.0.2.15:9944` inside `fc`; mac-linux-aarch64 reaches it there directly, the LAN via `192.168.1.203:9945` (socat relay `kot-relay-mac-akuma-aarch64.service` in `fc`, exposed by Lima) | **Live 2026-09-22**, in dumpster-akuma-amd64's seat. 10 min as primary, 11 min as replica, no wedge. ParityDB survives crash and clean close since two aarch64 kernel fixes in `../akuma` (`../akuma/docs/archive/MIOT_MESH_ON_AKUMA.md`) |
 
 `--peers` on each `kot run` invocation needs the other 4 agents' reachable
 addresses — from *that* agent's vantage point, which differs for the two
@@ -79,12 +79,12 @@ the mesh assembled.
 
 ## Known blocker
 
-**mac-fc cannot join durably yet.** `docs/TOPOLOGY.md`'s `node4` section:
+**mac-akuma-aarch64 cannot join durably yet.** `docs/TOPOLOGY.md`'s `node4` section:
 ParityDB panics on `akuma-guest` once its index grows past some threshold
 (`index.rs:237`, unresolved). This agent is the direct successor to `node4`
 and inherits the same blocker — building the new topology does not fix it;
 it needs its own investigation (bounding index growth via more frequent
-compaction, or finding the underlying `ext2`/mmap difference) before mac-fc
+compaction, or finding the underlying `ext2`/mmap difference) before mac-akuma-aarch64
 can be trusted the way the other 4 can.
 
 ## Provenance

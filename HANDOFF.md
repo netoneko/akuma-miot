@@ -528,6 +528,26 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
    correct per the documented rule, just expensive. Wired up right after
    (`compact()` fires on root's `/clear`; see "real compaction" in "What is
    real," above) — reconciliation now lands on the checkpoint instead.
+6. **Open, observed 2026-09-23, not yet root-caused: `@name`-tagging a cat
+   in the REPL doesn't reliably get a reaction.** Reported live against the
+   deployed fleet — operator types `@sora ...`, sora doesn't respond. Traced
+   the plumbing that *should* make this work and it looks correct at every
+   layer checked: `Effect::wakes()` (`crates/miot-primitives/src/lib.rs`)
+   returns `true` for a `Said` with `to: Some(_)`, and `agent.rs`'s event
+   loop does filter `/events` on `wakes == its own hex account`
+   (`crates/kot/src/agent.rs:289`). Neither end was changed this session.
+   Didn't reproduce this live before writing it down (out of scope for the
+   session that found it), so treat the above as "nothing obviously wrong
+   in the code path," not "cause found." Things to check first, before
+   assuming a deeper bug: whether the tagged cat's agent loop is actually
+   running at all right now (a node with no `--llm`/`--glm` is silent by
+   design, not broken — `docs/TOPOLOGY_TARGET.md`'s "blocked" agents), and
+   whether `@name` in the REPL resolved to the account you expected
+   (`parse_targets`/`Roster::account`, `crates/kot/src/client.rs`) —
+   `mesh.env`'s `MIOT_ROSTER` was relabeled to cat names this same session
+   (`root`/`meow`/`tama`/`kuro`/`sora`/`mimi`), so a stale roster string in
+   an operator's shell env would silently resolve `@sora` to nothing or the
+   wrong account rather than erroring.
 
 ---
 

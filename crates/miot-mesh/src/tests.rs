@@ -98,7 +98,7 @@ impl Sim {
             for a in 0..n {
                 for b in 0..n {
                     if a != b && self.reach(a, b) {
-                        let st = self.nodes[b].status(self.heads[b]);
+                        let st = self.nodes[b].status(self.heads[b], "");
                         self.nodes[a].on_status(&name(b), st, self.now);
                     }
                 }
@@ -331,7 +331,7 @@ fn chaos_never_produces_two_leaders_in_one_term() {
 fn listing_yourself_as_a_peer_does_not_inflate_the_quorum() {
     let mut m = Mesh::new("a".into(), vec!["self".into(), "b".into(), "c".into()], Timing::default(), Hard::default(), 0, 1);
     assert_eq!(m.quorum(), 3);
-    let me = m.status(0);
+    let me = m.status(0, "");
     m.on_status(&"self".to_string(), me, 0);
     assert_eq!(m.routes(), &["b".to_string(), "c".to_string()]);
     assert_eq!(m.quorum(), 2);

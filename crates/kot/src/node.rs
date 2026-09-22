@@ -1076,7 +1076,7 @@ async fn mesh_status(AxState(n): AxState<Shared>, headers: HeaderMap) -> Respons
     if let Err(why) = verify_headers(&headers, b"", |a| n.is_trusted_signer(a)) {
         return unauthorized(why);
     }
-    let status = n.mesh.status(n.store.head());
+    let status = n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account()));
     signed_json(&n.identity, StatusCode::OK, &status)
 }
 
@@ -1110,7 +1110,7 @@ async fn mesh_peers(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
         })
         .collect();
     Json(serde_json::json!({
-        "me": n.mesh.status(n.store.head()),
+        "me": n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account())),
         "quorum": n.mesh.quorum(),
         "producing": n.producing,
         "following": n.peer,

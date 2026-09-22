@@ -87,6 +87,11 @@ pub struct Hard {
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Status {
     pub name: Name,
+    /// Opaque to this crate — whatever the caller's `status()` was given.
+    /// `kot` puts its hex `AccountId` here so a client can resolve `name`
+    /// (a mesh/routing label, not necessarily human-facing) to a roster
+    /// name for display, without `miot-mesh` knowing what an account is.
+    pub account: String,
     pub term: u64,
     pub role: Role,
     pub leader: Option<Name>,
@@ -221,9 +226,10 @@ impl Mesh {
         std::mem::take(&mut self.hard_dirty).then(|| self.hard.clone())
     }
 
-    pub fn status(&self, head: u64) -> Status {
+    pub fn status(&self, head: u64, account: &str) -> Status {
         Status {
             name: self.name.clone(),
+            account: account.to_string(),
             term: self.hard.term,
             role: self.role,
             leader: self.leader.clone(),

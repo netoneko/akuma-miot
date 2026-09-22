@@ -10,7 +10,7 @@
 #          10.0.2.15:22), HTTP pulled through the guest's NAT from the mac's
 #          loopback (192.168.5.2). Boot it first: ../akuma
 #          overlays/devbox-firecracker/{guest-setup,build,run}.sh.
-#          ryzen-fc (the same on ryzen's real KVM) is staged only.
+#          ryzen-akuma-amd64 (the same on ryzen's real KVM) is staged only.
 #
 #   overlays/deploy/deploy.sh ids           create each agent's identity once, write mesh.env
 #   overlays/deploy/deploy.sh up <agent>    ship kot + persona + config, (re)start it
@@ -37,18 +37,18 @@ die() { printf '\033[1;31m[deploy] %s\033[0m\n' "$*" >&2; exit 1; }
 
 # ---- the table -----------------------------------------------------------------
 # name | shape | host | arch | persona | llm (url, or "glm") | model
-# The litter leader is the first row. Its persona is meow-chan; akuma-metal
+# The litter leader is the first row. Its persona is meow-chan; dumpster-akuma-amd64
 # runs GLM, the strongest model in the litter, and planning is the hardest job.
 AGENTS=(
-  "akuma-metal|akuma|akuma|x86_64|meow|glm|glm-5.3"
-  "ryzen-linux|linux|ryzen|x86_64|tama|http://127.0.0.1:8081|qwen3-4b"
-  "mac-linux|lima|fc|aarch64|kuro|http://192.168.5.2:8083|qwen3:4b"
-  "ryzen-fc|fcguest|ryzen|x86_64|sora|http://192.168.1.49:8082|qwen3-4b"
-  "mac-fc|fcguest|fc|aarch64|mimi|http://192.168.5.2:8084|qwen3:4b"
+  "dumpster-akuma-amd64|akuma|akuma|x86_64|meow|glm|glm-5.3"
+  "ryzen-linux-amd64|linux|ryzen|x86_64|tama|http://127.0.0.1:8081|qwen3-4b"
+  "mac-linux-aarch64|lima|fc|aarch64|kuro|http://192.168.5.2:8083|qwen3:4b"
+  "ryzen-akuma-amd64|fcguest|ryzen|x86_64|sora|http://192.168.1.49:8082|qwen3-4b"
+  "mac-akuma-aarch64|fcguest|fc|aarch64|mimi|http://192.168.5.2:8084|qwen3:4b"
 )
-# akuma-metal is out while its replica wedge is chased (HANDOFF traps);
-# mac-fc runs the same role on aarch64 Akuma to see if it wedges too.
-LIVE=(ryzen-linux mac-linux mac-fc ryzen-fc)
+# dumpster-akuma-amd64 is out while its replica wedge is chased (HANDOFF traps);
+# mac-akuma-aarch64 runs the same role on aarch64 Akuma to see if it wedges too.
+LIVE=(ryzen-linux-amd64 mac-linux-aarch64 mac-akuma-aarch64 ryzen-akuma-amd64)
 
 # llama-server per agent, never ollama: its own process, its own port, its
 # thread count pinned, so an agent's turns get a known slice of the box and
@@ -56,29 +56,29 @@ LIVE=(ryzen-linux mac-linux mac-fc ryzen-fc)
 # overlays/local/llama-swarm.sh (8081-8084, -t 1, Metal).
 # agent | gguf on its host | port | threads
 LLAMAS=(
-  "ryzen-linux|/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8081|6|127.0.0.1"
-  # ryzen-fc's own, on ryzen's tap0 address (192.168.1.49) so the guest reaches it.
-  "ryzen-fc|/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8082|4|192.168.1.49"
+  "ryzen-linux-amd64|/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8081|6|127.0.0.1"
+  # ryzen-akuma-amd64's own, on ryzen's tap0 address (192.168.1.49) so the guest reaches it.
+  "ryzen-akuma-amd64|/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf|8082|4|192.168.1.49"
 )
 
 # Every node's view of every *other* live node. Differs per vantage point:
-# the fc VM reaches the LAN directly, and the LAN reaches mac-linux through
+# the fc VM reaches the LAN directly, and the LAN reaches mac-linux-aarch64 through
 # Lima's 0.0.0.0 forward of fc:9944 (../akuma host-setup.sh LIMA_LAN_PORTS).
-# mac-linux and mac-fc share fc and talk over its tap0 (10.0.2.2 is fc,
-# 10.0.2.15 the guest); the LAN reaches mac-fc through fc:9945, a socat relay
-# (kot-relay-mac-fc.service) that Lima exposes as mac:9945.
+# mac-linux-aarch64 and mac-akuma-aarch64 share fc and talk over its tap0 (10.0.2.2 is fc,
+# 10.0.2.15 the guest); the LAN reaches mac-akuma-aarch64 through fc:9945, a socat relay
+# (kot-relay-mac-akuma-aarch64.service) that Lima exposes as mac:9945.
 route() { # route <from> <to>
   case "$1>$2" in
-    *">akuma-metal") echo http://192.168.1.123:9944 ;;
-    *">ryzen-linux") echo http://192.168.1.126:9944 ;;
-    "mac-fc>mac-linux") echo http://10.0.2.2:9944 ;;
-    *">mac-linux") echo "http://$MAC_LAN:9944" ;;
-    "mac-linux>mac-fc") echo http://10.0.2.15:9944 ;;
-    *">mac-fc") echo "http://$MAC_LAN:9945" ;;
-    # ryzen-fc: Akuma/amd64 in Firecracker on ryzen's real KVM, on ryzen's
+    *">dumpster-akuma-amd64") echo http://192.168.1.123:9944 ;;
+    *">ryzen-linux-amd64") echo http://192.168.1.126:9944 ;;
+    "mac-akuma-aarch64>mac-linux-aarch64") echo http://10.0.2.2:9944 ;;
+    *">mac-linux-aarch64") echo "http://$MAC_LAN:9944" ;;
+    "mac-linux-aarch64>mac-akuma-aarch64") echo http://10.0.2.15:9944 ;;
+    *">mac-akuma-aarch64") echo "http://$MAC_LAN:9945" ;;
+    # ryzen-akuma-amd64: Akuma/amd64 in Firecracker on ryzen's real KVM, on ryzen's
     # existing guest network: tap0 + proxy-ARP, the guest's pinned lease is a
     # real LAN address, so everyone reaches it directly. No relay.
-    *">ryzen-fc") echo http://192.168.1.50:9944 ;;
+    *">ryzen-akuma-amd64") echo http://192.168.1.50:9944 ;;
     *) die "no route to $2 yet" ;;
   esac
 }
@@ -97,9 +97,9 @@ on() { # on <agent> <shell command>, run as root on the agent's host
       case "$1" in
         # Generous: an 11 MB kot takes ~2 min into the amd64 guest (~90 KB/s
         # inbound, measured 2026-09-22) and the ssh session carries the wget.
-        mac-fc)   timeout 600 ssh "${o[@]}" -p 4444 root@localhost "$2" ;;
+        mac-akuma-aarch64) timeout 600 ssh "${o[@]}" -p 4444 root@localhost "$2" ;;
         # The amd64 image's sshd trusts mkdisk.sh's test key only.
-        ryzen-fc) timeout 600 ssh "${o[@]}" -p 2222 -i "$AKUMA_REPO/target/x86_64-unknown-none/release/amd64-ssh-test-key" root@192.168.1.50 "$2" ;;
+        ryzen-akuma-amd64) timeout 600 ssh "${o[@]}" -p 2222 -i "$AKUMA_REPO/target/x86_64-unknown-none/release/amd64-ssh-test-key" root@192.168.1.50 "$2" ;;
       esac ;;
     *) die "$1: shape $(field "$1" 2) not deployable yet" ;;
   esac
@@ -116,9 +116,9 @@ put() { # put <agent> <local file> <remote path>
       # guest reaches the mac's loopback as 192.168.5.2 (Lima), so it
       # needs no LAN-facing listener; the metal box needs the LAN one.
       local bind=0.0.0.0 from=$MAC_LAN
-      # mac-fc reaches the mac's loopback as 192.168.5.2 (Lima); ryzen-fc
+      # mac-akuma-aarch64 reaches the mac's loopback as 192.168.5.2 (Lima); ryzen-akuma-amd64
       # comes out through ryzen's NAT onto the LAN like the metal box does.
-      [ "$a" = mac-fc ] && { bind=127.0.0.1; from=192.168.5.2; }
+      [ "$a" = mac-akuma-aarch64 ] && { bind=127.0.0.1; from=192.168.5.2; }
       local stage; stage="$(mktemp -d)"
       cp "$src" "$stage/f"
       if lsof -iTCP:$HTTP_PORT -sTCP:LISTEN -P >/dev/null 2>&1; then
@@ -160,7 +160,7 @@ cmd_ids() {
     [[ "$acct" =~ ^[0-9a-f]{64}$ ]] || die "$a: kot id printed '$acct'"
     accounts+=("$a=$acct")
   done
-  for a in ryzen-fc mac-fc; do
+  for a in ryzen-akuma-amd64 mac-akuma-aarch64; do
     say "$a: staging identity on the mac (moves into its guest rootfs later)"
     acct="$(cargo run -q --release -p kot -- --seed-file "$HOME/.akuma/kot/$a.seed" id --comment "$a" 2>/dev/null | head -1)"
     [[ "$acct" =~ ^[0-9a-f]{64}$ ]] || die "$a: kot id printed '$acct'"
@@ -234,8 +234,8 @@ cmd_up() {
     [ "$(account_of "$a")" = "$(grep -o "$a=pub:[0-9a-f]*" "$MESH_ENV" | cut -d: -f2)" ] \
       || die "$a: identity in the guest does not match mesh.env"
     # Only the Lima guest needs a relay: Lima exposes only sockets listening
-    # in fc. ryzen-fc has a LAN address of its own.
-    [ "$a" = mac-fc ] && cat > "$tmp.relay" <<EOF
+    # in fc. ryzen-akuma-amd64 has a LAN address of its own.
+    [ "$a" = mac-akuma-aarch64 ] && cat > "$tmp.relay" <<EOF
 [Unit]
 Description=LAN :9945 -> $a (Akuma guest 10.0.2.15:9944)
 After=network-online.target
@@ -247,7 +247,7 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-    if [ "$a" = mac-fc ]; then
+    if [ "$a" = mac-akuma-aarch64 ]; then
       limactl copy "$tmp.relay" fc:/tmp/kot-relay.service
       limactl shell fc -- sudo sh -c "mv /tmp/kot-relay.service /etc/systemd/system/kot-relay-$a.service && systemctl daemon-reload && systemctl enable --now kot-relay-$a.service >/dev/null 2>&1"
     fi
@@ -305,7 +305,7 @@ EOF
 cmd_llama() { # a systemd llama-server for one agent, on its (host's) linux side
   local a="$1" r="" x gguf port threads bind tmp host_agent="$1"
   # A Firecracker guest's model runs on the guest's Linux host.
-  [ "$a" = ryzen-fc ] && host_agent=ryzen-linux
+  [ "$a" = ryzen-akuma-amd64 ] && host_agent=ryzen-linux-amd64
   for x in "${LLAMAS[@]}"; do [ "${x%%|*}" = "$a" ] && r="$x"; done
   [ -n "$r" ] || die "$a has no llama-server row"
   IFS='|' read -r _ gguf port threads bind <<<"$r"

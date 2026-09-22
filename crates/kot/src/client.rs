@@ -179,33 +179,55 @@ impl Client {
             Err(e) => return println!("  mesh: {e}"),
         };
         let me = &m["me"];
+        let names = mesh_names(&m, &self.roster);
+        let cat_of = |mesh_name: &str| names.get(mesh_name).cloned().unwrap_or_else(|| mesh_name.to_string());
+
         println!(
             "  {DIM}mesh, from {} ({}){OFF}  quorum {}  last checkpoint {}",
-            me["name"].as_str().unwrap_or("?"),
+            cat_of(me["name"].as_str().unwrap_or("?")),
             self.node,
             m["quorum"],
             m["last_checkpoint"]
         );
-        let row = |name: &str, st: &serde_json::Value, seen: String| {
+        let row = |name: String, st: &serde_json::Value, seen: String| {
             println!(
                 "    {name:<14} {:<13} term {:<4} head {:<7} leader {:<14} {DIM}{seen}{OFF}",
                 st["role"].as_str().unwrap_or("?"),
                 st["term"],
                 st["head"],
-                st["leader"].as_str().unwrap_or("-"),
+                st["leader"].as_str().map(&cat_of).unwrap_or_else(|| "-".into()),
             )
         };
-        row(me["name"].as_str().unwrap_or("?"), me, "(this node)".into());
+        row(cat_of(me["name"].as_str().unwrap_or("?")), me, "(this node)".into());
         for p in m["peers"].as_array().into_iter().flatten() {
             let route = p["route"].as_str().unwrap_or("?");
             match p["status"].as_object() {
                 Some(_) => {
                     let ago = p["seen_ms_ago"].as_u64().unwrap_or(0);
                     let stale = if ago > 5_000 { "  STALE" } else { "" };
-                    row(p["status"]["name"].as_str().unwrap_or("?"), &p["status"], format!("{route}  seen {:.1}s ago{stale}", ago as f64 / 1000.0));
+                    row(cat_of(p["status"]["name"].as_str().unwrap_or("?")), &p["status"], format!("{route}  seen {:.1}s ago{stale}", ago as f64 / 1000.0));
                 }
                 None => println!("    {:<14} {DIM}{route}  never answered{OFF}", "?"),
             }
+        }
+    }
+
+    /// Every hex-looking string in `v`, resolved through the roster in
+    /// place — not field-name-specific, since an effect's account-carrying
+    /// fields differ by type (`who`, `to`, `from`, `author`, `holder`, ...)
+    /// and a new `Effect` variant shouldn't need a matching new case here.
+    /// `from_hex` only accepts exactly 32 bytes of hex, so a task id like
+    /// `"t1.1"` or a directive name like `"PlanNeeded"` never matches.
+    fn resolve_accounts(&self, v: &mut serde_json::Value) {
+        match v {
+            serde_json::Value::String(s) => {
+                if let Ok(a) = miot_keys::from_hex(s) {
+                    *s = self.roster.name_of(&a);
+                }
+            }
+            serde_json::Value::Object(m) => m.values_mut().for_each(|vv| self.resolve_accounts(vv)),
+            serde_json::Value::Array(a) => a.iter_mut().for_each(|vv| self.resolve_accounts(vv)),
+            _ => {}
         }
     }
 
@@ -216,6 +238,8 @@ impl Client {
             let label = from.map(|a| self.roster.name_of(&a)).unwrap_or_else(|| "?".into());
             println!("  {DIM}block {}{OFF}  {label}: {}", e["block"], eff["body"].as_str().unwrap_or(""));
         } else {
+            let mut eff = eff.clone();
+            self.resolve_accounts(&mut eff);
             println!("  {DIM}block {}{OFF}  {eff}", e["block"]);
         }
     }
@@ -287,6 +311,74 @@ fn prompt(label: &str) {
 /// from us as it lands. A background task, not something the prompt waits
 /// on: a cat's turn is 30–150 s, and blocking the prompt for that was the
 /// bug this replaced.
+/// `Status.name` (a mesh/routing label, e.g. `ryzen-fc`) → cat name,
+/// resolved through each status's `account` (hex) and the roster. Shared
+/// between `kot peers` and the REPL's background mesh poll so both agree on
+/// what to call a peer.
+fn mesh_names(m: &serde_json::Value, roster: &Roster) -> std::collections::HashMap<String, String> {
+    let mut names = std::collections::HashMap::new();
+    let statuses = std::iter::once(&m["me"]).chain(m["peers"].as_array().into_iter().flatten().map(|p| &p["status"]).filter(|s| s.is_object()));
+    for st in statuses {
+        let Some(mesh_name) = st["name"].as_str() else { continue };
+        let cat = st["account"]
+            .as_str()
+            .and_then(|s| miot_keys::from_hex(s).ok())
+            .map(|a| roster.name_of(&a))
+            .unwrap_or_else(|| mesh_name.to_string());
+        names.insert(mesh_name.to_string(), cat);
+    }
+    names
+}
+
+/// Background, spawned by the REPL: watches `/mesh/peers` and prints only
+/// when something changes — leader, quorum, or a peer going stale/coming
+/// back — never a full table on a timer. Scrollback is sacred (`docs/
+/// CLI.md`); `/peers` still gives the full picture on demand.
+async fn poll_mesh(http: reqwest::Client, node: String, roster: Roster) {
+    let mut last_leader: Option<String> = None;
+    let mut had_quorum: Option<bool> = None;
+    let mut stale: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
+        let Ok(r) = http.get(format!("{node}/mesh/peers")).send().await else { continue };
+        let Ok(m) = r.json::<serde_json::Value>().await else { continue };
+        let names = mesh_names(&m, &roster);
+        let cat_of = |n: &str| names.get(n).cloned().unwrap_or_else(|| n.to_string());
+
+        let leader = m["me"]["leader"].as_str().map(&cat_of);
+        if leader != last_leader {
+            println!("{DIM}  [mesh] leader: {}{OFF}", leader.as_deref().unwrap_or("nobody (election)"));
+            last_leader = leader;
+        }
+
+        let total = 1 + m["peers"].as_array().map(Vec::len).unwrap_or(0);
+        let quorum = m["quorum"].as_u64().unwrap_or(0) as usize;
+        let alive = 1 + m["peers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|p| p["status"].is_object() && p["seen_ms_ago"].as_u64().unwrap_or(u64::MAX) <= 5_000)
+            .count();
+        let has_quorum = alive >= quorum;
+        if had_quorum != Some(has_quorum) {
+            let tag = if has_quorum { format!("quorum ok ({alive}/{total})") } else { format!("NO QUORUM ({alive}/{total})") };
+            println!("{DIM}  [mesh] {tag}{OFF}");
+            had_quorum = Some(has_quorum);
+        }
+
+        for p in m["peers"].as_array().into_iter().flatten() {
+            if !p["status"].is_object() {
+                continue;
+            }
+            let name = cat_of(p["status"]["name"].as_str().unwrap_or("?"));
+            let now_stale = p["seen_ms_ago"].as_u64().unwrap_or(u64::MAX) > 5_000;
+            if stale.insert(name.clone(), now_stale).is_some_and(|was| was != now_stale) {
+                println!("{DIM}  [mesh] {name} {}{OFF}", if now_stale { "went stale" } else { "back" });
+            }
+        }
+    }
+}
+
 async fn print_replies(http: reqwest::Client, node: String, roster: Roster, me: AccountId, since: u64) {
     let mut cursor = since;
     loop {
@@ -339,6 +431,7 @@ pub async fn repl(mut c: Client) {
         println!("{DIM}  — end replay —{OFF}");
     }
     tokio::spawn(print_replies(c.http.clone(), c.node.clone(), c.roster.clone(), me.clone(), cursor));
+    tokio::spawn(poll_mesh(c.http.clone(), c.node.clone(), c.roster.clone()));
 
     let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
     loop {
