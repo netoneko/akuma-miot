@@ -84,7 +84,7 @@ cargo test --workspace                        # host-native, no docker (there is
 overlays/local/build.sh all                   # dist/{aarch64,x86_64}/kot (+ storeprobe, mmapprobe)
 overlays/deploy/deploy.sh up <agent>|all      # the 5-agent mesh, docs/TOPOLOGY_TARGET.md
 kot --node http://192.168.1.126:9944 --roster "$MIOT_ROSTER" peers   # roster + who is primary
-cargo run -p kot -- run --as solo --db /tmp/solo.db                  # a mesh of one, local dev
+cargo run -p kot -- run --as solo --seed 1 --db /tmp/solo.db         # a mesh of one, local dev
 ```
 
 ## Real infrastructure available to this project

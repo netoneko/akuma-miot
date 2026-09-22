@@ -51,18 +51,21 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::{Path, Query, State as AxState};
-use axum::http::StatusCode;
+use axum::http::{StatusCode, Uri};
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use codec::{Decode, Encode};
+use http::{HeaderMap, HeaderValue};
+use miot_keys::Identity;
 use miot_mesh::{Hard, Mesh, Status, Timing, VoteReply, VoteRequest};
 use miot_primitives::{Effect, TaskId};
 use miot_runtime::{AccountId, Executive, Header, Litter, Runtime, System, UncheckedExtrinsic, VERSION};
 use polkadot_sdk::*;
 use serde::{Deserialize, Serialize};
-use sp_core::H256;
+use sp_core::{ed25519, Pair as _, H256};
 use sp_runtime::traits::Header as HeaderT;
 use sp_runtime::traits::UniqueSaturatedInto;
 use tokio::sync::Mutex;
@@ -75,6 +78,11 @@ use crate::common::parse_task;
 pub struct NodeConfig {
     /// This node's mesh name — `--as`.
     pub name: String,
+    /// This node's own keypair, derived from `--as` via the roster. Signs
+    /// mesh-internal traffic (election, chain sync) — never `/submit`'s
+    /// extrinsics, which are signed by whoever calls the client. See
+    /// `docs/MESH_AUTH.md`.
+    pub identity: Identity,
     pub bind: String,
     pub port: u16,
     pub db: PathBuf,
@@ -134,6 +142,8 @@ pub struct Node {
     genesis_root: AccountId,
     genesis_leader: AccountId,
     members: Vec<AccountId>,
+    /// This node's own keypair — signs outgoing mesh-internal traffic.
+    identity: Identity,
     mesh: Mesh,
     /// Whether this node is currently producing blocks — what the mesh last
     /// said, as applied. Differs from `mesh.is_leader()` only between an
@@ -254,11 +264,18 @@ impl Node {
             genesis_root: cfg.root.clone(),
             genesis_leader: cfg.leader.clone(),
             members: cfg.members.clone(),
+            identity: cfg.identity,
             mesh,
             producing: false,
             peer: None,
             needs_reconcile: false,
-            http: reqwest::Client::builder().timeout(Duration::from_secs(10)).build().unwrap(),
+            // Prior knowledge, not negotiated: these are plain `http://`
+            // routes (no TLS/ALPN to negotiate over), and mesh-internal
+            // traffic is a tight poll loop between the same peers over and
+            // over, so one multiplexed connection beats a fresh handshake
+            // per call. axum's server side matches via `http2` feature on
+            // `hyper-util`'s `auto::Builder` (sniffs the h2c preface).
+            http: reqwest::Client::builder().timeout(Duration::from_secs(10)).http2_prior_knowledge().build().unwrap(),
             started: Instant::now(),
         };
         if !node.store.is_empty() {
@@ -286,6 +303,27 @@ impl Node {
 
     pub fn is_producing(&self) -> bool {
         self.producing
+    }
+
+    /// Who mesh-internal traffic is allowed to come from: genesis `members`
+    /// plus root and leader, the same set [`genesis`] gives chain standing.
+    /// Not the same question as "who can sign a tx" — `/submit` accepts any
+    /// account `CheckNonce` allows; this is narrower, and it's what was
+    /// missing before (`docs/MESH_AUTH.md`).
+    fn is_trusted_signer(&self, a: &AccountId) -> bool {
+        self.members.contains(a) || *a == self.genesis_root || *a == self.genesis_leader
+    }
+
+    /// [`is_trusted_signer`](Self::is_trusted_signer)'s set, materialized —
+    /// for a snapshot ([`PeerAuth`]) that outlives the lock.
+    fn trusted_set(&self) -> Vec<AccountId> {
+        let mut v = self.members.clone();
+        for a in [&self.genesis_root, &self.genesis_leader] {
+            if !v.contains(a) {
+                v.push(a.clone());
+            }
+        }
+        v
     }
 
     /// The whole litter table, SCALE-encoded — counters `/tasks` doesn't
@@ -520,20 +558,49 @@ pub type Shared = Arc<Mutex<Node>>;
 /// a campaign if the tick started one. Every node runs this every
 /// `poll_ms`, leader included — a leader polls too, which is how
 /// check-quorum knows it can still see a majority.
-pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
-    let (routes, http) = {
+/// What a call to a peer needs beyond the URL: how to sign what this node
+/// sends, and who to trust in what comes back. Every mesh-internal call
+/// (election, chain sync) takes one; a snapshot rather than holding the
+/// lock, since these calls cross an await and the node mustn't be blocked
+/// while a peer is slow to answer.
+#[derive(Clone)]
+struct PeerAuth {
+    http: reqwest::Client,
+    identity: Identity,
+    trusted: Vec<AccountId>,
+}
+
+impl PeerAuth {
+    async fn snapshot(shared: &Shared) -> Self {
         let n = shared.lock().await;
-        (n.mesh.routes().to_vec(), n.http.clone())
-    };
+        PeerAuth { http: n.http.clone(), identity: n.identity, trusted: n.trusted_set() }
+    }
+
+    fn is_trusted(&self, a: &AccountId) -> bool {
+        self.trusted.contains(a)
+    }
+}
+
+pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
+    let routes = shared.lock().await.mesh.routes().to_vec();
+    let auth = PeerAuth::snapshot(shared).await;
     // Longer than the poll interval on purpose: a slow answer is still an
     // answer. Only a peer that misses every poll for a whole election
     // window counts as gone.
     let timeout = Duration::from_millis((poll_ms * 2).max(2_000));
     let mut set = tokio::task::JoinSet::new();
     for r in routes {
-        let http = http.clone();
+        let auth = auth.clone();
         set.spawn(async move {
-            let st = async { http.get(format!("{r}/mesh/status")).timeout(timeout).send().await.ok()?.json::<Status>().await.ok() }.await;
+            let st = async {
+                let headers = sign_headers(&auth.identity, b"");
+                let resp = auth.http.get(format!("{r}/mesh/status")).headers(headers).timeout(timeout).send().await.ok()?;
+                let resp_headers = resp.headers().clone();
+                let bytes = resp.bytes().await.ok()?;
+                verify_headers(&resp_headers, &bytes, |a| auth.is_trusted(a)).ok()?;
+                serde_json::from_slice::<Status>(&bytes).ok()
+            }
+            .await;
             (r, st)
         });
     }
@@ -564,16 +631,32 @@ pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
 /// go again with the real one.
 async fn campaign(shared: &Shared, mut req: VoteRequest, timeout: Duration) {
     loop {
-        let (routes, http) = {
-            let n = shared.lock().await;
-            (n.mesh.routes().to_vec(), n.http.clone())
-        };
+        let routes = shared.lock().await.mesh.routes().to_vec();
+        let auth = PeerAuth::snapshot(shared).await;
         let mut set = tokio::task::JoinSet::new();
         for r in routes {
-            let http = http.clone();
+            let auth = auth.clone();
             let body = req.clone();
             set.spawn(async move {
-                let rep = async { http.post(format!("{r}/mesh/vote")).json(&body).timeout(timeout).send().await.ok()?.json::<VoteReply>().await.ok() }.await;
+                let rep = async {
+                    let bytes = serde_json::to_vec(&body).ok()?;
+                    let headers = sign_headers(&auth.identity, &bytes);
+                    let resp = auth
+                        .http
+                        .post(format!("{r}/mesh/vote"))
+                        .headers(headers)
+                        .header(http::header::CONTENT_TYPE, "application/json")
+                        .body(bytes)
+                        .timeout(timeout)
+                        .send()
+                        .await
+                        .ok()?;
+                    let resp_headers = resp.headers().clone();
+                    let rbytes = resp.bytes().await.ok()?;
+                    verify_headers(&resp_headers, &rbytes, |a| auth.is_trusted(a)).ok()?;
+                    serde_json::from_slice::<VoteReply>(&rbytes).ok()
+                }
+                .await;
                 (r, rep)
             });
         }
@@ -648,23 +731,28 @@ pub async fn replica_round(shared: &Shared) {
     sync_once(shared, &peer).await;
 }
 
-async fn peer_head(http: &reqwest::Client, peer: &str) -> Option<ChainHead> {
-    http.get(format!("{peer}/chain/head")).send().await.ok()?.json().await.ok()
+async fn peer_head(auth: &PeerAuth, peer: &str) -> Option<ChainHead> {
+    let headers = sign_headers(&auth.identity, b"");
+    let resp = auth.http.get(format!("{peer}/chain/head")).headers(headers).send().await.ok()?;
+    let resp_headers = resp.headers().clone();
+    let bytes = resp.bytes().await.ok()?;
+    verify_headers(&resp_headers, &bytes, |a| auth.is_trusted(a)).ok()?;
+    serde_json::from_slice(&bytes).ok()
 }
 
 /// Fetch and fold whatever the primary has beyond our head.
 async fn sync_once(shared: &Shared, peer: &str) {
-    let http = shared.lock().await.http.clone();
-    let Some(head) = peer_head(&http, peer).await else {
+    let auth = PeerAuth::snapshot(shared).await;
+    let Some(head) = peer_head(&auth, peer).await else {
         return; // the mesh round notices a dead primary; nothing to say here
     };
-    adopt_peer_checkpoint_if_ahead(shared, &http, peer, head.last_checkpoint).await;
+    adopt_peer_checkpoint_if_ahead(shared, &auth, peer, head.last_checkpoint).await;
     loop {
         let from = shared.lock().await.store.head() + 1;
         if from > head.head {
             break;
         }
-        let rows = fetch_blocks(&http, peer, from, SYNC_PAGE).await;
+        let rows = fetch_blocks(&auth, peer, from, SYNC_PAGE).await;
         if rows.is_empty() {
             break;
         }
@@ -691,15 +779,27 @@ async fn sync_once(shared: &Shared, peer: &str) {
     }
 }
 
-async fn fetch_blocks(http: &reqwest::Client, peer: &str, from: u64, limit: u64) -> Vec<BlockRow> {
-    match http.get(format!("{peer}/chain/blocks?from={from}&limit={limit}")).send().await {
-        Ok(r) => r.json().await.unwrap_or_default(),
-        Err(_) => Vec::new(),
+async fn fetch_blocks(auth: &PeerAuth, peer: &str, from: u64, limit: u64) -> Vec<BlockRow> {
+    async {
+        let query = format!("from={from}&limit={limit}");
+        let headers = sign_headers(&auth.identity, query.as_bytes());
+        let resp = auth.http.get(format!("{peer}/chain/blocks?{query}")).headers(headers).send().await.ok()?;
+        let resp_headers = resp.headers().clone();
+        let bytes = resp.bytes().await.ok()?;
+        verify_headers(&resp_headers, &bytes, |a| auth.is_trusted(a)).ok()?;
+        serde_json::from_slice::<Vec<BlockRow>>(&bytes).ok()
     }
+    .await
+    .unwrap_or_default()
 }
 
-async fn fetch_checkpoint(http: &reqwest::Client, peer: &str) -> Option<(u64, Vec<u8>)> {
-    let row: Option<CheckpointRow> = http.get(format!("{peer}/chain/checkpoint")).send().await.ok()?.json().await.ok()?;
+async fn fetch_checkpoint(auth: &PeerAuth, peer: &str) -> Option<(u64, Vec<u8>)> {
+    let headers = sign_headers(&auth.identity, b"");
+    let resp = auth.http.get(format!("{peer}/chain/checkpoint")).headers(headers).send().await.ok()?;
+    let resp_headers = resp.headers().clone();
+    let bytes = resp.bytes().await.ok()?;
+    verify_headers(&resp_headers, &bytes, |a| auth.is_trusted(a)).ok()?;
+    let row: Option<CheckpointRow> = serde_json::from_slice(&bytes).ok()?;
     let row = row?;
     Some((row.height, hex::decode(&row.state_hex).ok()?))
 }
@@ -710,11 +810,11 @@ async fn fetch_checkpoint(http: &reqwest::Client, peer: &str) -> Option<(u64, Ve
 /// primary's checkpoint at any time. Found live: without that, a replica
 /// that had already caught up got stuck one block short of where the
 /// primary could still serve from.
-async fn adopt_peer_checkpoint_if_ahead(shared: &Shared, http: &reqwest::Client, peer: &str, peer_cp: u64) -> bool {
+async fn adopt_peer_checkpoint_if_ahead(shared: &Shared, auth: &PeerAuth, peer: &str, peer_cp: u64) -> bool {
     if peer_cp <= shared.lock().await.store.last_checkpoint() {
         return false;
     }
-    let Some((cp_height, cp_state)) = fetch_checkpoint(http, peer).await else {
+    let Some((cp_height, cp_state)) = fetch_checkpoint(auth, peer).await else {
         eprintln!("[node] sync: peer reports a checkpoint but didn't serve one");
         return false;
     };
@@ -737,11 +837,11 @@ async fn adopt_peer_checkpoint_if_ahead(shared: &Shared, http: &reqwest::Client,
 ///
 /// Returns false if the peer couldn't be asked, so the caller retries.
 async fn reconcile_if_diverged(shared: &Shared, peer: &str) -> bool {
-    let (http, my_head, my_cp) = {
+    let (auth, my_head, my_cp) = {
         let n = shared.lock().await;
-        (n.http.clone(), n.store.head(), n.store.last_checkpoint())
+        (PeerAuth { http: n.http.clone(), identity: n.identity, trusted: n.trusted_set() }, n.store.head(), n.store.last_checkpoint())
     };
-    let Some(ph) = peer_head(&http, peer).await else {
+    let Some(ph) = peer_head(&auth, peer).await else {
         return false;
     };
 
@@ -754,7 +854,7 @@ async fn reconcile_if_diverged(shared: &Shared, peer: &str) -> bool {
         rewind(shared, peer, my_cp.saturating_sub(1)).await;
         return true;
     }
-    if adopt_peer_checkpoint_if_ahead(shared, &http, peer, ph.last_checkpoint).await {
+    if adopt_peer_checkpoint_if_ahead(shared, &auth, peer, ph.last_checkpoint).await {
         return true;
     }
     if my_head == my_cp {
@@ -764,7 +864,7 @@ async fn reconcile_if_diverged(shared: &Shared, peer: &str) -> bool {
     let mut theirs = Vec::new();
     let mut from = my_cp + 1;
     while from <= my_head {
-        let rows = fetch_blocks(&http, peer, from, SYNC_PAGE).await;
+        let rows = fetch_blocks(&auth, peer, from, SYNC_PAGE).await;
         if rows.is_empty() {
             break;
         }
@@ -795,6 +895,68 @@ async fn rewind(shared: &Shared, peer: &str, fork: u64) {
         r.height, r.dropped
     );
     n.reload_from_store();
+}
+
+// ------------------------------------------------------------- mesh auth
+//
+// Signs and verifies mesh-internal HTTP traffic (election, chain sync) —
+// not client-facing endpoints like `/tasks` or `/account`, which stay open
+// to any `kot` client per `CLAUDE.md`. Distinct from `/submit`'s signed
+// `UncheckedExtrinsic`: that authorizes a *state change*; this authenticates
+// *who a mesh peer is* on the wire, which nothing checked before. Full
+// write-up: `docs/MESH_AUTH.md`.
+//
+// The signature covers exactly the bytes sent — the raw request/response
+// body, or the raw query string for a parameterless GET — never a
+// re-serialized value, so there's no question of canonical JSON.
+
+const SIG_HEADER_SIGNER: &str = "x-miot-signer";
+const SIG_HEADER_SIG: &str = "x-miot-sig";
+
+/// `pub` only so `tests/election.rs` can call a mesh-internal endpoint
+/// directly to inspect a node's raw log, the same way a real peer would.
+/// Not part of the client surface: `kot`'s own client never touches
+/// `/mesh/*` or `/chain/*`.
+pub fn sign_headers(identity: &Identity, bytes: &[u8]) -> HeaderMap {
+    let sig = identity.sign(bytes);
+    let mut h = HeaderMap::new();
+    h.insert(SIG_HEADER_SIGNER, HeaderValue::from_str(&miot_keys::to_hex(&identity.account())).expect("hex is ascii"));
+    h.insert(SIG_HEADER_SIG, HeaderValue::from_str(&hex::encode(sig.0)).expect("hex is ascii"));
+    h
+}
+
+/// `Ok(signer)` only if the header signature verifies over `bytes` *and*
+/// `is_trusted` accepts the signer — a well-formed signature from a stranger
+/// is still a rejection.
+fn verify_headers(headers: &HeaderMap, bytes: &[u8], is_trusted: impl Fn(&AccountId) -> bool) -> Result<AccountId, &'static str> {
+    let signer_hex = headers.get(SIG_HEADER_SIGNER).and_then(|v| v.to_str().ok()).ok_or("missing signer header")?;
+    let sig_hex = headers.get(SIG_HEADER_SIG).and_then(|v| v.to_str().ok()).ok_or("missing sig header")?;
+    let account = miot_keys::from_hex(signer_hex).map_err(|_| "signer header is not a valid account")?;
+    if !is_trusted(&account) {
+        return Err("signer is not a trusted mesh member");
+    }
+    let sig_bytes = hex::decode(sig_hex).map_err(|_| "sig header is not valid hex")?;
+    let sig_arr: [u8; 64] = sig_bytes.try_into().map_err(|_| "sig is not 64 bytes")?;
+    let sig = ed25519::Signature::from_raw(sig_arr);
+    let pub_arr: [u8; 32] = AsRef::<[u8]>::as_ref(&account).try_into().expect("AccountId32 is 32 bytes");
+    let public = ed25519::Public::from_raw(pub_arr);
+    if !ed25519::Pair::verify(&sig, bytes, &public) {
+        return Err("signature does not verify");
+    }
+    Ok(account)
+}
+
+/// A signed JSON response: the body, `Content-Type`, and the signature
+/// headers together, so a handler can build it in one line.
+fn signed_json<T: Serialize>(identity: &Identity, status: StatusCode, body: &T) -> Response {
+    let bytes = serde_json::to_vec(body).expect("serializable");
+    let mut headers = sign_headers(identity, &bytes);
+    headers.insert(http::header::CONTENT_TYPE, HeaderValue::from_static("application/json"));
+    (status, headers, Body::from(bytes)).into_response()
+}
+
+fn unauthorized(why: &'static str) -> Response {
+    (StatusCode::UNAUTHORIZED, why).into_response()
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -909,18 +1071,29 @@ pub async fn start(cfg: NodeConfig) -> Result<Running, String> {
     Ok(Running { shared, addr, tasks })
 }
 
-async fn mesh_status(AxState(n): AxState<Shared>) -> Json<Status> {
+async fn mesh_status(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let n = n.lock().await;
-    Json(n.mesh.status(n.store.head()))
+    if let Err(why) = verify_headers(&headers, b"", |a| n.is_trusted_signer(a)) {
+        return unauthorized(why);
+    }
+    let status = n.mesh.status(n.store.head());
+    signed_json(&n.identity, StatusCode::OK, &status)
 }
 
-async fn mesh_vote(AxState(n): AxState<Shared>, Json(req): Json<VoteRequest>) -> Json<VoteReply> {
+async fn mesh_vote(AxState(n): AxState<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     let mut n = n.lock().await;
+    if let Err(why) = verify_headers(&headers, &body, |a| n.is_trusted_signer(a)) {
+        return unauthorized(why);
+    }
+    let req: VoteRequest = match serde_json::from_slice(&body) {
+        Ok(r) => r,
+        Err(_) => return (StatusCode::BAD_REQUEST, "malformed vote request").into_response(),
+    };
     let (now, head) = (n.now_ms(), n.store.head());
     let reply = n.mesh.on_vote_request(&req, now, head);
     // Persisted before the reply leaves (follow_mesh saves first).
     n.follow_mesh();
-    Json(reply)
+    signed_json(&n.identity, StatusCode::OK, &reply)
 }
 
 /// `kot peers`: this node, and every peer as last seen from here.
@@ -946,13 +1119,23 @@ async fn mesh_peers(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
     }))
 }
 
-async fn chain_head(AxState(n): AxState<Shared>) -> Json<ChainHead> {
+async fn chain_head(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let n = n.lock().await;
-    Json(ChainHead { head: n.store.head(), last_checkpoint: n.store.last_checkpoint() })
+    if let Err(why) = verify_headers(&headers, b"", |a| n.is_trusted_signer(a)) {
+        return unauthorized(why);
+    }
+    let body = ChainHead { head: n.store.head(), last_checkpoint: n.store.last_checkpoint() };
+    signed_json(&n.identity, StatusCode::OK, &body)
 }
 
-async fn chain_blocks(AxState(n): AxState<Shared>, Query(q): Query<BlocksQuery>) -> Json<Vec<BlockRow>> {
+async fn chain_blocks(AxState(n): AxState<Shared>, uri: Uri, headers: HeaderMap, Query(q): Query<BlocksQuery>) -> Response {
     let n = n.lock().await;
+    // Signed over the raw query string — exactly what the caller put after
+    // `?` — never the parsed `BlocksQuery`, so there's no canonicalization
+    // to get subtly wrong between the two ends.
+    if let Err(why) = verify_headers(&headers, uri.query().unwrap_or("").as_bytes(), |a| n.is_trusted_signer(a)) {
+        return unauthorized(why);
+    }
     let head = n.store.head();
     let limit = q.limit.unwrap_or(SYNC_PAGE).min(SYNC_PAGE);
     let mut out = Vec::new();
@@ -963,17 +1146,20 @@ async fn chain_blocks(AxState(n): AxState<Shared>, Query(q): Query<BlocksQuery>)
         }
         h += 1;
     }
-    Json(out)
+    signed_json(&n.identity, StatusCode::OK, &out)
 }
 
-async fn chain_checkpoint(AxState(n): AxState<Shared>) -> Json<Option<CheckpointRow>> {
+async fn chain_checkpoint(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let n = n.lock().await;
+    if let Err(why) = verify_headers(&headers, b"", |a| n.is_trusted_signer(a)) {
+        return unauthorized(why);
+    }
     let cp = n.store.last_checkpoint();
     if cp == 0 {
-        return Json(None);
+        return signed_json(&n.identity, StatusCode::OK, &Option::<CheckpointRow>::None);
     }
     let state = n.store.checkpoint_state().expect("store read").expect("checkpoint recorded, its state must exist");
-    Json(Some(CheckpointRow { height: cp, state_hex: hex::encode(state) }))
+    signed_json(&n.identity, StatusCode::OK, &Some(CheckpointRow { height: cp, state_hex: hex::encode(state) }))
 }
 
 #[derive(Deserialize)]

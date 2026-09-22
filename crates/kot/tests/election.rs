@@ -17,10 +17,14 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
-fn cfg(name: &str, port: u16, peers: Vec<String>, db: std::path::PathBuf) -> NodeConfig {
+fn cfg(who: u8, name: &str, port: u16, peers: Vec<String>, db: std::path::PathBuf) -> NodeConfig {
     let seed = |n: u8| Identity::from_seed(&[n; 32]).account();
     NodeConfig {
         name: name.into(),
+        // `who` matches this node's own position in the `1..=5` seeds
+        // `members` draws from below, so its signed mesh traffic verifies
+        // against its own genesis.
+        identity: Identity::from_seed(&[who; 32]),
         bind: "127.0.0.1".into(),
         port,
         db,
@@ -49,7 +53,7 @@ impl Mesh3 {
 
     fn cfg(&self, i: usize) -> NodeConfig {
         let peers = (0..3).filter(|&j| j != i).map(|j| self.url(j)).collect();
-        cfg(self.names[i], self.ports[i], peers, self.dirs[i].path().join("db"))
+        cfg(i as u8 + 1, self.names[i], self.ports[i], peers, self.dirs[i].path().join("db"))
     }
 
     async fn start() -> Self {
@@ -125,11 +129,17 @@ impl Mesh3 {
     }
 
     async fn blocks(&self, i: usize, http: &reqwest::Client) -> Vec<String> {
+        // `/chain/blocks` is mesh-internal now (docs/MESH_AUTH.md) — sign as
+        // root (a trusted genesis account) to read it the way a real peer
+        // would, not the way `kot`'s own client ever does.
+        let root = Identity::from_seed(&[1; 32]);
         let mut out = Vec::new();
         let mut from = 1;
         loop {
+            let query = format!("from={from}&limit=256");
             let rows: Vec<serde_json::Value> = http
-                .get(format!("{}/chain/blocks?from={from}&limit=256", self.url(i)))
+                .get(format!("{}/chain/blocks?{query}", self.url(i)))
+                .headers(node::sign_headers(&root, query.as_bytes()))
                 .send()
                 .await
                 .unwrap()
@@ -239,7 +249,7 @@ async fn a_mesh_of_one_produces_on_its_own() {
     let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let r = node::start(cfg("solo", port, vec![], dir.path().join("db"))).await.unwrap();
+    let r = node::start(cfg(1, "solo", port, vec![], dir.path().join("db"))).await.unwrap();
     let url = format!("http://127.0.0.1:{port}");
     submit(&http, &url, open("alone")).await;
     tokio::time::sleep(Duration::from_millis(500)).await;

@@ -1,6 +1,6 @@
 # Handoff
 
-State of Akuma Miot as of 2026-09-22 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`). What runs, what doesn't, what to do next,
+State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated — `docs/MESH_AUTH.md`). What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
@@ -28,7 +28,7 @@ kot --node http://192.168.1.126:9944 --roster "$R" task open "your question"
 kot --node http://192.168.1.126:9944 --roster "$R"                  # the REPL
 kot --node http://192.168.1.126:9944 --roster "$R" log --follow
 
-cargo run -p kot -- run --as solo --db /tmp/solo.db                  # a mesh of one: local dev
+cargo run -p kot -- run --as solo --seed 1 --db /tmp/solo.db         # a mesh of one: local dev
 ```
 
 Signing defaults to the operator's root identity (`~/.akuma/miot/id_ed25519.seed`);
@@ -188,6 +188,25 @@ arm shows the old behaviour diverging.
 `ARTIFACT_PAGES` (4) × `ARTIFACT_PAGE_BYTES` (4 KiB ≈ 1k tokens) = 16 KiB, in
 `miot-runtime`, and the leader's `ArtifactNeeded` prompt states the word
 budget.
+
+**Mesh-internal HTTP is authenticated and on HTTP/2, 2026-09-23
+(`docs/MESH_AUTH.md`).** `/mesh/vote`, `/mesh/status`, `/chain/{head,blocks,
+checkpoint}` used to trust whatever a reachable HTTP client claimed — no
+relation to `/submit`'s signed extrinsics, which authorize a state change,
+not a peer's identity. Every mesh node now carries its own keypair (`kot run
+--as <name>` needs `<name>` in the roster or an explicit `--seed`/
+`--seed-file`, unconditionally now, not just when an agent loop is
+attached), and every mesh-internal request and response carries
+`x-miot-signer`/`x-miot-sig` headers, verified against genesis `members` ∪
+{root, leader}. Client-facing endpoints (`/tasks`, `/account`, `/submit`,
+...) are untouched. Alongside it: `reqwest`'s client uses
+`.http2_prior_knowledge()`, and axum's `http2` feature turns on
+`hyper-util`'s connection-preface sniffing so `axum::serve` accepts it —
+mesh traffic is a tight poll loop between the same peers, so one multiplexed
+connection beats a handshake per call. Verified live (`kot run --as solo`,
+curl with and without a valid signature) and via `cargo test --workspace`
+(unchanged, 108+ tests including the 3-node election integration test);
+**not yet redeployed to the fleet** — host-native only this pass.
 
 ---
 
@@ -383,6 +402,12 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
   also covers the metal-box replica wedge (open) and PSTATS naming amd64
   syscalls from the aarch64 table (open). **Lesson:** a change to shared
   kernel code must be checked against both dispatchers.
+- **amd64 Akuma: kot goes deaf in minutes, on metal *and* in a 1-vCPU
+  Firecracker guest on ryzen (`192.168.1.50`, the `ryzen-fc` agent).** Not
+  fixed. Handed off in `../akuma/docs/archive/AKUMA_AMD64_KOT_REPLICA_WEDGE.md`.
+  Strongest lead: x86_64 `accept4` (288) has no amd64 syscall row, so tokio's
+  accepts get ENOSYS. Until then akuma-metal and ryzen-fc can't hold a seat,
+  and the mesh is ryzen-linux + mac-linux + mac-fc.
 - **Akuma's sshd merges stderr into stdout.** Anything parsed from `ssh
   akuma '…'` output needs `2>/dev/null` on the far side.
 - **The z.ai token is a coding-plan key**: `paas/v4` answers "insufficient

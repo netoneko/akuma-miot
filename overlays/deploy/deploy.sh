@@ -95,9 +95,11 @@ on() { # on <agent> <shell command>, run as root on the agent's host
     fcguest)
       local o=(-o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR)
       case "$1" in
-        mac-fc)   timeout 60 ssh "${o[@]}" -p 4444 root@localhost "$2" ;;
+        # Generous: an 11 MB kot takes ~2 min into the amd64 guest (~90 KB/s
+        # inbound, measured 2026-09-22) and the ssh session carries the wget.
+        mac-fc)   timeout 600 ssh "${o[@]}" -p 4444 root@localhost "$2" ;;
         # The amd64 image's sshd trusts mkdisk.sh's test key only.
-        ryzen-fc) timeout 60 ssh "${o[@]}" -i "$AKUMA_REPO/target/x86_64-unknown-none/release/amd64-ssh-test-key" root@192.168.1.50 "$2" ;;
+        ryzen-fc) timeout 600 ssh "${o[@]}" -p 2222 -i "$AKUMA_REPO/target/x86_64-unknown-none/release/amd64-ssh-test-key" root@192.168.1.50 "$2" ;;
       esac ;;
     *) die "$1: shape $(field "$1" 2) not deployable yet" ;;
   esac
@@ -127,7 +129,7 @@ put() { # put <agent> <local file> <remote path>
       sleep 1
       local want; want="$(md5 -q "$src")"
       on "$a" "wget -q -O $dst.new http://$from:$HTTP_PORT/f && md5sum $dst.new" | grep -q "$want" \
-        || { kill $srv; wait $srv 2>/dev/null; rm -rf "$stage"; die "transfer of $src to $a failed or corrupted"; }
+        || { kill $srv; wait $srv 2>/dev/null || true; rm -rf "$stage"; die "transfer of $src to $a failed or corrupted"; }
       kill $srv; wait $srv 2>/dev/null || true; rm -rf "$stage"
       on "$a" "chmod +x $dst.new 2>/dev/null; mv $dst.new $dst"
       ;;

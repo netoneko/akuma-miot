@@ -43,7 +43,10 @@ use sp_core::{ed25519, ByteArray, Pair as _};
 use sp_runtime::AccountId32;
 
 /// An ed25519 keypair. Thin wrapper over [`ed25519::Pair`] so callers get an
-/// [`AccountId32`] without repeating the conversion.
+/// [`AccountId32`] without repeating the conversion. `Copy`, like the `Pair`
+/// it wraps, so a running node can hold its own identity alongside a
+/// `Clone`d config without a lifetime fight.
+#[derive(Clone, Copy)]
 pub struct Identity(ed25519::Pair);
 
 impl Identity {

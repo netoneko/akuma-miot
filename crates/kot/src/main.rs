@@ -177,8 +177,20 @@ async fn connect(cli: &Cli) -> client::Client {
 async fn run(cli: &Cli, a: &RunArgs) {
     let name = cli.as_.clone().unwrap_or_else(|| die("run needs --as <name> (or MIOT_NAME)"));
     let account = |s: &str| parse_account(s).unwrap_or_else(|e| die(e));
+    // Every node needs its own keypair now, not just one running an agent
+    // loop: it signs the mesh-internal traffic (election, chain sync) this
+    // node sends, election included — a node with no `--llm`/`--glm` used
+    // to get no identity at all (docs/MESH_AUTH.md).
+    let identity = if cli.seed.is_some() || cli.seed_file.is_some() {
+        signer(cli)
+    } else {
+        common::roster_seed(&cli.roster, &name).unwrap_or_else(|| {
+            die(format!("run needs a keypair to sign mesh traffic: --seed-file, --seed, or a seed for {name} in the roster"))
+        })
+    };
     let cfg = node::NodeConfig {
         name: name.clone(),
+        identity,
         bind: a.bind.clone(),
         port: a.port,
         db: expand_home(a.db.as_deref().unwrap_or(&format!("kot-{name}.db"))),
@@ -205,12 +217,6 @@ async fn run(cli: &Cli, a: &RunArgs) {
     match llm {
         None => println!("[{name}] no --llm/--glm: node only, no agent loop"),
         Some(llm) => {
-            let identity = if cli.seed.is_some() || cli.seed_file.is_some() {
-                signer(cli)
-            } else {
-                common::roster_seed(&cli.roster, &name)
-                    .unwrap_or_else(|| die(format!("the agent loop needs an identity: --seed-file, --seed, or a seed for {name} in the roster")))
-            };
             let persona = a
                 .persona
                 .as_deref()
