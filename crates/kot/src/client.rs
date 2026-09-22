@@ -231,17 +231,55 @@ impl Client {
         }
     }
 
-    fn print_event(&self, e: &serde_json::Value) {
-        let eff = &e["effect"];
-        if eff["t"] == "said" {
-            let from = eff["from"].as_str().and_then(|s| miot_keys::from_hex(s).ok());
-            let label = from.map(|a| self.roster.name_of(&a)).unwrap_or_else(|| "?".into());
-            println!("  {DIM}block {}{OFF}  {label}: {}", e["block"], eff["body"].as_str().unwrap_or(""));
-        } else {
-            let mut eff = eff.clone();
-            self.resolve_accounts(&mut eff);
-            println!("  {DIM}block {}{OFF}  {eff}", e["block"]);
+    /// `eff[field]`, resolved through the roster if it's an account, else
+    /// the raw string (or `"?"` if absent/null — `from`/`to` on a broadcast
+    /// or a root-authored effect are `null` in the wire JSON).
+    fn name(&self, eff: &serde_json::Value, field: &str) -> String {
+        eff[field]
+            .as_str()
+            .map(|s| miot_keys::from_hex(s).map(|a| self.roster.name_of(&a)).unwrap_or_else(|_| s.to_string()))
+            .unwrap_or_else(|| "?".into())
+    }
+
+    /// One effect, in prose — matches `render()` in `crates/kot/src/node.rs`
+    /// field-for-field. A raw JSON dump (even with hex resolved to names)
+    /// reads as noise; every effect type gets an actual sentence, the way
+    /// `"said"` always has.
+    fn render_effect(&self, eff: &serde_json::Value) -> String {
+        let task = || eff["task"].as_str().unwrap_or("?").to_string();
+        let text = |field: &str| eff[field].as_str().unwrap_or("");
+        match eff["t"].as_str().unwrap_or("") {
+            "said" => format!("{}: {}", self.name(eff, "from"), text("body")),
+            "opened" => format!("{} opened {}: {}", self.name(eff, "who"), task(), text("text")),
+            "planned" => format!("{} planned {} into {} subtask(s)", self.name(eff, "who"), task(), eff["count"]),
+            "assigned" => format!("{} assigned to {}: {}", task(), self.name(eff, "to"), text("what")),
+            "directed" => format!("{} directed on {}: {}", self.name(eff, "to"), task(), eff["directive"].as_str().unwrap_or("?")),
+            "nudge" => {
+                let last = if eff["last"].as_bool().unwrap_or(false) { ", last" } else { "" };
+                format!("{} nudged on {} ({} left{last})", self.name(eff, "to"), task(), eff["remaining"])
+            }
+            "record" => {
+                let t = text("text");
+                let suffix = if t.is_empty() { String::new() } else { format!(": {t}") };
+                format!("{} {} on {}{suffix}", self.name(eff, "who"), eff["act"].as_str().unwrap_or("?"), task())
+            }
+            "requeued" => format!("{} requeued from {}: {}", task(), self.name(eff, "from"), eff["why"].as_str().unwrap_or("?")),
+            "budget_spent" => format!("{} spent its nudge budget on {}", self.name(eff, "holder"), task()),
+            "closed" => format!("{} closed by {}: {}", task(), self.name(eff, "author"), text("title")),
+            "failed" => format!("{} failed", task()),
+            "rehomed" => format!("{} rehomed from {} to {}", task(), self.name(eff, "from"), self.name(eff, "to")),
+            // A future Effect variant lands here until it earns its own
+            // sentence above — still resolves accounts, just not to prose.
+            _ => {
+                let mut v = eff.clone();
+                self.resolve_accounts(&mut v);
+                v.to_string()
+            }
         }
+    }
+
+    fn print_event(&self, e: &serde_json::Value) {
+        println!("  {DIM}block {}{OFF}  {}", e["block"], self.render_effect(&e["effect"]));
     }
 
     /// `kot log`. With `task`, only events about it (or its sub-tasks).
