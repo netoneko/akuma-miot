@@ -220,5 +220,33 @@ pub fn task_tools() -> Vec<Tool> {
                 },
                 "required": ["task", "to"]
             })),
+        // Stubs: local to this cat's own host, no sandbox. A turn is one LLM
+        // call in, tool calls out — there is no loop that feeds a result back
+        // for a further reply, so these don't help decide what to do next;
+        // use them to do work, then a separate TaskUpdate to report it.
+        Tool::new("Bash")
+            .with_description("Run one shell command on this cat's own host (/bin/sh -c).")
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            })),
+        Tool::new("ReadFile")
+            .with_description("Read one text file from this cat's own host.")
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            })),
+        Tool::new("WriteFile")
+            .with_description("Write text to a file on this cat's own host, overwriting it.")
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            })),
     ]
 }

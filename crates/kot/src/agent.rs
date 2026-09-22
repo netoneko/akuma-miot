@@ -242,7 +242,50 @@ impl Cat {
         Some((p, tools))
     }
 
+    /// Stubs: run locally, log the result, done. No sandbox, no output fed
+    /// back to the model — a turn is one LLM call in, tool calls out, with no
+    /// loop that would let it see what came back and react.
+    async fn act_local(&self, c: &miot_llm::Call) -> bool {
+        match c.name.as_str() {
+            "Bash" => {
+                let command = c.str("command").unwrap_or_default();
+                let run = tokio::process::Command::new("/bin/sh").arg("-c").arg(&command).output();
+                match tokio::time::timeout(std::time::Duration::from_secs(30), run).await {
+                    Ok(Ok(out)) => println!(
+                        "  [{}] bash `{command}` exit={:?}\n{}{}",
+                        self.name,
+                        out.status.code(),
+                        String::from_utf8_lossy(&out.stdout),
+                        String::from_utf8_lossy(&out.stderr),
+                    ),
+                    Ok(Err(e)) => println!("  [{}] bash `{command}` failed to spawn: {e}", self.name),
+                    Err(_) => println!("  [{}] bash `{command}` timed out after 30s", self.name),
+                }
+            }
+            "ReadFile" => {
+                let path = c.str("path").unwrap_or_default();
+                match tokio::fs::read_to_string(&path).await {
+                    Ok(s) => println!("  [{}] read {path} ({} bytes):\n{s}", self.name, s.len()),
+                    Err(e) => println!("  [{}] read {path} failed: {e}", self.name),
+                }
+            }
+            "WriteFile" => {
+                let path = c.str("path").unwrap_or_default();
+                let content = c.str("content").unwrap_or_default();
+                match tokio::fs::write(&path, &content).await {
+                    Ok(()) => println!("  [{}] wrote {path} ({} bytes)", self.name, content.len()),
+                    Err(e) => println!("  [{}] write {path} failed: {e}", self.name),
+                }
+            }
+            _ => return false,
+        }
+        true
+    }
+
     async fn act(&self, c: &miot_llm::Call) {
+        if self.act_local(c).await {
+            return;
+        }
         let task = c.str("task").unwrap_or_default();
         let call = match c.name.as_str() {
             "TaskPlan" => {
