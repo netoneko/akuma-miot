@@ -15,7 +15,7 @@ entry"? All three exist and are deliberately different:
 | Layer | What it is | Lives where | Example |
 |---|---|---|---|
 | **Transactions** (extrinsics) | The verbs. Signed calls that *decide* what happened. | The wire / a signed `UncheckedExtrinsic` | `Litter::update(task: t1.2, act: Done, text: "...")` |
-| **Effects** (events) | The **one and only description of a state change**. Everything below is folded from these. | `TaskTable::apply`'s input; `miot-node`'s in-memory ring (`/events`) for observability | `Effect::Directed{to: mimi, task: t1, directive: PlanNeeded}` |
+| **Effects** (events) | The **one and only description of a state change**. Everything below is folded from these. | `TaskTable::apply`'s input; `miot`'s in-memory ring (`/events`) for observability | `Effect::Directed{to: mimi, task: t1, directive: PlanNeeded}` |
 | **State** | The nouns. One `Task<A>` row per task — a *materialized view*, never mutated except by folding an effect through `apply`. | `pallet_litter::Litter`, one `StorageValue<State<AccountId>>` | `t1.2`'s `status` field flips `Pending → InProgress → AwaitingClearance` over its life |
 
 A task is **state**, and state is **a fold over effects** — genuinely, as of
@@ -46,7 +46,7 @@ display field only, never read for authorization) is stamped as the
 add a field later if that field ever needs to be exact; not worth it today
 for a value nothing but a listing reads.
 
-**Persistence** (`miot-store` → `miot-node`, HANDOFF item 2, done
+**Persistence** (`miot-store` → `miot`, HANDOFF item 2, done
 2026-09-22): the effect log described above *is* what gets persisted
 (`Node::persist`, one `Store::append` per block) and replayed on start
 (`Node::replay`, folding through `pallet_litter::Pallet::replay_effect` →
@@ -113,7 +113,7 @@ into four LLM turns — measured, not assumed (`docs/MAPPING_REPORT.md` §1.1).
 **The values in `miot-primitives`' doc comments (e.g. "`claim_window` ...
 600s") are generic defaults, not what's running.** `miot-runtime`'s
 `parameter_types!` are tuned against measured LLM turn lengths and are the
-ones that matter. At `BLOCK_MS = 6000` (`miot-node`):
+ones that matter. At `BLOCK_MS = 6000` (`miot`):
 
 | Constant | Blocks | Real time |
 |---|---|---|
@@ -151,7 +151,7 @@ that is consensus business"). `clear_all` (2026-09-22) also calls
 just the ones it just failed — `/clear` is an operator's "move on," so
 nothing dead is worth 24h of grace.
 
-## Tool exposure per effect type (`crates/miot-cat/src/main.rs`, `crates/miot-llm`)
+## Tool exposure per effect type (`crates/kot/src/main.rs`, `crates/miot-llm`)
 
 An agent's tool surface depends on **why it was woken**, not on being a
 fixed persona-wide capability list:

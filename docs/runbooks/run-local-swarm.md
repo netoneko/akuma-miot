@@ -37,10 +37,10 @@ running yet: `limactl start fc` (or `limactl list` to check).
 ```bash
 cargo run -p miot -- --rpc http://localhost:9944 --identity-seed 1 \
   --open "your question here"
-cargo run -p miot -- --rpc http://localhost:9944 --identity-seed 1 --chat
+cargo run -p miot -- --rpc http://localhost:9944 --identity-seed 1 --repl
 ```
 
-**`--identity-seed 1` is not optional the first time.** Without it, `--chat`
+**`--identity-seed 1` is not optional the first time.** Without it, `--repl`
 generates and persists a brand-new random identity
 (`~/.akuma/miot/id_ed25519.seed`) that the node's genesis never granted a
 provider to, and every single submit comes back `refused: rejected:
@@ -49,7 +49,9 @@ root by the default `MIOT_MEMBERS=1,2,3,4,5` convention; `2,3,4,5` are
 mimi/tama/kuro/sora. The error message itself now explains this
 (`crates/miot/src/rpc.rs::submit`).
 
-In `--chat`:
+In `--repl` (an operator's interactive session against a real node — not a
+simulated conversation between cats, which isn't a thing this project does;
+the chain is still the only channel between agents):
 
 - Plain text broadcasts to the whole litter.
 - `@tama` (or `@kuro`, etc.) addresses one cat; `@tama @kuro` addresses both,
@@ -62,7 +64,7 @@ In `--chat`:
 - Blank line, `/quit`, or `/exit` leaves.
 - Replies print **as they land**, in the background — the prompt does not
   block waiting for one. A cat's real turn is 30-150+ seconds (`BLOCK_MS` is
-  6000 in `miot-node`, so that's a dozen-plus blocks); don't mistake "no
+  6000 in `miot`, so that's a dozen-plus blocks); don't mistake "no
   reply yet" for "broken" for at least a couple of minutes.
 
 ## Rebuilding and redeploying after a code change
@@ -76,7 +78,7 @@ docker build -t akuma-miot:net .
 docker compose -f overlays/local/docker-compose.yml up -d --force-recreate
 ```
 
-Do this after touching `crates/miot-node`, `crates/miot-cat`,
+Do this after touching `crates/miot`, `crates/kot`,
 `crates/pallet-litter`, `crates/miot-runtime`, or `crates/miot-primitives` —
 even a small addition (e.g. a new dispatchable) means the running node's
 `RuntimeCall` enum doesn't have it, and calling it will fail oddly rather than
@@ -97,7 +99,7 @@ genesis and cats do need restarting again, same as before.
 Quick staleness check, given a report that something isn't working:
 
 ```bash
-git log -1 --format=%cd -- crates/miot-node crates/miot-cat crates/pallet-litter
+git log -1 --format=%cd -- crates/miot crates/kot crates/pallet-litter
 docker inspect akuma-miot:net --format '{{.Created}}'
 ```
 
@@ -119,13 +121,13 @@ To (re)start `kuro` on `fc`:
 
 ```bash
 limactl shell fc -- bash -lc '
-  pkill -f "./miot-cat"
+  pkill -f "./kot"
   cd /home/netoneko.guest
   export MIOT_NAME=kuro MIOT_SEED=4 MIOT_MODEL=qwen3:4b \
          MIOT_NODE=http://192.168.5.2:9944 \
          MIOT_LLM=http://192.168.5.2:8083 \
          MIOT_PERSONA=/home/netoneko.guest/kuro.md
-  setsid nohup ./miot-cat > /home/netoneko.guest/miot-cat.log 2>&1 < /dev/null &
+  setsid nohup ./kot > /home/netoneko.guest/kot.log 2>&1 < /dev/null &
 '
 ```
 
@@ -134,12 +136,12 @@ limactl shell fc -- bash -lc '
 inside the VM. **Use `setsid`, not just `& disown`** — plain `disown` was
 observed to not reliably survive the `limactl shell` session closing;
 `setsid` fully detaches the process from the controlling terminal. Tail
-`~/miot-cat.log` on the VM (`limactl shell fc -- tail -f
-/home/netoneko.guest/miot-cat.log`) to see its turns and any `llm error:` /
+`~/kot.log` on the VM (`limactl shell fc -- tail -f
+/home/netoneko.guest/kot.log`) to see its turns and any `llm error:` /
 `refused:` lines — this is the *only* place those show up; they never reach
 your host terminal.
 
-If `kuro`'s binary itself needs updating (a `miot-cat`-affecting change),
+If `kuro`'s binary itself needs updating (a `kot`-affecting change),
 rebuild for the VM's target and copy it over — see `HANDOFF.md`'s "Target
 mismatch" note and `overlays/local/build-akuma.sh` for the
 `aarch64-unknown-linux-musl` cross-compile, then `limactl copy` onto `fc`.
@@ -171,7 +173,7 @@ printer is in doubt — the event log's `wakes` field is the ground truth for
 ## `node2`, a read replica — HANDOFF item 5
 
 `overlays/local/docker-compose.yml` also brings up `node2`, running
-`miot-node` as `MIOT_ROLE=replica MIOT_PEER=http://node:9944` — it pulls
+`miot` as `MIOT_ROLE=replica MIOT_PEER=http://node:9944` — it pulls
 `node`'s block log over HTTP (`docs/references/storage.md` has the wire
 mechanism) and mirrors it, but no cat talks to it and it refuses `/submit`.
 It comes up with the rest of `docker compose up -d`; nothing extra to do.

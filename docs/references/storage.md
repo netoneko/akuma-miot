@@ -195,7 +195,7 @@ history nobody can use.
 
 Everything above was designed and unit-tested (`crates/miot-store/src/tests.rs`,
 especially `a_cat_that_diverged_converges_on_the_leader`) before there was a
-second `miot-node` process for it to run against. There now is one.
+second `miot` process for it to run against. There now is one.
 
 **Vocabulary note**: this section is about which node's block log is
 canonical — a different question from `pallet-litter`'s `leader`, which is
@@ -217,7 +217,7 @@ the unrelated litter leader):
   compaction state a replica adopts directly when it can't reach it by
   replay (below).
 
-A replica does three things, in `crates/miot-node/src/main.rs`:
+A replica does three things, in `crates/miot/src/main.rs`:
 
 1. **`reconcile_if_diverged`**, once, before it starts serving (covers both
    a fresh replica and one restarting after having run independently).
@@ -254,7 +254,7 @@ still serve from. Restoring `Node::apply_block` from a checkpoint
 the *check* every tick, not just once, is what actually closes the gap.
 
 Verified live, twice. First (before compaction existed): a standalone third
-`miot-node`, run as a replica, killed, restarted as its own independent
+`miot`, run as a replica, killed, restarted as its own independent
 primary, given a submit only it received, then pointed back — printed
 `sync: diverged from peer above block 481, rewound to 0 (dropped 485
 block(s))`, full genesis replay, byte-for-field identical after. Second
@@ -268,7 +268,7 @@ genesis" case actually looks like live.
 ### The checkpoint is a real snapshot, not a hand-rolled subset
 
 `Store::compact`'s `state` parameter was designed opaque from the start —
-`miot-store` has no idea what's inside it. What `miot-node` actually puts
+`miot-store` has no idea what's inside it. What `miot` actually puts
 there: the *entire* FRAME storage trie, via
 `sp_io::TestExternalities::into_raw_snapshot`/`from_raw_snapshot` — every
 pallet's storage, not just `pallet-litter`'s own value, `frame_system`'s

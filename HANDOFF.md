@@ -16,32 +16,33 @@ is imported**, only its behavioural findings, each now a named test.
 ## Run it
 
 ```bash
-cargo test --workspace                 # 92 tests, host-native, no docker
+cargo test --workspace                 # 94 tests, host-native, no docker
 
 # models on the HOST (Metal). Docker on macOS has no GPU passthrough.
 overlays/local/llama-swarm.sh up       # 4 llama-servers, ports 8081-8084
 
-docker compose -f overlays/local/docker-compose.yml up -d   # node + 4 cats
+docker compose -f overlays/local/docker-compose.yml up -d   # 2 nodes + 4 cats
 curl -s localhost:9944/head
 curl -s localhost:9944/meta                          # genesis hash + spec/tx version
 # there is no more unauthenticated /call — every act is a signed extrinsic.
-# --rpc is the same `miot` binary (shipped as dist/miot), pointed at a real
-# node instead of driving an in-process chain:
+# --rpc is the same `miot` binary (shipped as dist/miot; `miot node` is the
+# other thing it can do) pointed at a real node instead of driving one:
 cargo run -p miot -- --rpc http://localhost:9944 --identity-seed 1 \
   --open "your question here"
-cargo run -p miot -- --rpc http://localhost:9944 --chat   # same REPL as in-process --chat, real signed lines
+cargo run -p miot -- --rpc http://localhost:9944 --repl   # interactive session, real signed lines
 cargo run -p miot -- --rpc http://localhost:9944 --clear  # fail every open task — new session, same chain
 docker compose -f overlays/local/docker-compose.yml logs -f
 curl -s localhost:9944/artifact/t1 | python3 -m json.tool
 ```
 
-Single-process simulation (no networking, much faster to iterate on):
-
-```bash
-cargo run -p miot                  # scripted, shows the recovery path
-cargo run -p miot -- --live --models "$(overlays/local/llama-swarm.sh spec)"
-cargo run -p miot -- --chat --models "$(overlays/local/llama-swarm.sh spec)"
-```
+**The hardcoded scripted-cats demo, `--live`, and in-process `--chat` this
+section used to show are gone** — merged out of `miot` (2026-09-22,
+alongside the `miot`+`kot`→`miot`+`kot` rename): the demo was
+redundant with `cargo test`'s own coverage, and `--live`/`--chat` simulated
+cats "talking" to each other, which was never actually true of the real
+architecture — the chain is the only channel between agents, always.
+`kot` (formerly `kot`) is a real cat's agentic loop against a real
+node; there's no in-process stand-in for it anymore.
 
 Akuma-shippable binaries:
 
@@ -62,9 +63,8 @@ overlays/local/build-akuma.sh          # dist/miot (5.1 MB), dist/storeprobe (0.
 | `miot-store` | block log on ParityDB, compaction-boundary rewind, leader-wins | 14 |
 | `miot-keys` | ed25519 identity: seeds for cats, the operator's SSH *public* key → `AccountId32`, hex wire encoding | 14 |
 | `miot-llm` | provider layer on `genai` (15 providers, GLM included) | — |
-| `miot-node` | the chain as a process: HTTP, real block lifecycle (`Executive`) on its own clock, `/submit` verifies before it dispatches, persists+replays via `miot-store` (`MIOT_DB`) | — |
-| `miot-cat` | one cat, signs its own extrinsics and talks to the node — a container today, or any process that can reach it (running on a Lima VM as of 2026-09-22, see below) | — |
-| `miot` | one binary (ships as `dist/miot`), five modes: scripted / `--live` / `--chat` (in-process) / `--rpc` (one-shot: open/say/clear against a real node) / `--rpc --chat` (the same REPL, real signed lines, replays history on start) | — |
+| `kot` | one cat's agentic loop, signs its own extrinsics and talks to a node — Polish for "cat" (renamed from `kot` 2026-09-22, once cat+node work converged into `miot` below and it needed its own name); a container today, or any process that can reach a node (running on a Lima VM, and on the real Akuma kernel via Firecracker, as of 2026-09-22 — `docs/TOPOLOGY.md`) | — |
+| `miot` | one binary (ships as `dist/miot`), two jobs, merged 2026-09-22 (formerly `miot` + a separate `miot`): `miot node` is the chain as a process — HTTP, real block lifecycle (`Executive`) on its own clock, `/submit` verifies before it dispatches, persists+replays via `miot-store` (`MIOT_DB`), compacts on `/clear`; anything else is an RPC client of one — one-shot (`--open`/`--say`/`--clear`) or `--repl` (an operator's interactive session, real signed lines, replays history on start). The old scripted-demo/`--live`/in-process-`--chat` modes were dropped, not merged. | — |
 
 **`miot-tasks` is the real thing.** Everything else hosts it. That is why the
 pallet is thin and why the same machine runs with or without a chain.
@@ -85,7 +85,7 @@ and the same runtime compiles to a blob.
 (domain string, genesis, nonce, length-prefixing) was written, tested, and
 deleted: `UncheckedExtrinsic` + the `frame-system` transaction extensions cover
 all of it plus mortality and spec-version binding, and it is now actually
-wired — `miot-node` runs `frame_executive::Executive::initialize_block` /
+wired — `miot` runs `frame_executive::Executive::initialize_block` /
 `apply_extrinsic` / `finalize_block` for real, which is also what makes
 `CheckGenesis`/`CheckMortality` mean something (they bind to `BlockHash`
 storage, which nothing populated before). What survived from the hand-rolled
@@ -105,9 +105,9 @@ refuses any account whose `providers`/`sufficients` are both zero — a gate
 fees nor balances, so nothing was ever going to trip it, and *every*
 signature, however correct, was refused with `InvalidTransaction::Payment`
 (read: not a fee error, a "this account doesn't exist yet" error). Fixed by
-having `miot-node` call `inc_providers` for every account in `MIOT_MEMBERS`
+having `miot` call `inc_providers` for every account in `MIOT_MEMBERS`
 (default `1,2,3,4,5`, the same seed convention as `MIOT_ROSTER`) at genesis —
-named `catnip` in `miot-node/src/main.rs`, because an account that hasn't had
+named `catnip` in `crates/miot/src/main.rs`, because an account that hasn't had
 any can't be nonce-checked. **Worth reconsidering later:** a minimal
 `pallet-balances` (zero-fee weight, or just used for its provider bookkeeping)
 might be a smaller surface than operator-curated membership lists, especially
@@ -150,7 +150,7 @@ itself carries. Verified by
 (`crates/miot-tasks/src/tests.rs`): runs a full lifecycle live, replays only
 the resulting effects into an untouched table, asserts field-for-field
 equality. `docs/PROTOCOL.md`'s tx/state/event section is the write-up; this
-is what makes wiring `miot-store` into `miot-node` (item 2, below) a matter
+is what makes wiring `miot-store` into `miot` (item 2, below) a matter
 of persisting+replaying the effect log rather than something to re-derive
 from raw transactions.
 
@@ -174,10 +174,10 @@ and checks a real `UncheckedExtrinsic` (signature, nonce, mortality, genesis
 and spec/tx version) before anything dispatches; artifacts stored and read
 back from chain state; five containers on a network with the chain ticking in
 its own process; four llama-servers; **ParityDB, wired in and proven,
-2026-09-22** — `miot-node` persists every block's effects and replays them
-on start (`MIOT_DB`, defaults to `miot-node.db`; the docker `node` service
+2026-09-22** — `miot` persists every block's effects and replays them
+on start (`MIOT_DB`, defaults to `miot.db`; the docker `node` service
 mounts a named volume at `/data`), verified both standalone (kill/restart a
-bare `miot-node`, `/events` and `/tasks` came back byte-identical) and
+bare `miot`, `/events` and `/tasks` came back byte-identical) and
 through `docker compose restart node` / `up -d --force-recreate node` — a
 task opened before either survived it. Practical upshot: **cats no longer
 need restarting when the node does** — `seq` numbering is continuous across
@@ -193,7 +193,7 @@ connected. The node never noticed it moved — which is the actual point of
 `docs/CLI.md` §5a and `overlays/local/README.md` Stage 1, now demonstrated
 rather than asserted.
 **a second node, replicated for real, 2026-09-22** — `node2` in
-`overlays/local/docker-compose.yml` runs `miot-node` as `MIOT_ROLE=replica`,
+`overlays/local/docker-compose.yml` runs `miot` as `MIOT_ROLE=replica`,
 pulling `node`'s block log over HTTP; `rewind_for_fork` has now run against a
 real disagreement, not a synthetic one (item 5, above, has the story). Six
 containers now, not five.
@@ -295,10 +295,10 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
 
 1. ~~**Signed extrinsics.**~~ **Done, 2026-09-21.** `AccountId` is
    `AccountId32`; `/call` is gone; `/submit` takes a signed
-   `UncheckedExtrinsic` and `miot-node` verifies it for real through
-   `frame_executive::Executive` before dispatch. `miot-cat` and `miot --rpc`
+   `UncheckedExtrinsic` and `miot` verifies it for real through
+   `frame_executive::Executive` before dispatch. `kot` and `miot --rpc`
    both sign through the shared `miot_runtime::client::sign`.
-2. ~~**Wire `miot-store` into `miot-node`.**~~ **Done, 2026-09-22.** Persists
+2. ~~**Wire `miot-store` into `miot`.**~~ **Done, 2026-09-22.** Persists
    every block's effects (not raw extrinsics — `TaskTable::apply`, the
    event-sourcing decision above, is what made replay a matter of folding a
    log rather than re-deriving one); replays on start. Verified: standalone
@@ -306,14 +306,14 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
    reproduce identical `/events`/`/tasks`. Prerequisite for item 5, below.
 3. ~~**Run `dist/storeprobe` on an Akuma guest.**~~ **Superseded, 2026-09-22
    — the bigger claim turned out true first.** Rather than the diagnostic
-   probe, the *full* `miot-node` was run directly on the actual Akuma kernel
+   probe, the *full* `miot` was run directly on the actual Akuma kernel
    — not the real `akuma` host below, but `akuma-guest`, a Firecracker
    microVM nested inside the Lima VM `fc` (`../akuma/overlays/
    devbox-firecracker/`). Real multi-threaded tokio, real axum HTTP server,
    real ParityDB (sparse mmap'd files — the exact thing `storeprobe` exists
    to test, now proven live instead of by a diagnostic stand-in), real
    `reqwest` client — running unmodified, as a herd-managed service
-   (`/etc/herd/enabled/miot-node.conf`, auto-starts on boot same as `sshd`).
+   (`/etc/herd/enabled/miot.conf`, auto-starts on boot same as `sshd`).
    Verified end to end: a task opened against the real docker `node` showed
    up in this node's `/tasks` a few seconds later, over the same
    primary/replica HTTP protocol every other node in the mesh speaks.
@@ -321,12 +321,20 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
    one binary, a specific syscall surface — not a general claim about
    Akuma). Item 4 below is still genuinely open: this ran on a *Firecracker
    guest*, not the real physical `akuma` host.
+   **Correction, same day: not durably up.** ParityDB panics on this guest
+   once its index needs to grow past some threshold (`docs/TOPOLOGY.md` has
+   the exact panic and what was ruled out chasing it). `node4` runs for a
+   while after a fresh store, then crashes and stays down. The claim above
+   — real tokio/axum/ParityDB/reqwest working together on Akuma — is still
+   true and still the first time any of this ran there; "durable, long-
+   running node" is not yet also true, and isn't being chased further right
+   now.
 4. **Ship `dist/miot` to Akuma** and run a cat there against a host model.
    Needs a host `llama-server` reachable from that box — today
    `llama-swarm.sh` binds `127.0.0.1` only, so this also needs a deliberate
    decision about exposing an inference port on the LAN, not just a bind-flag
    change.
-5. ~~**A second node.**~~ **Done, 2026-09-22.** `miot-node` gained a role
+5. ~~**A second node.**~~ **Done, 2026-09-22.** `miot` gained a role
    (`MIOT_ROLE=primary|replica`) rather than a full P2P/gossip layer — a
    replica pulls its peer's block log over two new HTTP endpoints
    (`GET /chain/head`, `GET /chain/blocks?from=N&limit=M`) and folds new
@@ -340,7 +348,7 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
    Verified live: `node2` (`overlays/local/docker-compose.yml`) mirrors
    `node`'s `/tasks`/`/events` within one sync interval and survives its own
    restart. More importantly, `rewind_for_fork` finally ran against a real
-   disagreement rather than a synthetic one — a standalone third `miot-node`
+   disagreement rather than a synthetic one — a standalone third `miot`
    was pointed at `node`'s peer as a replica, killed, restarted independently
    as its own primary, given a submit that only it received (diverging its
    log), then pointed back at `node` as a replica again. It printed `sync:

@@ -2,9 +2,10 @@
 
 What's actually running right now, on one operator's machine, across every
 virtualization boundary that machine has. Not aspirational — every node
-below is up and verified converged as of this date (see HANDOFF.md item 5
-and its "real fork, real reconciliation" writeup for how each replica was
-proven, not just started).
+below was verified converged as of this date (see HANDOFF.md item 5 and its
+"real fork, real reconciliation" writeup for how each replica was proven,
+not just started) — **except `node4`, which is intermittent, not durably
+up; see its own section below before assuming it's currently running.**
 
 ```
 macOS host
@@ -33,10 +34,11 @@ macOS host
 
             node4 (replica) ── same aarch64-unknown-linux-musl binary
                                 as node3, running as a herd service
-                                (/etc/herd/enabled/miot-node.conf,
+                                (/etc/herd/enabled/miot.conf,
                                 restart=true) — Akuma's own supervisor
                                 auto-starts it on boot, same as sshd
-                                and httpd.
+                                and httpd. INTERMITTENT — see below,
+                                not durably up.
 ```
 
 Every replica (`node2`, `node3`, `node4`) pulls from `node` the same way,
@@ -63,9 +65,28 @@ later.
 
 **Caveat, stated plainly**: this is one boot, one binary, one narrow set of
 syscalls actually exercised (thread spawn, TCP listen/accept/connect, mmap'd
-file I/O, basic file read/write). It is evidence the surface `miot-node`
+file I/O, basic file read/write). It is evidence the surface `miot`
 needs works *on this build*, not a general claim about Akuma — the same
 caution `HANDOFF.md` already applies to every Akuma claim applies here too.
+
+**Known limitation, found live, not chased to root cause**: ParityDB panics
+on `akuma-guest` once its index needs to grow past some threshold —
+`thread 'main' panicked ... parity-db-0.5.6/src/index.rs:237: range start
+index 512 out of range for slice of length 1`. Reproduced twice: once
+syncing ~800 blocks of history from scratch, once tailing normally after
+starting from a pre-populated store copied over from `fc` (which only
+delayed it, not avoided it) — so it's about index growth itself, not the
+catch-up path or the `/tmp` vs `/var/lib` question investigated along the
+way (ruled out: both are the same `ext2` root, `mount` confirms no separate
+tmpfs). `node4` is therefore **intermittent, not durably up** — it works
+for a while after a fresh DB, then crashes once enough new blocks
+accumulate, and `restart=true`/`max_retries=0` in its herd config does not
+bring it back (crashes again on the regrown index). Not investigated
+further per an explicit call to stop chasing it; a real fix would mean
+either bounding ParityDB's index growth (compaction running often enough
+that it never needs to grow this far) or finding out what Akuma's `ext2`/
+mmap implementation actually does differently once an index page beyond
+the first needs allocating.
 
 ## Naming, so it doesn't become a problem
 

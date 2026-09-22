@@ -20,20 +20,31 @@ read that first, it is kept current and this file does not repeat it.
   `parameter_types!`, tuned against measured LLM turn lengths, not against
   `miot-primitives`' generic defaults.
 - `crates/miot-store` — the chain's block log on ParityDB: append, compact,
-  `rewind_for_fork`. Built and tested; **not yet wired into `miot-node`**,
-  which currently keeps state in memory only.
+  `rewind_for_fork`. Wired into `miot node` since HANDOFF item 2 — every
+  block's effects persist and replay on restart, and `compact` fires for
+  real on root's `/clear`.
 - `crates/miot-keys` — an account *is* an ed25519 public key
   (`sp_runtime::AccountId32`); `account_from_ssh` reads the operator's
-  existing `authorized_keys` line so root needs no new secret. Signature
-  verification and address recovery are not yet wired into any wire path —
-  see "Known gaps" below.
+  existing `authorized_keys` line so root needs no new secret. Address
+  recovery is wired into the wire path since HANDOFF item 1 — see "Known
+  gaps" below for what's still not.
 - `crates/miot-llm` — provider layer on `genai`.
-- `crates/miot-node` — the chain as an HTTP process, block loop on its own
-  clock. `AccountId = u64` today; calls arrive as JSON naming an account
-  and are trusted, not verified.
-- `crates/miot-cat` — one cat, one container/process, talks to the node.
-- `crates/miot` — single-process harness (scripted / `--live` / `--chat`) and,
-  via `--rpc`, a signing client of a real node. Ships as `dist/miot`.
+- `crates/kot` — one cat's agentic loop, one process, talks to a node over
+  the network. Polish for "cat" (*Miot Kotów*, README's own etymology) —
+  named this, not `miot-cat`, once cat and node converged into one binary
+  (below) and needed a name that wasn't just "the other one." No chat mode
+  of its own; nothing talks to it interactively.
+- `crates/miot` — two jobs in one binary, ships as `dist/miot`:
+  `miot node` is the chain as an HTTP process, block loop on its own clock,
+  real signed `UncheckedExtrinsic`s verified through `Executive` (see
+  HANDOFF item 1 — the `AccountId = u64`/trusted-JSON description this line
+  used to have is long since fixed); anything else is an RPC client of one
+  — one-shot (`--open`/`--say`/`--clear`) or, with `--repl`, an operator's
+  interactive session against a real node. The hardcoded scripted-cats demo
+  and `--live`/in-process `--chat` that used to live in a separate
+  `crates/miot`+`crates/miot-node` split were dropped in the merge —
+  redundant with `cargo test`'s own coverage, or (for `--live`/`--chat`)
+  simply no longer useful once `kot` existed for real.
 - `miot-cli` does not exist yet — `docs/CLI.md` is its design of record
   (Phase 3), including how a client resolves `@name` tags against the
   on-chain roster and submits over RPC without holding any local state.
@@ -55,13 +66,20 @@ read that first, it is kept current and this file does not repeat it.
 
 ## Known gaps (don't assume these are fixed without checking the code)
 
-- **No signatures on the wire.** `miot-node`'s `/call` takes a JSON `who: u64`
-  field and trusts it — `ensure_signed` only checks *an* origin was signed,
-  not that the HTTP caller is who they claim. `miot-keys` proves address
-  recovery in isolation but nothing calls it yet. This is HANDOFF's gap #1.
-- **`miot-store` is wired to nothing.** The node's state is in-memory only.
-- **No consensus.** One node owns the chain; `rewind_for_fork` has never run
-  against a real disagreement.
+- **No OpenSSH private-key signing.** `miot-keys` reads the operator's real
+  `~/.ssh` *public* key, but nothing here parses a private key to sign with
+  it — every cat and `miot --rpc` today signs with a seed the operator
+  separately told the node is trusted (`MIOT_MEMBERS`), not the operator's
+  own identity.
+- **No election, no automatic failover.** `miot node`'s role
+  (primary/replica) is an operator-set env var, changed by restarting the
+  process. HANDOFF item 5's Part 2 (an N-way mesh with real leader
+  election, in progress) is what closes this.
+- **Node and agent-loop-in-the-same-process (`docs/CLI.md` §5a: cat=node, no
+  privileged endpoint) is not built.** `miot node` and `kot` (an agent loop)
+  are still separate processes/binaries as of this writing; only the
+  `--rpc` client's *code* was merged into `miot`, not the "a cat's agent
+  loop runs inside the node process" mode itself.
 
 ## Build, run, test
 
@@ -78,17 +96,29 @@ overlays/local/build-akuma.sh          # dist/miot, dist/storeprobe — see targ
 
 ## Real infrastructure available to this project
 
-Two separate things both called "Akuma guest" exist in this project's docs —
-don't conflate them:
+Three separate things get called "Akuma" in this project's docs — don't
+conflate them, and use these exact names going forward (a previous session
+briefly reused `fc` for two of them, which was confusing enough to correct
+mid-conversation):
 
-- **Lima VM `fc`** (`limactl list`) — aarch64, `vz` — the Firecracker/KVM host
-  for `overlays/local/README.md` Stage 2 (agents as microVMs, one TAP each).
+- **Lima VM `fc`** (`limactl list`) — aarch64, `vz` nested virt, plain
+  Linux. Both the Firecracker/KVM host for the next item, and where a cat
+  can run directly in its own Linux userspace (`node3`/`kuro` in
+  `docs/TOPOLOGY.md` do this) — two different uses of the same VM, not the
+  same thing.
+- **`akuma-guest`** — the actual Akuma kernel (not Linux), booted as a
+  Firecracker microVM *nested inside* `fc` (`../akuma/overlays/
+  devbox-firecracker/`). `docs/TOPOLOGY.md`'s `node4` runs here, verified
+  live, as a herd-managed service — but that's one boot, one binary, a
+  specific syscall surface exercised; not a general claim about Akuma.
 - **The real `akuma` host** — an ssh alias (`ssh akuma`, port 2222, key in
   `~/.ssh/config`) to actual hardware ("the dumpster", an HP box) running
-  Kirill's own kernel, *not* stock Linux: `uname -a` reports
-  `x86_64 GNU/Linux` but there's no `/etc/passwd`, `whoami` fails, and the
-  pthread/mmap/socket surface anything beyond a static binary needs is
-  **unverified** (`docs/FLEET.md` "Honest gaps").
+  the same Akuma kernel *on real hardware*, not nested in anything:
+  `uname -a` reports `x86_64 GNU/Linux` but there's no `/etc/passwd`,
+  `whoami` fails, and the pthread/mmap/socket surface anything beyond a
+  static binary needs is **unverified** (`docs/FLEET.md` "Honest gaps") —
+  `akuma-guest` running the same syscall surface doesn't settle this one;
+  it's a different machine.
 
 **Target mismatch to fix before item 3/4 of HANDOFF's roadmap:**
 `overlays/local/build-akuma.sh` cross-compiles for

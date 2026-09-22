@@ -27,7 +27,7 @@
 services:
   node:
     image: akuma-miot:net
-    command: miot-node
+    command: miot node
     environment:
       MIOT_PORT: "9944"
       MIOT_DB: /data/miot.db
@@ -39,12 +39,12 @@ services:
   # A passive read replica — HANDOFF item 5. No cat points at it; its only
   # job is to prove `node`'s block log replicates over HTTP. It pulls
   # `node`'s blocks itself (`MIOT_ROLE=replica`/`MIOT_PEER`, see
-  # `crates/miot-node/src/main.rs`'s `sync_once`) rather than being told
+  # `crates/miot/src/main.rs`'s `sync_once`) rather than being told
   # about them, and refuses `/submit` — read from it (`curl
   # localhost:9945/tasks`), don't write to it.
   node2:
     image: akuma-miot:net
-    command: miot-node
+    command: miot node
     depends_on: [node]
     environment:
       MIOT_PORT: "9944"
@@ -58,7 +58,7 @@ services:
 
   mimi:
     image: akuma-miot:net
-    command: miot-cat
+    command: kot
     depends_on: [node]
     extra_hosts: ["host.docker.internal:host-gateway"]
     environment:
@@ -71,7 +71,7 @@ services:
 
   tama:
     image: akuma-miot:net
-    command: miot-cat
+    command: kot
     depends_on: [node]
     extra_hosts: ["host.docker.internal:host-gateway"]
     environment:
@@ -84,7 +84,7 @@ services:
 
   kuro:
     image: akuma-miot:net
-    command: miot-cat
+    command: kot
     depends_on: [node]
     extra_hosts: ["host.docker.internal:host-gateway"]
     environment:
@@ -97,7 +97,7 @@ services:
 
   sora:
     image: akuma-miot:net
-    command: miot-cat
+    command: kot
     depends_on: [node]
     extra_hosts: ["host.docker.internal:host-gateway"]
     environment:

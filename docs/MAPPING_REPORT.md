@@ -619,7 +619,7 @@ the entire boundary.
 | `miot-primitives` | ✅ | ✅ | ✅ | ✅ | ✅ |
 | `pallet-litter` | ✅ | ✅ | ✅ | ✅ builds | ✅ |
 | `miot-runtime` | ✅ | ✅ | ✅ | — | ✅ |
-| `miot-node` | ✗ | ✅ | — | ⚠️ experiment (§5.2) | ✅ |
+| `miot` | ✗ | ✅ | — | ⚠️ experiment (§5.2) | ✅ |
 | `miot-chain`, `-bodies`, `-llm`, `-tools`, `-agent`, `-cli` | ✗ | ✅ | — | ✅ cross-compiled | ✅ |
 
 Standard preamble on the three:
@@ -695,7 +695,7 @@ succeeded. Cross-compile from the host.
 
 ### 5.2 The local testbed — `overlays/local/`
 
-**Stage 1 is plain Linux in one Lima VM.** Three `miot-node` validators, one
+**Stage 1 is plain Linux in one Lima VM.** Three `miot` validators, one
 `llama-server`, N `miot-cli` agents, all ordinary processes over localhost. No
 Firecracker, no TAPs, no disk images, no Akuma.
 
@@ -817,7 +817,7 @@ drill — before an Akuma guest is involved at all.
 |---|---|---|
 | **0** | `miot-primitives` + `miot-tasks` — the lifecycle as a pure state machine, §1.1 encoded as behaviour. | Every finding in §1.1 has a named test, `cargo test` green on the host. |
 | **1** | `pallet-litter` — thin FRAME wrapper over `miot-tasks`, against the §4.1 checklist. Wired to nothing. | The same behaviours pass through `TestExternalities`. |
-| **2** | `miot-runtime` + `miot-node` — minimal template, AURA + GRANDPA. First wasm. | 3 validators producing and finalizing locally. |
+| **2** | `miot-runtime` + `miot` — minimal template, AURA + GRANDPA. First wasm. | 3 validators producing and finalizing locally. |
 | **3** | `miot-chain` (subxt) + `miot-llm` + a minimal `miot-agent`. | **First end-to-end:** one agent claims from chain events, runs a turn, submits `done`. |
 | **4** | `miot-tools` (async + aggregator) + `miot-bodies` (local) + artifacts. | A parent goes plan → claim → done → clear → artifact across 3 agents; the artifact is readable markdown out of chain state. |
 | **5** | `overlays/local` Stage 1 + the failure drills. | Kill an agent mid-claim, partition one, stall one past its lease, kill a validator — the findings hold under all four. |
@@ -853,8 +853,8 @@ have required.
    same condition. Keep the answer verbatim: **fail fast with a clear message,
    never hang the turn.**
 6a. **Wayward should also cover the LLM link, not just the chain — noted
-    2026-09-22, not built.** Today `miot-cat` prints `[name] llm error: ...`
-    when a turn's model call fails (`crates/miot-cat/src/main.rs`, the `Err(e)`
+    2026-09-22, not built.** Today `kot` prints `[name] llm error: ...`
+    when a turn's model call fails (`crates/kot/src/main.rs`, the `Err(e)`
     arm of the `cat.llm.turn(...)` match) and just moves on to the next poll —
     nothing tells the rest of the litter anything changed, so a human watching
     only the chain log sees silence, not a diagnosis, and an assignment sits
