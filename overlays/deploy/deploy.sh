@@ -231,7 +231,12 @@ cmd_up() {
       put "$a" "$HOME/.akuma/kot/$a.seed" /root/kot/id_ed25519.seed
       on "$a" "chmod 600 /root/kot/id_ed25519.seed"
     fi
-    [ "$(account_of "$a")" = "$(grep -o "$a=pub:[0-9a-f]*" "$MESH_ENV" | cut -d: -f2)" ] \
+    # mesh.env's MIOT_ROSTER keys by persona name (mimi, sora, ...), not by
+    # this script's agent id — relabeled 2026-09-22 (HANDOFF item 6) without
+    # updating this check, so it always compared against an empty grep and
+    # would have refused every fcguest identity, matching or not.
+    local persona; persona="$(field "$a" 5)"
+    [ "$(account_of "$a")" = "$(grep -o "$persona=pub:[0-9a-f]*" "$MESH_ENV" | cut -d: -f2)" ] \
       || die "$a: identity in the guest does not match mesh.env"
     # Only the Lima guest needs a relay: Lima exposes only sockets listening
     # in fc. ryzen-akuma-amd64 has a LAN address of its own.

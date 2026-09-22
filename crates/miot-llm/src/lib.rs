@@ -176,7 +176,11 @@ pub fn task_tools() -> Vec<Tool> {
             .with_schema(serde_json::json!({
                 "type": "object",
                 "properties": {
-                    "task": {"type": "string", "description": "task id, e.g. t1 or t1.2"},
+                    "task": {"type": "string",
+                             "description": "the exact id you were given: a PARENT id like t1 \
+                                              (only for status=artifact) or a SUB-TASK id like \
+                                              t1.2 (for claim/done/failed/clear/reopen) — never \
+                                              the parent id where a sub-task id is asked for"},
                     "status": {"type": "string",
                                "enum": ["claim","done","failed","clear","reopen","artifact"]},
                     "text": {"type": "string",

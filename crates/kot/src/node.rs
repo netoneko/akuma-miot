@@ -1009,8 +1009,9 @@ impl Running {
 pub async fn start(cfg: NodeConfig) -> Result<Running, String> {
     let node = Node::open(&cfg)?;
     println!(
-        "[node] {} on {}:{}  root={}  leader={}  peers={}  block={}ms",
+        "[node] {} v{} on {}:{}  root={}  leader={}  peers={}  block={}ms",
         cfg.name,
+        crate::version::VERSION,
         cfg.bind,
         cfg.port,
         miot_keys::short(&cfg.root),
@@ -1199,6 +1200,14 @@ async fn tasks(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
                     "opened_by": miot_keys::to_hex(&t.opened_by),
                     "opened_at": t.opened_at,
                     "text": t.text,
+                    // A sub-task's submitted result — the leader needs this
+                    // to decide clear-vs-reopen; it used to be missing here
+                    // entirely, which is why the agent loop's
+                    // ClearanceNeeded prompt had nothing to show it.
+                    "outcome": t.outcome.as_ref().map(|o| serde_json::json!({
+                        "kind": if o.failed() { "failed" } else { "done" },
+                        "text": o.text(),
+                    })),
                 })
             })
             .collect::<Vec<_>>()
@@ -1213,6 +1222,7 @@ async fn meta(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
         "genesis_hash": hex::encode(genesis_hash.as_bytes()),
         "spec_version": VERSION.spec_version,
         "tx_version": VERSION.transaction_version,
+        "kot_version": crate::version::VERSION,
     }))
 }
 

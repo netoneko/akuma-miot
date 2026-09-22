@@ -26,6 +26,20 @@ use std::collections::{HashMap, HashSet};
 
 use crate::common::{parse_task, Roster};
 
+/// Appended to every persona. Found live, 2026-09-23: GLM's tool calls were
+/// landing as `WrongKind`/`SubtasksOutstanding`/no-call-at-all often enough
+/// to break a run. Two of the three causes are id confusion (a small model
+/// substituting a parent id for a sub-task id or back) and simply not
+/// calling a tool — both are cheap to head off with an explicit rule rather
+/// than left implicit in each one-off prompt.
+const AGENT_RULES: &str = "\n\nRules:\n\
+- A task id like \"t1\" names a whole task; \"t1.2\" names one sub-task of \
+it. Use exactly the id you were given for the action you are taking — never \
+shorten a sub-task id to its parent, and never use a parent id where a \
+sub-task id is asked for.\n\
+- Always respond by calling exactly one of the tools offered. Never reply \
+with plain text alone.";
+
 pub struct AgentConfig {
     pub name: String,
     pub identity: Identity,
@@ -64,6 +78,13 @@ impl Cat {
             Ok(r) => r.json().await.unwrap_or_default(),
             // A node that isn't answering isn't an error to hang on. Fail
             // fast, keep polling — the litter's WAYWARD rule.
+            Err(_) => Vec::new(),
+        }
+    }
+
+    async fn tasks(&self) -> Vec<serde_json::Value> {
+        match self.http.get(format!("{}/tasks", self.node)).send().await {
+            Ok(r) => r.json().await.unwrap_or_default(),
             Err(_) => Vec::new(),
         }
     }
@@ -113,7 +134,7 @@ impl Cat {
 
     /// Build the prompt for one woken event. The parent question is carried
     /// into every one: a turn is stateless, so the chain is the only memory.
-    fn prompt(&self, e: &Entry, question: &str) -> Option<(String, Vec<miot_llm::Tool>)> {
+    async fn prompt(&self, e: &Entry, question: &str) -> Option<(String, Vec<miot_llm::Tool>)> {
         let t = e.effect.get("t")?.as_str()?;
         let task = e.effect.get("task").and_then(|v| v.as_str()).unwrap_or("t1");
         let workers = || {
@@ -144,11 +165,54 @@ impl Cat {
                      Call TaskPlan on {task} now. One assignment each to: {}. All in ONE call.",
                     workers()
                 ),
-                "ClearanceNeeded" => format!(
-                    "[clearance-needed: {task}]\nThe question: {question}\n\n\
-                     Results are in. For EACH sub-task call TaskUpdate with status=clear if it \
-                     helps answer the question, or status=reopen with text saying why not."
-                ),
+                "ClearanceNeeded" => {
+                    // Used to tell the leader "results are in" without ever
+                    // saying which sub-tasks, what they returned, or what id
+                    // to call TaskUpdate with — the model had nothing to act
+                    // on but the parent id in this header, which is exactly
+                    // the id `clear`/`reopen` refuse (`Error::WrongKind`).
+                    // Observed live, 2026-09-23: WrongKind and
+                    // SubtasksOutstanding refusals, and turns with no tool
+                    // call at all, tracing back to this gap.
+                    let rows = self.tasks().await;
+                    let prefix = format!("{task}.");
+                    let lines: Vec<String> = rows
+                        .iter()
+                        .filter(|r| r.get("id").and_then(|v| v.as_str()).is_some_and(|id| id.starts_with(&prefix)))
+                        .filter(|r| r.get("status").and_then(|v| v.as_str()) == Some("AwaitingClearance"))
+                        .map(|r| {
+                            let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                            let holder = r
+                                .get("holder")
+                                .and_then(|v| v.as_str())
+                                .and_then(|h| miot_keys::from_hex(h).ok())
+                                .map(|a| self.roster.name_of(&a))
+                                .unwrap_or_else(|| "someone".into());
+                            let (kind, text) = r
+                                .get("outcome")
+                                .and_then(|o| Some((o.get("kind")?.as_str()?, o.get("text")?.as_str()?)))
+                                .unwrap_or(("done", ""));
+                            let text: String = if text.chars().count() > 600 {
+                                text.chars().take(600).chain(['…']).collect()
+                            } else {
+                                text.to_string()
+                            };
+                            format!("- {id} ({holder}, {kind}): {text}")
+                        })
+                        .collect();
+                    let list = if lines.is_empty() {
+                        "(none outstanding right now — check /tasks before acting)".to_string()
+                    } else {
+                        lines.join("\n")
+                    };
+                    format!(
+                        "[clearance-needed: {task}]\nThe question: {question}\n\n\
+                         Sub-tasks awaiting your decision:\n{list}\n\n\
+                         For EACH one listed above, call TaskUpdate using ITS OWN id shown above \
+                         (never {task}, the parent) with status=clear if it helps answer the \
+                         question, or status=reopen (with text saying why not) if it doesn't."
+                    )
+                }
                 "ArtifactNeeded" => format!(
                     "[artifact-needed: {task}]\nTHE QUESTION YOU MUST ANSWER:\n{question}\n\n\
                      Every sub-task is cleared. Call TaskUpdate with task={task}, \
@@ -235,7 +299,7 @@ pub async fn run(cfg: AgentConfig) {
         node: cfg.node,
         http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(900)).build().unwrap(),
         llm: cfg.llm,
-        persona: cfg.persona,
+        persona: format!("{}{AGENT_RULES}", cfg.persona),
         roster: cfg.roster,
     };
     let name = cat.name.clone();
@@ -305,7 +369,7 @@ pub async fn run(cfg: AgentConfig) {
             if !seen.insert(e.seq) {
                 continue;
             }
-            let Some((prompt, tools)) = cat.prompt(&e, &question) else { continue };
+            let Some((prompt, tools)) = cat.prompt(&e, &question).await else { continue };
             let t = e.effect.get("t").and_then(|v| v.as_str()).unwrap_or("");
             println!("[{name}] block {} {t} — thinking", e.block);
             match cat.llm.turn(&cat.persona, &prompt, tools).await {

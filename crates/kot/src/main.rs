@@ -26,7 +26,7 @@ use miot_runtime::RuntimeCall;
 const DEV_ROSTER: &str = "root=1,mimi=2,tama=3,kuro=4,sora=5";
 
 #[derive(Parser)]
-#[command(name = "kot", version, about = "The litter's binary: a mesh node + agent loop (`kot run`), or a client of any node")]
+#[command(name = "kot", version = kot::version::VERSION, about = "The litter's binary: a mesh node + agent loop (`kot run`), or a client of any node")]
 struct Cli {
     /// A node to talk to. Falls back to each of --nodes in turn.
     #[arg(long, env = "MIOT_NODE", global = true)]

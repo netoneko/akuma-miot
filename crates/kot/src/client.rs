@@ -477,7 +477,11 @@ pub async fn repl(mut c: Client) {
         let Ok(Some(line)) = lines.next_line().await else { break };
         let line = line.trim().to_string();
         match line.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((line.as_str(), "")) {
-            ("" | "/quit" | "/exit", _) => break,
+            ("/quit" | "/exit", _) => break,
+            // Bare Enter: re-prompt, don't quit. `next_line()` returning
+            // `Ok(None)` (real EOF, e.g. piped input or Ctrl+D) still exits
+            // via the `let else` above.
+            ("", _) => {}
             ("/clear", _) => {
                 c.submit(RuntimeCall::Litter(pallet_litter::Call::clear_all {})).await;
             }
