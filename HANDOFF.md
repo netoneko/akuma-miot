@@ -48,6 +48,11 @@ Akuma-shippable binaries:
 
 ```bash
 overlays/local/build-akuma.sh          # dist/miot (5.1 MB), dist/storeprobe (0.8 MB)
+                                       # aarch64 musl. For the x86_64 hosts (ryzen, the
+                                       # real akuma box) build the same two -p miot -p
+                                       # miot-store binaries with x86_64-linux-musl-gcc +
+                                       # rustup target x86_64-unknown-linux-musl — see
+                                       # docs/TOPOLOGY.md (no script for it yet).
 ```
 
 ---
@@ -192,11 +197,30 @@ toolchain `build-akuma.sh` already used, copied onto the VM's own disk with
 connected. The node never noticed it moved — which is the actual point of
 `docs/CLI.md` §5a and `overlays/local/README.md` Stage 1, now demonstrated
 rather than asserted.
-**a second node, replicated for real, 2026-09-22** — `node2` in
-`overlays/local/docker-compose.yml` runs `miot` as `MIOT_ROLE=replica`,
-pulling `node`'s block log over HTTP; `rewind_for_fork` has now run against a
-real disagreement, not a synthetic one (item 5, above, has the story). Six
-containers now, not five.
+**a second node, replicated for real, 2026-09-22** — the replica role moved
+off docker the same day it was born there: `node2` now runs as a bare
+`miot` on **ryzen** (192.168.1.126, systemd `miot-node2.service`,
+`MIOT_ROLE=replica MIOT_PEER=http://<mac>:9944`), cross-compiled with the
+x86_64 twin of `build-akuma.sh`'s aarch64 toolchain. Verified converged
+(`/tasks`/`/events` byte-identical; a live signed `--say` replicated within
+one sync interval). The docker `node2` container was stopped, removed and
+deleted from the compose file — one replica identity, not two running under
+it. `docs/TOPOLOGY.md` has the details.
+**a fifth node, on the real akuma hardware, 2026-09-22 — but not durably.**
+`node5` (`ssh akuma`, the physical Akuma-kernel box) runs a *fresh-genesis
+primary* of its own (not migrated into mac's log), from the same
+x86_64-unknown-linux-musl binary, transferred over busybox `wget` + HTTP.
+Fresh boot works end to end (tokio workers, HTTP, ticking, a signed
+extrinsic landing and persisting) — but ParityDB hits a wall the moment it
+needs a **writable `MAP_SHARED` file mapping**: reopen over an existing DB
+exits with `os error 38`, and a bare-syscall probe of exactly that mmap
+shape **segfaults**. `storeprobe` stages 1–5 pass there; stage 6 (reopen)
+is where it dies. Repointing the box at mac's primary as a replica wedged
+it mid-catch-up instead (threads `R` with zero CPU, HTTP never bound).
+All of this — including the root cause, stated in ../akuma's own
+`sys_mmap` doc comment — is written up in `docs/TOPOLOGY.md`'s `node5`
+section. First akuma-miot contact with the physical box; `storeprobe`
+finally earned its keep.
 **real compaction, 2026-09-22** — `Store::compact` fires on root's `/clear`
 (a genuine snapshot of the whole storage trie via `sp_io::TestExternalities`'s
 own `into_raw_snapshot`/`from_raw_snapshot`, not a hand-rolled subset); a
@@ -214,10 +238,14 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
   a dead primary and promotes a replica on its own. Fine for one operator's
   swarm; would need real work for anything else. (In progress this session —
   Part 2 of item 5's plan: an N-way mesh with real leader election.)
-- **Akuma-on-the-real-hardware is still untested.** `docs/TOPOLOGY.md`'s
-  `node4` runs on a *Firecracker guest* nested in a Lima VM, not the
-  physical `akuma` box (`ssh akuma`) — item 4, below, is unchanged by this.
-  `dist/storeprobe` still exists and still hasn't been run anywhere.
+- **Akuma-on-the-real-hardware: partially tested, not durable.** `node5`
+  (above) now *runs* on the physical `akuma` box — fresh boot verified —
+  but a restart over a grown ParityDB is fatal (writable `MAP_SHARED` file
+  mmap refused by the kernel; `docs/TOPOLOGY.md` `node5` section). `node4`
+  on the Firecracker guest remains intermittent for a different reason
+  (index-growth panic). `storeprobe` and the newer `mmapprobe`
+  (`crates/miot-store/src/bin/mmapprobe.rs`) are the two diagnostics; both
+  have now actually run on the real host.
 - **No OpenSSH private-key signing.** `miot-keys` reads the operator's
   *public* key (`account_from_ssh`) but cannot sign with the matching private
   one — nothing here has parsed an OpenSSH private key file. Signing as the
@@ -289,6 +317,19 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
   changed between the directive being issued and the reply landing — `curl
   .../tasks` or `.../events` will show it.
 
+- **Akuma refuses writable `MAP_SHARED` file mappings — and it costs more
+  than an errno.** Stated as a deliberate gap in ../akuma's `sys_mmap` doc
+  comment; observed from here as a ParityDB reopen failing with
+  `os error 38` and a raw probe of the same mmap shape **segfaulting**
+  (2026-09-22, real `akuma` host). Any "just restart the node" story on
+  Akuma is dead until this changes or `miot-store` grows a no-mmap
+  fallback. Also: restarting a process on akuma leaves zombies (nothing
+  reaps) — `ps` there fills with dead `miot node` entries; cosmetic, but
+  don't read them as live.
+- **A stale `python3 -m http.server` on the mac squatted port 8123** and
+  served 404s that looked like a wrong URL. `lsof -i :PORT -sTCP:LISTEN`
+  + `ps -p <pid> -o command=` before blaming the client side.
+
 ---
 
 ## Next, in order
@@ -330,10 +371,16 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
    running node" is not yet also true, and isn't being chased further right
    now.
 4. **Ship `dist/miot` to Akuma** and run a cat there against a host model.
-   Needs a host `llama-server` reachable from that box — today
-   `llama-swarm.sh` binds `127.0.0.1` only, so this also needs a deliberate
-   decision about exposing an inference port on the LAN, not just a bind-flag
-   change.
+   ~~Needs a host `llama-server` reachable from that box~~ — updated
+   2026-09-22: the *node* now runs there (`node5`, fresh genesis, see
+   "What is real"), and the x86_64-unknown-linux-musl build + busybox-wget
+   transfer path is proven. What's still open for a *cat* on akuma is
+   unchanged (an exposed inference port decision) **plus** the store wall:
+   a long-running cat is fine (no ParityDB in `kot`), but anything that
+   restarts the akuma node over a grown DB dies — see `docs/TOPOLOGY.md`.
+   Remaining genuinely-open question on the box: nothing yet exercises the
+   akuma host's `reqwest`-as-client path for long (the replica sync wedged
+   before it could).
 5. ~~**A second node.**~~ **Done, 2026-09-22.** `miot` gained a role
    (`MIOT_ROLE=primary|replica`) rather than a full P2P/gossip layer — a
    replica pulls its peer's block log over two new HTTP endpoints

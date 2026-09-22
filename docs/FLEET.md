@@ -60,11 +60,13 @@ GGUF sources (verified against the HF API before download, not guessed):
 - **akuma isn't a normal Linux userland — checked, not assumed.** `uname -a`:
   `Akuma akuma 0.0.8 d565985c-release-smp-shared x86_64 GNU/Linux`. This is
   Kirill's own kernel, not stock Linux. `whoami` fails (`unknown uid 0`, no
-  `/etc/passwd`) — the userland is minimal. Whether it has the pthread/mmap/
-  socket surface `llama-server` needs is **unverified**, on top of the ~10 GB
-  budget already being spoken for by the Rust toolchain during kernel builds.
-  Another reason local inference on akuma stays a someday-maybe, not that RAM
-  size was ever the only blocker.
+  `/etc/passwd`) — the userland is minimal. **Update 2026-09-22, from the
+  real box:** the pthread/socket surface a multi-threaded Rust network
+  service needs is now *verified* — a real `miot` node ran there (tokio
+  workers, axum HTTP — `docs/TOPOLOGY.md` `node5`). mmap is the gap:
+  writable `MAP_SHARED` file mappings are refused (worse than refused —
+  the probe segfaults), which is fatal to ParityDB across a restart. Fine
+  for a stateless cat; disqualifying for a durable node until it changes.
 - **`--jinja` tool-call parsing with Qwen3/GLM on `llama-server` is unverified
   live.** RESULTS.md's zero-malformed-calls finding is against Ollama +
   gemma4-yolo-4b/qwen3:4b, not against `llama-server`'s parser.

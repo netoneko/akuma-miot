@@ -1,4 +1,4 @@
-# A litter of six containers on one network.
+# A litter of five containers on one network.
 #
 # This is the shape that `miot-sim` only pretended to be. There, four cats were
 # four integers inside one process sharing one in-memory state machine. Here
@@ -8,8 +8,9 @@
 #
 #   node   owns the chain. Ticks blocks on its own clock, forever, whether or
 #          not any cat is connected. Law I, as a separate process.
-#   node2  a read replica of `node` (HANDOFF item 5) — pulls its block log
-#          over HTTP, produces none of its own, no cat talks to it.
+#   node2  RETIRED from docker, 2026-09-22 — the replica role moved to a
+#          bare `miot` on `ryzen` (systemd `miot-node2.service`,
+#          MIOT_PEER=http://<mac>:9944). See docs/TOPOLOGY.md.
 #   mimi   leader.  tama / kuro / sora  workers.
 #
 # The MODELS stay on the HOST: Docker Desktop on macOS has no GPU passthrough,
@@ -35,26 +36,6 @@ services:
       - node-db:/data         # survives `up -d --force-recreate`; `down -v` to reset
     ports:
       - "9944:9944"          # talk to the chain from your terminal
-
-  # A passive read replica — HANDOFF item 5. No cat points at it; its only
-  # job is to prove `node`'s block log replicates over HTTP. It pulls
-  # `node`'s blocks itself (`MIOT_ROLE=replica`/`MIOT_PEER`, see
-  # `crates/miot/src/main.rs`'s `sync_once`) rather than being told
-  # about them, and refuses `/submit` — read from it (`curl
-  # localhost:9945/tasks`), don't write to it.
-  node2:
-    image: akuma-miot:net
-    command: miot node
-    depends_on: [node]
-    environment:
-      MIOT_PORT: "9944"
-      MIOT_DB: /data/miot.db
-      MIOT_ROLE: replica
-      MIOT_PEER: http://node:9944
-    volumes:
-      - node2-db:/data
-    ports:
-      - "9945:9944"          # compare against `node` by hand: curl localhost:9945/tasks
 
   mimi:
     image: akuma-miot:net
@@ -110,4 +91,3 @@ services:
 
 volumes:
   node-db:
-  node2-db:
