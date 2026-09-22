@@ -525,7 +525,10 @@ pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
         let n = shared.lock().await;
         (n.mesh.routes().to_vec(), n.http.clone())
     };
-    let timeout = Duration::from_millis(poll_ms.max(250));
+    // Longer than the poll interval on purpose: a slow answer is still an
+    // answer. Only a peer that misses every poll for a whole election
+    // window counts as gone.
+    let timeout = Duration::from_millis((poll_ms * 2).max(2_000));
     let mut set = tokio::task::JoinSet::new();
     for r in routes {
         let http = http.clone();

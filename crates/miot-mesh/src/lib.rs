@@ -126,7 +126,8 @@ pub struct Timing {
 impl Default for Timing {
     fn default() -> Self {
         // Status polls run every second (kot's default), so a leader has to
-        // miss about four in a row before anyone moves.
+        // miss about four in a row before anyone moves. `kot run` defaults
+        // to 10-20 s for the real network; the tests keep these.
         Timing { election_min_ms: 4_000, election_max_ms: 8_000 }
     }
 }

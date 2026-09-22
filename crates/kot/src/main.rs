@@ -133,9 +133,13 @@ struct RunArgs {
     sync_ms: u64,
     #[arg(long, env = "MIOT_POLL_MS", default_value_t = 1000)]
     poll_ms: u64,
-    #[arg(long, env = "MIOT_ELECTION_MIN_MS", default_value_t = 4000)]
+    /// A leader unheard for this long (randomized up to the max) triggers a
+    /// pre-vote; a leader that can't see a majority for this long steps
+    /// down. 4 s flapped live: a mac busy with a cargo build starved the
+    /// Lima VM past four 1 s polls in a row, twice in a minute.
+    #[arg(long, env = "MIOT_ELECTION_MIN_MS", default_value_t = 10_000)]
     election_min_ms: u64,
-    #[arg(long, env = "MIOT_ELECTION_MAX_MS", default_value_t = 8000)]
+    #[arg(long, env = "MIOT_ELECTION_MAX_MS", default_value_t = 20_000)]
     election_max_ms: u64,
 }
 

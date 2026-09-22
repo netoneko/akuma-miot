@@ -364,6 +364,21 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
   no-slot-recycler class (`../akuma/docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md`);
   not root-caused. Batch ssh execs to that box, and prefer letting herd
   restart a service over killing it by hand.
+- **`kot` as a *replica* on the akuma metal box wedges within minutes**
+  (2026-09-22, reproduced across a reboot): listener refuses even from
+  `127.0.0.1`, sync stops, threads all `R` and still accruing CPU. The old
+  `node5` was durable only as a *primary*, with no outbound HTTP; a replica
+  is an HTTP client and server at once, which is the one combination that
+  has never stayed up on that kernel. Unconfirmed hypothesis, not
+  root-caused. `../akuma` territory. See `docs/TOPOLOGY_TARGET.md`.
+- **ParityDB on aarch64 Akuma (`akuma-guest`)**: reopen died with ENOSYS
+  (no `fadvise64` arm in the aarch64 dispatcher; added in `../akuma`
+  2026-09-22). Behind it, a clean close appears to lose data (storeprobe
+  stage 6 reopens empty), probably missing `MAP_SHARED` write-back, the
+  other half of the amd64 fix. A crash keeps the logs and replays fine. The
+  write-up is `../akuma/docs/archive/MIOT_MESH_ON_AKUMA_2026-09-22.md`, which
+  also covers the metal-box replica wedge and PSTATS naming amd64 syscalls
+  from the aarch64 table.
 - **Akuma's sshd merges stderr into stdout.** Anything parsed from `ssh
   akuma '…'` output needs `2>/dev/null` on the far side.
 - **The z.ai token is a coding-plan key**: `paas/v4` answers "insufficient
@@ -379,6 +394,31 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
 ---
 
 ## Next, in order
+
+0. **Future work on `kot`: the operator's roster name becomes `ken`, not
+   `root`** (asked 2026-09-22; not started). It must stay configurable
+   (e.g. `--operator-name` / `MIOT_OPERATOR_NAME`), and `ken` is the default
+   for what it means in Japanese:
+   - 賢 (ken): wise, clever (also common in names)
+   - 権 (ken): authority, right (as in 人権 *jinken*, "human rights")
+
+   This renames the *roster label only*. The authority itself stays what the
+   pallet calls root (`MIOT_ROOT_PUBKEY`, `Authority::Root`, `set_root`,
+   `clear_all`'s check), and the on-chain `from_root` flag on `said` stays
+   as is. Nothing on chain carries a name. The places that spell it today:
+   - `crates/kot/src/main.rs`: `DEV_ROSTER` (`root=1,…`), and the
+     `miot-root` comment on the identity's `.pub` line.
+   - `crates/kot/src/agent.rs`: the planner's worker list filters out
+     `n != "root"`, so the operator is never handed a sub-task
+     (`RootNotAssignable`). This filter must follow the configured name,
+     not a literal.
+   - `overlays/deploy/deploy.sh` `ids`: writes `root=pub:<acct>` into
+     `mesh.env`'s `MIOT_ROSTER`. Regenerating `mesh.env` changes no key
+     and no genesis. The roster is client-side lookup only, so this is
+     just a redeploy.
+   - Docs that say "root" when they mean the operator's *name* (`docs/CLI.md`
+     §2 tags, `docs/runbooks/run-the-mesh.md`). Leave the ones that mean
+     the *authority* alone.
 
 1. ~~**Signed extrinsics.**~~ **Done, 2026-09-21.** `AccountId` is
    `AccountId32`; `/call` is gone; `/submit` takes a signed

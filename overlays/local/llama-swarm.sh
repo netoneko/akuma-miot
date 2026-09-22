@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# Four llama-servers, one per cat.
+# Two llama-servers, one per mac-hosted agent (mac-linux, mac-fc). Were four
+# (8081-8084) in the docker-litter days; 8081/8082 retired 2026-09-22.
 #
 # WHY one each: four cats against a single server serialize their turns, and
 # the entire design rests on turns running concurrently while the chain ticks
@@ -9,14 +10,14 @@
 # The model is mmap'd, so four instances of the same GGUF share their weight
 # pages. The per-instance cost is the KV cache, not 2.3 GB each.
 #
-#   ./llama-swarm.sh up      start 4 servers on 8081-8084
+#   ./llama-swarm.sh up      start 2 servers on 8083-8084
 #   ./llama-swarm.sh down    stop them
 #   ./llama-swarm.sh status
 set -euo pipefail
 
 MODEL="${MIOT_GGUF:-$HOME/.ollama/models/blobs/sha256-3e4cb14174460404e7a233e531675303b2fbf7749c02f91864fe311ab6344e4f}"
-PORTS=(8081 8082 8083 8084)
-CATS=(mimi tama kuro sora)
+PORTS=(8083 8084)
+CATS=(mac-linux mac-fc)
 CTX="${MIOT_CTX:-8192}"
 # Threads PER SERVER. One is enough, and that is measured rather than assumed:
 # with -ngl 99 the GPU does the matmuls and CPU threads only handle sampling,

@@ -5,8 +5,12 @@
 #   akuma  bare-metal Akuma: HTTP pull (no scp, no big ssh exec), herd service
 #   linux  plain Linux over ssh: scp, systemd unit
 #   lima   plain Linux inside Lima `fc`: limactl copy, systemd unit
-#   (fc    a Firecracker Akuma guest: the akuma shape plus a boot layer, not
-#          built yet — ryzen-fc and mac-fc are staged only; see `ids`)
+#   fcguest  Akuma in Firecracker inside Lima `fc` (akuma-guest): the akuma
+#          shape, reached through fc — ssh on the mac's :4444 (fc's socat to
+#          10.0.2.15:22), HTTP pulled through the guest's NAT from the mac's
+#          loopback (192.168.5.2). Boot it first: ../akuma
+#          overlays/devbox-firecracker/{guest-setup,build,run}.sh.
+#          ryzen-fc (the same on ryzen's real KVM) is staged only.
 #
 #   overlays/deploy/deploy.sh ids           create each agent's identity once, write mesh.env
 #   overlays/deploy/deploy.sh up <agent>    ship kot + persona + config, (re)start it
@@ -39,9 +43,11 @@ AGENTS=(
   "ryzen-linux|linux|ryzen|x86_64|tama|http://127.0.0.1:8081|qwen3-4b"
   "mac-linux|lima|fc|aarch64|kuro|http://192.168.5.2:8083|qwen3:4b"
   "ryzen-fc|fc|ryzen|x86_64|sora|-|-"
-  "mac-fc|fc|fc|aarch64|mimi|-|-"
+  "mac-fc|fcguest|fc|aarch64|mimi|http://192.168.5.2:8084|qwen3:4b"
 )
-LIVE=(akuma-metal ryzen-linux mac-linux)
+# akuma-metal is out while its replica wedge is chased (HANDOFF traps);
+# mac-fc runs the same role on aarch64 Akuma to see if it wedges too.
+LIVE=(ryzen-linux mac-linux mac-fc)
 
 # llama-server per agent, never ollama: its own process, its own port, its
 # thread count pinned, so an agent's turns get a known slice of the box and
@@ -55,12 +61,18 @@ LLAMAS=(
 # Every node's view of every *other* live node. Differs per vantage point:
 # the fc VM reaches the LAN directly, and the LAN reaches mac-linux through
 # Lima's 0.0.0.0 forward of fc:9944 (../akuma host-setup.sh LIMA_LAN_PORTS).
-route() { # route <to>
-  case "$1" in
-    akuma-metal) echo http://192.168.1.123:9944 ;;
-    ryzen-linux) echo http://192.168.1.126:9944 ;;
-    mac-linux)   echo "http://$MAC_LAN:9944" ;;
-    *) die "no route to $1 yet" ;;
+# mac-linux and mac-fc share fc and talk over its tap0 (10.0.2.2 is fc,
+# 10.0.2.15 the guest); the LAN reaches mac-fc through fc:9945, a socat relay
+# (kot-relay-mac-fc.service) that Lima exposes as mac:9945.
+route() { # route <from> <to>
+  case "$1>$2" in
+    *">akuma-metal") echo http://192.168.1.123:9944 ;;
+    *">ryzen-linux") echo http://192.168.1.126:9944 ;;
+    "mac-fc>mac-linux") echo http://10.0.2.2:9944 ;;
+    *">mac-linux") echo "http://$MAC_LAN:9944" ;;
+    "mac-linux>mac-fc") echo http://10.0.2.15:9944 ;;
+    *">mac-fc") echo "http://$MAC_LAN:9945" ;;
+    *) die "no route to $2 yet" ;;
   esac
 }
 
@@ -73,6 +85,8 @@ on() { # on <agent> <shell command>, run as root on the agent's host
     akuma) ssh -o BatchMode=yes akuma "$2" ;;
     linux) ssh -o BatchMode=yes "$(field "$1" 3)" "$2" ;;
     lima)  limactl shell fc -- sudo sh -c "$2" ;;
+    fcguest) timeout 60 ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+               -o LogLevel=ERROR -p 4444 root@localhost "$2" ;;
     *) die "$1: shape $(field "$1" 2) not deployable yet" ;;
   esac
 }
@@ -82,20 +96,24 @@ put() { # put <agent> <local file> <remote path>
   case "$(field "$a" 2)" in
     linux) scp -q "$src" "$(field "$a" 3):$dst.new" && on "$a" "mv $dst.new $dst" ;;
     lima)  limactl copy "$src" "fc:/tmp/$(basename "$dst").new" && on "$a" "mv /tmp/$(basename "$dst").new $dst" ;;
-    akuma)
+    akuma|fcguest)
       # HTTP only: no SFTP subsystem, and an ssh exec channel stalls at
-      # exactly 1 MiB. Serve a staging dir holding just this file.
+      # exactly 1 MiB. Serve a staging dir holding just this file. The
+      # guest reaches the mac's loopback as 192.168.5.2 (Lima), so it
+      # needs no LAN-facing listener; the metal box needs the LAN one.
+      local bind=0.0.0.0 from=$MAC_LAN
+      [ "$(field "$a" 2)" = fcguest ] && { bind=127.0.0.1; from=192.168.5.2; }
       local stage; stage="$(mktemp -d)"
       cp "$src" "$stage/f"
       if lsof -iTCP:$HTTP_PORT -sTCP:LISTEN -P >/dev/null 2>&1; then
         die "port $HTTP_PORT already has a listener (a stale http.server?) — lsof -iTCP:$HTTP_PORT"
       fi
-      (cd "$stage" && exec python3 -m http.server $HTTP_PORT --bind 0.0.0.0 >/dev/null 2>&1) &
+      (cd "$stage" && exec python3 -m http.server $HTTP_PORT --bind $bind >/dev/null 2>&1) &
       local srv=$!
       sleep 1
       local want; want="$(md5 -q "$src")"
-      on "$a" "wget -q -O $dst.new http://$MAC_LAN:$HTTP_PORT/f && md5sum $dst.new" | grep -q "$want" \
-        || { kill $srv; wait $srv 2>/dev/null; rm -rf "$stage"; die "transfer of $src to akuma failed or corrupted"; }
+      on "$a" "wget -q -O $dst.new http://$from:$HTTP_PORT/f && md5sum $dst.new" | grep -q "$want" \
+        || { kill $srv; wait $srv 2>/dev/null; rm -rf "$stage"; die "transfer of $src to $a failed or corrupted"; }
       kill $srv; wait $srv 2>/dev/null || true; rm -rf "$stage"
       on "$a" "chmod +x $dst.new 2>/dev/null; mv $dst.new $dst"
       ;;
@@ -157,7 +175,7 @@ EOF
 # ---- config + service ----------------------------------------------------------
 env_for() { # the agent's env file: genesis + its own row + peers from its vantage
   local a="$1" peers="" p llm model
-  for p in "${LIVE[@]}"; do [ "$p" = "$a" ] || peers="${peers:+$peers,}$(route "$p")"; done
+  for p in "${LIVE[@]}"; do [ "$p" = "$a" ] || peers="${peers:+$peers,}$(route "$a" "$p")"; done
   llm="$(field "$a" 6)"; model="$(field "$a" 7)"
   # shellcheck disable=SC1090
   . "$MESH_ENV"
@@ -190,8 +208,32 @@ cmd_up() {
     put "$a" "$HOME/.akuma/z.ai/token" /root/kot/zai.token
     on "$a" "chmod 600 /root/kot/zai.token"
   fi
+  if [ "$(field "$a" 2)" = fcguest ]; then
+    # Its identity was generated once on the mac (`ids`); move it in, never
+    # over an existing one.
+    if ! on "$a" "test -s /root/kot/id_ed25519.seed"; then
+      put "$a" "$HOME/.akuma/kot/$a.seed" /root/kot/id_ed25519.seed
+      on "$a" "chmod 600 /root/kot/id_ed25519.seed"
+    fi
+    [ "$(account_of "$a")" = "$(grep -o "$a=pub:[0-9a-f]*" "$MESH_ENV" | cut -d: -f2)" ] \
+      || die "$a: identity in the guest does not match mesh.env"
+    cat > "$tmp.relay" <<EOF
+[Unit]
+Description=LAN :9945 -> $a (akuma-guest 10.0.2.15:9944)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:9945,fork,reuseaddr TCP:10.0.2.15:9944
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+EOF
+    limactl copy "$tmp.relay" fc:/tmp/kot-relay.service
+    limactl shell fc -- sudo sh -c "mv /tmp/kot-relay.service /etc/systemd/system/kot-relay-$a.service && systemctl daemon-reload && systemctl enable --now kot-relay-$a.service >/dev/null 2>&1"
+  fi
   case "$(field "$a" 2)" in
-    akuma)
+    akuma|fcguest)
       # herd has `env =` lines, but a wrapper script is the version-proof
       # shape (docs/TOPOLOGY.md, node5). The env file is sourced with -a so
       # its quoted ssh-key line survives.
@@ -200,10 +242,19 @@ cmd_up() {
       put "$a" "$tmp.start" /root/kot/start.sh
       on "$a" "chmod 755 /root/kot/start.sh"
       printf 'command = /bin/sh\nargs = /root/kot/start.sh\nrestart = true\nrestart_delay = 2000\n' > "$tmp.conf"
-      put "$a" "$tmp.conf" /etc/herd/enabled/kot.conf
+      # herd's convention: confs live in available/, `herd enable` copies
+      # one into enabled/ (re-read every 20 s). NO_ENABLE=1 stages without
+      # enabling — for when the operator has `herd disable`d it on purpose.
+      on "$a" "mkdir -p /etc/herd/available"
+      put "$a" "$tmp.conf" /etc/herd/available/kot.conf
+      if [ -z "${NO_ENABLE:-}" ]; then
+        on "$a" "rm -f /etc/herd/enabled/kot.conf; herd enable kot"
+      fi
       # Restart = kill: herd restarts it (restart = true), and re-reads
       # /etc/herd/enabled every 20 s on its own, so a new conf needs nothing.
-      on "$a" "for p in \$(ps | grep '/root/kot/bin/kot run' | grep -v grep | awk '{print \$1}'); do kill \$p; done"
+      # Skipped with NO_ENABLE: a hand `kill` on this box preceded a
+      # sshd-can't-spawn wedge once (HANDOFF traps); a reboot is safer.
+      [ -n "${NO_ENABLE:-}" ] || on "$a" "for p in \$(ps | grep '/root/kot/bin/kot run' | grep -v grep | awk '{print \$1}'); do kill \$p; done"
       ;;
     linux|lima)
       put "$a" "$tmp" /root/kot/kot.env
@@ -227,7 +278,7 @@ EOF
       ;;
   esac
   rm -f "$tmp" "$tmp".*
-  say "$a: up — curl $(route "$a")/mesh/peers"
+  say "$a: up — curl $(route - "$a")/mesh/peers"
 }
 
 # ---- models --------------------------------------------------------------------
