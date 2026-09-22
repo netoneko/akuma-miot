@@ -357,12 +357,16 @@ fn produce_log(to: u64) -> (Vec<(u64, Vec<Effect<u64>>)>, miot_tasks::State<u64>
             match b {
                 // Never planned: nagged with PlanNeeded until the budget
                 // runs out and the parent fails — `Directed` every time.
-                1 => assert_ok!(Litter::open(RuntimeOrigin::signed(ROOT), "never planned".into())),
+                1 => {
+                    assert_ok!(Litter::open(RuntimeOrigin::signed(ROOT), "never planned".into()));
+                }
                 3 => {
                     assert_ok!(Litter::open(RuntimeOrigin::signed(ROOT), "planned".into()));
                     plan_two(TaskId::parent(2));
                 }
-                5 => assert_ok!(Litter::update(RuntimeOrigin::signed(TAMA), TaskId::sub(2, 1), Act::Claim, String::new())),
+                5 => {
+                    assert_ok!(Litter::update(RuntimeOrigin::signed(TAMA), TaskId::sub(2, 1), Act::Claim, String::new()));
+                }
                 _ => {}
             }
             let all = effects();
