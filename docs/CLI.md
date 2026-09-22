@@ -6,7 +6,7 @@ composer, nothing here contradicts §0's non-negotiable, because none of it
 exists to violate it). Slices of §2, §3, §4 and §5 **are** built, 2026-09-21
 through 22 — not as a separate `miot-cli` binary but as `miot --rpc <url>`.
 The crate used to be named `miot-sim` and was renamed once `--rpc` made it
-more than a simulator; it ships as `dist/miot`.
+more than a simulator; it ships as `kot` (`dist/<arch>/kot`) — the client verbs below are `kot`'s, 2026-09-22.
 
 What exists:
 

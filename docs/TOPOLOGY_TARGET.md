@@ -57,15 +57,18 @@ config only.
 
 ## Network
 
-Static IPs/ports are **not yet assigned** — fill in below once each agent's
-actual bind address is chosen (fixed per host, since placement is fixed):
+Addresses are fixed per host; `overlays/deploy/deploy.sh`'s `route()` is
+the source of truth for who reaches whom at what URL. The mesh is **three
+members** (quorum 2) until the Firecracker agents exist. All five
+identities are in genesis already (`overlays/deploy/mesh.env`), so adding
+them is a `MIOT_PEERS` change, not a new chain:
 
 | agent | address | notes |
 |---|---|---|
-| akuma-metal | `192.168.1.123:9944` (host already has this address; port matches today's `node5`) | direct, no NAT |
-| ryzen-linux | `192.168.1.126:____` | direct, no NAT; today's `node2` used `:9944` — reassign if `ryzen-fc` also wants `9944` on the same host |
+| akuma-metal | `192.168.1.123:9944` (host already has this address; port matches today's `node5`) | direct, no NAT. Shipped (`/root/kot`, identity generated); **not started**, the box needs a power cycle (HANDOFF traps). GLM: `zai-coding::glm-5.3` |
+| ryzen-linux | `192.168.1.126:9944` | direct, no NAT. **Live 2026-09-22.** Model: `llama-ryzen-linux.service`, 127.0.0.1:8081, Qwen3-4B-Instruct-2507 Q4_K_M, 6 threads (CPU; ollama disabled) |
 | ryzen-fc | `____` (guest address, behind ryzen's own NAT/tap — pattern TBD, no precedent yet; `run-on-firecracker.md`'s aarch64 path is the closest reference but is nested-virt-specific) | new — nothing has run an amd64 Firecracker Akuma guest yet |
-| mac-linux | `fc`'s Lima-assigned address, reachable from the mac at `192.168.5.x` per today's `node3` pattern | matches today's `node3`/`kuro` placement |
+| mac-linux | `192.168.1.203:9944` from the LAN (Lima forwards `fc:9944-9949` on `0.0.0.0`; `fc` itself is `192.168.5.15`) | **Live 2026-09-22.** Model: the mac's llama-server at `192.168.5.2:8083` (qwen3:4b). systemd `kot.service` inside `fc`, no longer started by hand |
 | mac-fc | `10.0.2.15` inside `fc` (today's `akuma-guest` address), reachable from outside via `192.168.5.2:9944` through `fc`'s tap0 — same 4-hop path `node4` uses today | unchanged from today's `node4` networking |
 
 `--peers` on each `kot run` invocation needs the other 4 agents' reachable

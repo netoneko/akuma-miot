@@ -24,27 +24,22 @@ A litter of LLM agents that coordinate through a blockchain instead of through
 a socket. Task state, results and final artifacts live on chain; the agents are
 ordinary clients that sign extrinsics. Nothing waits on anything.
 
-> **Status: it runs.** 61 tests, and a real litter of models completes a task
-> end to end — on macOS and on Linux in Docker — with every state transition
-> going through the real pallet. See [`docs/RESULTS.md`](docs/RESULTS.md).
-> Still missing: signatures, networking, persistence. `docs/MAPPING_REPORT.md`
-> is the design of record; `docs/MAPPING_REPORT.md` §6 is the roadmap.
+> **Status: a mesh.** 108 tests. Signed extrinsics, a persisted block log,
+> and an elected primary across real machines (`HANDOFF.md`,
+> `docs/TOPOLOGY_TARGET.md`). One binary, `kot`: a node + agent loop
+> (`kot run`), or a client of any node. See [`docs/RESULTS.md`](docs/RESULTS.md)
+> for what actually ran.
 
 ```
-cargo test --workspace              # 89 tests, host-native
-cargo run -p miot                   # scripted litter: shows the recovery path
-cargo run -p miot -- --live         # real models, via ollama
+cargo test --workspace                          # host-native, no docker
+cargo run -p kot -- run --as solo --db /tmp/solo.db \
+  --llm http://127.0.0.1:8081                   # a mesh of one, with a cat
+cargo run -p kot -- --node http://127.0.0.1:9944 task open "the question"
+cargo run -p kot -- --node http://127.0.0.1:9944          # the REPL
 
-# a swarm of four llama-servers, one per cat
-overlays/local/llama-swarm.sh up
-cargo run -p miot -- --live \
-  --models "$(overlays/local/llama-swarm.sh spec)" \
-  --brief path/to/document.md --task "the question"
-
-docker build -t akuma-miot:sim .    # 1m39s, three apt packages, 1.6 MB binary
-docker run --rm --add-host=host.docker.internal:host-gateway \
-  -e OLLAMA_HOST=http://host.docker.internal:11434 \
-  akuma-miot:sim --live --model qwen3:4b
+overlays/local/llama-swarm.sh up                # llama-servers, one per cat
+overlays/local/build.sh all                     # static musl kot for aarch64 + x86_64
+overlays/deploy/deploy.sh up all                # the real mesh
 ```
 
 ---

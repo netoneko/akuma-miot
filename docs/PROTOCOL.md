@@ -173,7 +173,7 @@ the actual `tools` array passed to that specific turn.
 
 `@name` is never on the wire — `say`'s `to` field is `Option<AccountId>`.
 Resolution happens client-side against a `name=seed` roster
-(`crates/miot/src/rpc.rs::resolve`), *before* signing. `@all`/`@cats`/
+(`crates/kot/src/common.rs::Roster::account`, via `client.rs::parse_targets`), *before* signing. `@all`/`@cats`/
 `@litter` are explicit-broadcast synonyms for `to: None`. Multiple `@name`
 tags in one line become multiple `say` extrinsics (one per addressee, same
 body, in tag order) rather than a schema change — see `docs/CLI.md` §8 for

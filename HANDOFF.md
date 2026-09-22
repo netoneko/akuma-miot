@@ -1,6 +1,6 @@
 # Handoff
 
-State of Akuma Miot as of 2026-09-22. What runs, what doesn't, what to do next,
+State of Akuma Miot as of 2026-09-22 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`). What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
@@ -16,44 +16,24 @@ is imported**, only its behavioural findings, each now a named test.
 ## Run it
 
 ```bash
-cargo test --workspace                 # 94 tests, host-native, no docker
+cargo test --workspace                 # 108 tests, host-native, no docker (docker is gone)
 
-# models on the HOST (Metal). Docker on macOS has no GPU passthrough.
-overlays/local/llama-swarm.sh up       # 4 llama-servers, ports 8081-8084
+overlays/local/build.sh all            # dist/aarch64/kot (9 MB), dist/x86_64/kot (11 MB), static musl
+overlays/deploy/deploy.sh up all       # the mesh: docs/TOPOLOGY_TARGET.md (live agents only)
 
-docker compose -f overlays/local/docker-compose.yml up -d   # 2 nodes + 4 cats
-curl -s localhost:9944/head
-curl -s localhost:9944/meta                          # genesis hash + spec/tx version
-# there is no more unauthenticated /call — every act is a signed extrinsic.
-# --rpc is the same `miot` binary (shipped as dist/miot; `miot node` is the
-# other thing it can do) pointed at a real node instead of driving one:
-cargo run -p miot -- --rpc http://localhost:9944 --identity-seed 1 \
-  --open "your question here"
-cargo run -p miot -- --rpc http://localhost:9944 --repl   # interactive session, real signed lines
-cargo run -p miot -- --rpc http://localhost:9944 --clear  # fail every open task — new session, same chain
-docker compose -f overlays/local/docker-compose.yml logs -f
-curl -s localhost:9944/artifact/t1 | python3 -m json.tool
+R="$(grep ^MIOT_ROSTER overlays/deploy/mesh.env | cut -d= -f2-)"
+kot --node http://192.168.1.126:9944 --roster "$R" peers            # roster, primary, terms, heads
+kot --node http://192.168.1.126:9944 --roster "$R" say --to mac-linux "hi"
+kot --node http://192.168.1.126:9944 --roster "$R" task open "your question"
+kot --node http://192.168.1.126:9944 --roster "$R"                  # the REPL
+kot --node http://192.168.1.126:9944 --roster "$R" log --follow
+
+cargo run -p kot -- run --as solo --db /tmp/solo.db                  # a mesh of one: local dev
 ```
 
-**The hardcoded scripted-cats demo, `--live`, and in-process `--chat` this
-section used to show are gone** — merged out of `miot` (2026-09-22,
-alongside the `miot`+`kot`→`miot`+`kot` rename): the demo was
-redundant with `cargo test`'s own coverage, and `--live`/`--chat` simulated
-cats "talking" to each other, which was never actually true of the real
-architecture — the chain is the only channel between agents, always.
-`kot` (formerly `kot`) is a real cat's agentic loop against a real
-node; there's no in-process stand-in for it anymore.
-
-Akuma-shippable binaries:
-
-```bash
-overlays/local/build-akuma.sh          # dist/miot (5.1 MB), dist/storeprobe (0.8 MB)
-                                       # aarch64 musl. For the x86_64 hosts (ryzen, the
-                                       # real akuma box) build the same two -p miot -p
-                                       # miot-store binaries with x86_64-linux-musl-gcc +
-                                       # rustup target x86_64-unknown-linux-musl — see
-                                       # docs/TOPOLOGY.md (no script for it yet).
-```
+Signing defaults to the operator's root identity (`~/.akuma/miot/id_ed25519.seed`);
+any node will do (`--node` then `--nodes a,b,c`), because a replica forwards
+`/submit` and `/account` to whoever is primary.
 
 ---
 
@@ -63,13 +43,13 @@ overlays/local/build-akuma.sh          # dist/miot (5.1 MB), dist/storeprobe (0.
 |---|---|---|
 | `miot-primitives` | vocabulary: `TaskId`, `Act`, `Effect`, `Limits`, `Timers`. `no_std`. | 5 |
 | `miot-tasks` | **the lifecycle, as a pure state machine.** No clock, no I/O. Event-sourced: `TaskTable::apply` is the only place state is written, live or replayed. | 41 |
-| `pallet-litter` | thin FRAME wrapper: `ensure_signed` → load → apply → store → emit | 16 |
+| `pallet-litter` | thin FRAME wrapper: `ensure_signed` → load → apply → store → emit; `Replaying` (fold without re-ticking) | 17 |
 | `miot-runtime` | `construct_runtime!`; `AccountId32`/`MultiSignature`, real `UncheckedExtrinsic` + `Executive`, **executed natively — no wasm** | 2 |
-| `miot-store` | block log on ParityDB, compaction-boundary rewind, leader-wins | 14 |
+| `miot-store` | block log on ParityDB, compaction-boundary rewind, leader-wins, `aux` (persisted vote) | 17 |
+| `miot-mesh` | **leader election** — Raft's, election only, with pre-vote + check-quorum + stickiness. Pure state machine; tests are a simulated network with partitions and kills | 10 |
 | `miot-keys` | ed25519 identity: seeds for cats, the operator's SSH *public* key → `AccountId32`, hex wire encoding | 14 |
 | `miot-llm` | provider layer on `genai` (15 providers, GLM included) | — |
-| `kot` | one cat's agentic loop, signs its own extrinsics and talks to a node — Polish for "cat" (renamed from `kot` 2026-09-22, once cat+node work converged into `miot` below and it needed its own name); a container today, or any process that can reach a node (running on a Lima VM, and on the real Akuma kernel via Firecracker, as of 2026-09-22 — `docs/TOPOLOGY.md`) | — |
-| `miot` | one binary (ships as `dist/miot`), two jobs, merged 2026-09-22 (formerly `miot` + a separate `miot`): `miot node` is the chain as a process — HTTP, real block lifecycle (`Executive`) on its own clock, `/submit` verifies before it dispatches, persists+replays via `miot-store` (`MIOT_DB`), compacts on `/clear`; anything else is an RPC client of one — one-shot (`--open`/`--say`/`--clear`) or `--repl` (an operator's interactive session, real signed lines, replays history on start). The old scripted-demo/`--live`/in-process-`--chat` modes were dropped, not merged. | — |
+| `kot` | **the one binary** (`dist/<arch>/kot`), 2026-09-22: `kot run --as <name>` = a mesh node + that cat's agent loop in one process; every other verb is a stateless client of any node. Absorbed `crates/miot` (node + RPC client), which is deleted. `tests/election.rs` = three real nodes over localhost, kill the primary, revive it | 2 |
 
 **`miot-tasks` is the real thing.** Everything else hosts it. That is why the
 pallet is thin and why the same machine runs with or without a chain.
@@ -170,6 +150,47 @@ wrong for a public chain.
 
 ---
 
+**Election, 2026-09-22 (`crates/miot-mesh`).** `MIOT_ROLE`/`MIOT_PEER` are
+gone; every `kot run` node is a mesh member and the mesh elects which one
+produces blocks. Raft's election only: terms, one persisted vote per term,
+majority quorum, randomized timeouts, **pre-vote** (a node cut off never
+inflates its term, so it never deposes a healthy leader on return),
+**check-quorum** (a leader that can't see a majority steps down by itself),
+and **stickiness** (nobody votes while they can still hear a leader). That's
+how "unreachable" is told apart from "lost the election". A vote goes only
+to a log at least as far along, compared as `(head_term, head)`, so an
+ex-leader that kept producing on a minority side, and so has the *higher*
+head, can't win with blocks the majority never saw. Heartbeats are
+**pulled** (everyone polls everyone's `/mesh/status`), so each node only
+needs its own outbound routes, which is what the NAT'd guests allow.
+Blocks still move the old way: pull-sync plus *leader wins, back to the
+last compaction*. A node that changes role rebuilds from its store
+(demotion) or runs the open block's missing tick (promotion); a replica
+that gets a new primary reconciles its whole range against it once. A
+replica forwards `/submit` and `/account` to the primary, so a cat's
+co-located node is always a valid endpoint.
+
+**Replay double-applied the tick, 2026-09-22 — found wiring election.**
+Folding a block (a replica syncing, *or any node replaying its own store on
+restart*) ran `on_initialize`'s `tick` locally **and** applied the
+producer's recorded tick effects on top. `Directed` *increments*
+`directive_nudges_used`, so every replica and every restarted primary burned
+the leader's directive budget at double speed. `/tasks` never shows that
+counter, which is why the "byte-identical" replica checks missed it. A
+promoted replica would have failed parents early. Fixed with
+`pallet_litter::Replaying` (tick skipped while folding; `gc` still runs,
+since it drops rows without an effect). The test is
+`a_folded_block_log_reproduces_the_producers_state_exactly`, whose control
+arm shows the old behaviour diverging.
+
+**Artifacts are budgeted in pages, 2026-09-22.** `MaxArtifact` was a flat
+64 KiB, about 16k tokens: half a local model's whole 32k window. It is now
+`ARTIFACT_PAGES` (4) × `ARTIFACT_PAGE_BYTES` (4 KiB ≈ 1k tokens) = 16 KiB, in
+`miot-runtime`, and the leader's `ArtifactNeeded` prompt states the word
+budget.
+
+---
+
 ## What is real and what is not
 
 **Real:** the pallet and its state machine; the FRAME runtime executing
@@ -232,12 +253,10 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
 
 **Not yet real:**
 
-- **No election, no automatic failover.** A node's role (primary/replica) is
-  an operator-set env var, changed by restarting the process — deliberate,
-  same trust model as `set_leader`/`set_root`, but it means nothing detects
-  a dead primary and promotes a replica on its own. Fine for one operator's
-  swarm; would need real work for anything else. (In progress this session —
-  Part 2 of item 5's plan: an N-way mesh with real leader election.)
+- ~~**No election, no automatic failover.**~~ **Built, 2026-09-22** — see
+  "Election" under Decisions. Honest residuals: membership is static
+  (genesis + `MIOT_PEERS`), and a block no replica pulled before its
+  primary died is lost to the rewind (no commit index).
 - **Akuma-on-the-real-hardware: tested, durable, still one boot.** `node5`
   (above) runs on the physical `akuma` box as a herd service and survives
   restart over a grown ParityDB. `node4` on the Firecracker guest remains
@@ -337,6 +356,25 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
 - **A stale `python3 -m http.server` on the mac squatted port 8123** and
   served 404s that looked like a wrong URL. `lsof -i :PORT -sTCP:LISTEN`
   + `ps -p <pid> -o command=` before blaming the client side.
+
+- **The akuma box can stop spawning after a `kill`** (2026-09-22): right
+  after `deploy.sh retire-old` killed the old `node5` process, sshd still
+  authenticated but every exec returned status 241 with no output, for
+  minutes. Not recovered remotely; needs a power cycle. Suspect the amd64
+  no-slot-recycler class (`../akuma/docs/archive/AKUMA_AMD64_NO_SLOT_RECYCLER.md`);
+  not root-caused. Batch ssh execs to that box, and prefer letting herd
+  restart a service over killing it by hand.
+- **Akuma's sshd merges stderr into stdout.** Anything parsed from `ssh
+  akuma '…'` output needs `2>/dev/null` on the far side.
+- **The z.ai token is a coding-plan key**: `paas/v4` answers "insufficient
+  balance"; only `coding/paas/v4` works. `Llm::glm` routes bare model names
+  to `zai-coding::`.
+- **Lima forwards guest ports to the mac's loopback only by default.** The LAN
+  couldn't reach a node in `fc`. `../akuma/overlays/devbox-firecracker/host-setup.sh`
+  now creates `fc` with 9944-9949 on `0.0.0.0` (`LIMA_LAN_PORTS`), and refuses
+  an old instance without it.
+- **`pkill -f <pattern>` over ssh can match the ssh session's own `bash -c`
+  line and kill it** (exit 255). Kill by PID.
 
 ---
 
@@ -441,11 +479,10 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
 - `docs/RESULTS.md` — **what actually ran, with numbers.** Evidence, not
   intentions. Read this before trusting any claim elsewhere.
 - `docs/CLI.md` — `miot-cli` requirements. Scrollback is sacred.
-- `docs/runbooks/run-local-swarm.md` — the everyday loop: bring the local
-  litter up, talk to it, rebuild/redeploy after a code change (the compose
-  file does not build the image), restart `kuro` on Lima after a node
-  restart, and where to look before assuming "a cat isn't responding" is an
-  application bug.
+- `docs/runbooks/run-the-mesh.md` — the everyday loop: build, `deploy.sh up`,
+  `kot peers` to see who leads, logs, and what "stable" looks like.
+- `overlays/deploy/deploy.sh` — the deployment blueprint: one script, three
+  shapes (akuma/herd, linux/systemd, lima/systemd).
 - `docs/references/storage.md` — the two stores, with measured binary costs
 - `docs/references/README.md` — **three event loops, four orders of magnitude
   apart, and none may await another.** Both of meow's deadlocks were that

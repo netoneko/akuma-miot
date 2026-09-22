@@ -5,6 +5,22 @@ Written for whoever (agent or operator) picks this up next. Read
 real"/"Next, in order" sections, not a replacement for it. Nothing here has
 been implemented yet; this is the agreed shape, not a report of work done.
 
+> **Progress, 2026-09-22 (late).** Item 2 (merge `miot` into `kot`) is
+> **done**; `crates/miot` is deleted. Election is built (`crates/miot-mesh`,
+> HANDOFF "Election") and tested (a simulated network, plus three real nodes
+> over HTTP). Item 1 exists as `overlays/deploy/deploy.sh` for the akuma,
+> linux and lima shapes. Item 3: the old `node2` (ryzen) and `node5` (akuma)
+> are retired, and `node3`/`kuro` went with the recreated `fc` VM. Five
+> identities are generated (`overlays/deploy/mesh.env`), and **mac-linux +
+> ryzen-linux are live**, electing, and answering LLM turns. akuma-metal is
+> shipped but not started: the box stopped spawning processes (HANDOFF
+> traps) and needs a power cycle. The two Firecracker agents are not built.
+> One correction to this doc: ryzen **has** run an Akuma/amd64 Firecracker
+> guest before (`../akuma/docs/archive/LITTER_TRASHCAN_RYZEN_JOIN.md`,
+> `amd64/run-firecracker.sh`, and `firecracker`/`jailer` in
+> `~netoneko/bin`), so ryzen-fc has a precedent. "Nothing has run one" below
+> is wrong.
+
 ## The ask, in one paragraph
 
 Redo the fleet from today's ad-hoc `node1..node5` naming into a fixed

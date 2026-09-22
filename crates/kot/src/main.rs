@@ -113,7 +113,7 @@ struct RunArgs {
     glm: bool,
     #[arg(long, env = "MIOT_GLM_TOKEN_FILE", default_value = "~/.akuma/z.ai/token")]
     glm_token_file: String,
-    /// Default: qwen3:4b, or glm-4.6 with --glm.
+    /// Default: qwen3:4b, or glm-5.3 (z.ai coding plan) with --glm.
     #[arg(long, env = "MIOT_MODEL")]
     model: Option<String>,
     #[arg(long, env = "MIOT_PERSONA")]
@@ -194,7 +194,7 @@ async fn run(cli: &Cli, a: &RunArgs) {
         (None, true) => {
             let path = expand_home(&a.glm_token_file);
             let token = std::fs::read_to_string(&path).unwrap_or_else(|e| die(format!("--glm: {}: {e}", path.display())));
-            Some(miot_llm::Llm::glm(&token, a.model.as_deref().unwrap_or("glm-4.6")))
+            Some(miot_llm::Llm::glm(&token, a.model.as_deref().unwrap_or("glm-5.3")))
         }
         (None, false) => None,
     };

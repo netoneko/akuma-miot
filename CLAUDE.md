@@ -20,34 +20,32 @@ read that first, it is kept current and this file does not repeat it.
   `parameter_types!`, tuned against measured LLM turn lengths, not against
   `miot-primitives`' generic defaults.
 - `crates/miot-store` — the chain's block log on ParityDB: append, compact,
-  `rewind_for_fork`. Wired into `miot node` since HANDOFF item 2 — every
-  block's effects persist and replay on restart, and `compact` fires for
-  real on root's `/clear`.
+  `rewind_for_fork`, plus a small `aux` space (the election's persisted
+  term/vote). Every mesh member is durable.
+- `crates/miot-mesh` — **who produces blocks**: Raft-style leader election
+  (terms, one vote per term, majority quorum, pre-vote, check-quorum,
+  stickiness) as a pure state machine, no clock, no I/O, same rule as
+  `miot-tasks`. Election only; blocks still move by pull-sync and
+  *leader wins, back to the last compaction*. Its tests are a simulated
+  network (partitions, kills, chaos).
 - `crates/miot-keys` — an account *is* an ed25519 public key
-  (`sp_runtime::AccountId32`); `account_from_ssh` reads the operator's
-  existing `authorized_keys` line so root needs no new secret. Address
-  recovery is wired into the wire path since HANDOFF item 1 — see "Known
-  gaps" below for what's still not.
-- `crates/miot-llm` — provider layer on `genai`.
-- `crates/kot` — one cat's agentic loop, one process, talks to a node over
-  the network. Polish for "cat" (*Miot Kotów*, README's own etymology) —
-  named this, not `miot-cat`, once cat and node converged into one binary
-  (below) and needed a name that wasn't just "the other one." No chat mode
-  of its own; nothing talks to it interactively.
-- `crates/miot` — two jobs in one binary, ships as `dist/miot`:
-  `miot node` is the chain as an HTTP process, block loop on its own clock,
-  real signed `UncheckedExtrinsic`s verified through `Executive` (see
-  HANDOFF item 1 — the `AccountId = u64`/trusted-JSON description this line
-  used to have is long since fixed); anything else is an RPC client of one
-  — one-shot (`--open`/`--say`/`--clear`) or, with `--repl`, an operator's
-  interactive session against a real node. The hardcoded scripted-cats demo
-  and `--live`/in-process `--chat` that used to live in a separate
-  `crates/miot`+`crates/miot-node` split were dropped in the merge —
-  redundant with `cargo test`'s own coverage, or (for `--live`/`--chat`)
-  simply no longer useful once `kot` existed for real.
-- `miot-cli` does not exist yet — `docs/CLI.md` is its design of record
-  (Phase 3), including how a client resolves `@name` tags against the
-  on-chain roster and submits over RPC without holding any local state.
+  (`sp_runtime::AccountId32`); `account_from_ssh` reads an
+  `authorized_keys` line so root is just a public key.
+- `crates/miot-llm` — provider layer on `genai`; `Llm::local` (any
+  OpenAI-compatible server — llama-server, never ollama in the fleet) and
+  `Llm::glm` (z.ai **coding plan** endpoint, token from a file).
+- `crates/kot` — **the one binary**, ships as `dist/<arch>/kot`. Polish for
+  "cat". `kot run --as <name>` is a mesh node (`node.rs`) plus, given
+  `--llm`/`--glm`, that cat's agent loop (`agent.rs`) in the same process,
+  still talking to its node over HTTP (`docs/CLI.md` §5a). Every other verb
+  (`task open|list`, `say`, `artifact`, `peers`, `log`, `clear`, `id`, bare
+  `kot` = REPL) is a stateless client of *any* node (`client.rs`); a
+  replica forwards `/submit` and `/account` to the elected primary.
+  `crates/miot` (the old node+client binary) was merged in and deleted
+  2026-09-22 (`docs/CLEANUP.md` item 2). `tests/election.rs` runs three
+  real nodes over localhost HTTP, kills the primary, revives it.
+- `miot-cli` never shipped under that name — `docs/CLI.md` is its design of
+  record, and `kot`'s client verbs are the implementation.
 
 ## Where to read
 
@@ -66,32 +64,27 @@ read that first, it is kept current and this file does not repeat it.
 
 ## Known gaps (don't assume these are fixed without checking the code)
 
-- **No OpenSSH private-key signing.** `miot-keys` reads the operator's real
-  `~/.ssh` *public* key, but nothing here parses a private key to sign with
-  it — every cat and `miot --rpc` today signs with a seed the operator
-  separately told the node is trusted (`MIOT_MEMBERS`), not the operator's
-  own identity.
-- **No election, no automatic failover.** `miot node`'s role
-  (primary/replica) is an operator-set env var, changed by restarting the
-  process. HANDOFF item 5's Part 2 (an N-way mesh with real leader
-  election, in progress) is what closes this.
-- **Node and agent-loop-in-the-same-process (`docs/CLI.md` §5a: cat=node, no
-  privileged endpoint) is not built.** `miot node` and `kot` (an agent loop)
-  are still separate processes/binaries as of this writing; only the
-  `--rpc` client's *code* was merged into `miot`, not the "a cat's agent
-  loop runs inside the node process" mode itself.
+- **No OpenSSH private-key signing.** Root signs with the project-native
+  seed at `~/.akuma/miot/id_ed25519.seed`; its `.pub` is what every node's
+  `MIOT_ROOT_PUBKEY` holds. Not the operator's `~/.ssh` key.
+- **Mesh membership is static.** `MIOT_MEMBERS` is genesis and `MIOT_PEERS`
+  is config; changing either is a coordinated restart, not an operation.
+  No joint consensus — fine for one operator, not for anything else.
+- **Election ≠ replication.** A block the primary produced that no replica
+  pulled before it died is lost to the rewind (records, not work —
+  `miot-store`'s docs). There is no commit index.
+- **`seq` in `/events` restarts when a node rebuilds its log** (demotion,
+  rewind, adopted checkpoint). The agent loop resets its cursor; any other
+  client holding one should too.
 
 ## Build, run, test
 
-See `HANDOFF.md` § "Run it" for the current commands (host models, docker
-compose from `overlays/local/docker-compose.yml`, `miot`, Akuma
-binaries). Quick reference:
-
 ```bash
-cargo test --workspace                 # host-native, no docker
-overlays/local/llama-swarm.sh up       # 4 llama-servers on the HOST (no Metal in Docker)
-docker compose -f overlays/local/docker-compose.yml up -d
-overlays/local/build-akuma.sh          # dist/miot, dist/storeprobe — see target note below
+cargo test --workspace                        # host-native, no docker (there is no docker any more)
+overlays/local/build.sh all                   # dist/{aarch64,x86_64}/kot (+ storeprobe, mmapprobe)
+overlays/deploy/deploy.sh up <agent>|all      # the 5-agent mesh, docs/TOPOLOGY_TARGET.md
+kot --node http://192.168.1.126:9944 --roster "$MIOT_ROSTER" peers   # roster + who is primary
+cargo run -p kot -- run --as solo --db /tmp/solo.db                  # a mesh of one, local dev
 ```
 
 ## Real infrastructure available to this project
@@ -120,19 +113,14 @@ mid-conversation):
   `akuma-guest` running the same syscall surface doesn't settle this one;
   it's a different machine.
 
-**Target mismatch to fix before item 3/4 of HANDOFF's roadmap:**
-`overlays/local/build-akuma.sh` cross-compiles for
-`aarch64-unknown-linux-musl`, but the reachable `akuma` host answers
-`x86_64` — a binary built by that script will not run there. Either add an
-`x86_64-unknown-linux-musl` cross target for the real host, or confirm which
-target the Lima-hosted Firecracker guest actually needs and keep the two
-paths (Lima aarch64 microVM vs. the physical x86_64 box) explicit rather than
-assuming one build serves both.
+**Two arches, one script:** `overlays/local/build.sh aarch64` (Lima `fc`,
+`akuma-guest`) and `x86_64` (ryzen, the akuma box, a ryzen Firecracker
+guest). The old aarch64-only `build-akuma.sh` is gone.
 
 **Getting a binary onto the `akuma` host:** not scp (no SFTP subsystem), not
 an SSH exec channel (stalls at exactly 1,048,576 bytes — see HANDOFF traps).
-HTTP from the host works; `build-akuma.sh`'s own trailing note has the
-one-liner.
+HTTP from the host works; `overlays/deploy/deploy.sh`'s `put` does it
+(python `http.server` on the mac + busybox `wget`, md5-checked).
 
 The sibling `../akuma` repo (the OS itself) has runbooks worth reading before
 debugging anything on that hardware rather than re-deriving it:
