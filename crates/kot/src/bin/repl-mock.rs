@@ -1,12 +1,19 @@
-//! The `kot` REPL, the *look* — a mock. Prints one fake session the way the
-//! real REPL (`client::repl`) should render it, then exits. No node, no
-//! network, no input.
+//! The `kot` REPL, the *look* — a mock. Renders what a node holds (its
+//! event log, head and mesh) the way the real REPL (`client::repl`) should,
+//! draws the composer, and exits. Read-only: no signing, no input.
 //!
-//!     cargo run -p kot --bin repl-mock -- bund     # the Bund after dark (default)
-//!     cargo run -p kot --bin repl-mock -- neon     # Lujiazui in the rain, full cyberpunk
-//!     cargo run -p kot --bin repl-mock -- ink      # 水墨 — ink wash, one vermilion seal
+//!     cargo run --release -p kot --bin repl-mock -- --node http://192.168.1.123:9944
+//!     cargo run --release -p kot --bin repl-mock -- neon --node http://192.168.1.123:9944 --last 50
+//!     cargo run --release -p kot --bin repl-mock -- ink --demo        # the canned session, no node
 //!
-//! (`KOT_THEME=neon` works too.) Same session, same layout, three skins.
+//! Skins: `bund` (the Bund after dark, default), `neon` (Lujiazui in the
+//! rain), `ink` (水墨). `KOT_THEME`, `MIOT_NODE` and `MIOT_ROSTER` are
+//! honoured like `kot` does; with no roster the fleet's from
+//! `overlays/deploy/mesh.env` is used, so the fleet's keys get names.
+//!
+//! Blocks carry no timestamp, so times are estimated: the head is "now"
+//! and every block is `BLOCK_MS` earlier — marked `≈`. Gaps between events
+//! are exact in blocks, so `(+12s)` is two blocks.
 //!
 //! Rules every skin obeys, all from `docs/CLI.md`:
 //!  §0 ordinary stdout lines, no alternate screen — the terminal owns
@@ -90,7 +97,7 @@ enum Vista {
 fn theme() -> &'static Theme {
     static T: OnceLock<Theme> = OnceLock::new();
     T.get_or_init(|| {
-        let pick = std::env::args().nth(1).or_else(|| std::env::var("KOT_THEME").ok()).unwrap_or_default();
+        let pick = std::env::args().skip(1).find(|a| ["bund", "neon", "ink"].contains(&a.as_str())).or_else(|| std::env::var("KOT_THEME").ok()).unwrap_or_default();
         match pick.as_str() {
             "neon" => NEON,
             "ink" => INK_WASH,
@@ -309,7 +316,11 @@ fn wrap(s: &str, width: usize) -> Vec<String> {
 
 /// One colour per sender, forever — that is what makes the scroll readable.
 fn cat(name: &str) -> Rgb {
-    theme().cats.iter().find(|(n, _, _)| *n == name).map(|c| c.1).unwrap_or(theme().paper)
+    let t = theme();
+    t.cats.iter().find(|(n, _, _)| *n == name).map(|c| c.1).unwrap_or_else(|| {
+        let h = name.bytes().fold(7usize, |h, b| h.wrapping_mul(31).wrapping_add(b as usize));
+        t.cats[1 + h % (t.cats.len() - 1)].1
+    })
 }
 /// Each cat's chop — one hanzi, stamped beside the name where there is room.
 fn chop(name: &str) -> &'static str {
@@ -329,7 +340,7 @@ fn task(id: &str) -> String {
 /// Message text with every `@name` lit in that cat's colour — in the log
 /// and, live, in the composer as you type it.
 fn tags(body: &str) -> String {
-    let names = ["meow", "tama", "kuro", "sora", "mimi", "root"];
+    let names: Vec<&str> = roster().names().collect();
     body.split(' ')
         .map(|w| match w.strip_prefix('@') {
             Some(t) => {
@@ -468,13 +479,15 @@ fn stamp(time: &str, block: u64) -> String {
         t.push(' ');
         t.push_str(&dim(gap));
     }
-    let pad = " ".repeat(14usize.saturating_sub(cells(time)));
+    let pad = " ".repeat(TIME_W.saturating_sub(cells(time)));
     format!("  {t}{pad}  {}  ", dim(&format!("{:<6}", block_id(block))))
 }
 
+/// The time column: `≈02:20 (+11m30s)` at its widest.
+const TIME_W: usize = 16;
 /// Cells the stamp occupies: two of margin, the time column, block column
 /// and their gaps. Continuation lines hang under the text, not column 0.
-const STAMP_W: usize = 2 + 14 + 2 + 6 + 2;
+const STAMP_W: usize = 2 + TIME_W + 2 + 6 + 2;
 
 /// A protocol observation — the effect in prose, the protocol's own verbs,
 /// wrapped to the terminal under its own column.
@@ -514,7 +527,7 @@ fn nudged() -> String {
 fn mesh(text: String) {
     let t = theme();
     let tag = if t.bracket_labels { "[网] MESH" } else { "网 mesh" };
-    println!("  {} {}  {text}", " ".repeat(14), paint(t.cats[3].1, tag));
+    println!("  {} {}  {text}", " ".repeat(TIME_W), paint(t.cats[3].1, tag));
 }
 
 /// A cat speaking: the small Akuma shaded from the sender's colour down
@@ -554,7 +567,16 @@ fn prompt(target: Option<&str>) -> String {
 /// What you typed, left in scrollback exactly where the composer stood when
 /// you hit ⏎ — at the margin, behind its prompt, like any shell.
 fn typed(target: Option<&str>, line: &str) {
-    println!("  {}{}", prompt(target), tags(line));
+    let p = prompt(target);
+    let indent = 2 + vcells(&p);
+    let width = term_width().saturating_sub(indent).max(20);
+    for (i, l) in wrap(&tags(line), width).into_iter().enumerate() {
+        if i == 0 {
+            println!("  {p}{l}");
+        } else {
+            println!("{}{l}", " ".repeat(indent));
+        }
+    }
 }
 
 /// Your own line: the echo, then the chain's word that it was sealed.
@@ -614,7 +636,237 @@ fn composer(node: &str, primary: &str, head: u64, target: &str, draft: &str) {
     println!("  {}{hint}", " ".repeat(vcells(&prompt)));
 }
 
-fn main() {
+// ── live ────────────────────────────────────────────────────────────────
+
+use kot::common::Roster;
+
+fn roster() -> &'static Roster {
+    static R: OnceLock<Roster> = OnceLock::new();
+    R.get_or_init(|| {
+        let spec = arg("--roster")
+            .or_else(|| std::env::var("MIOT_ROSTER").ok())
+            .or_else(|| include_str!("../../../../overlays/deploy/mesh.env").lines().find_map(|l| l.strip_prefix("MIOT_ROSTER=").map(str::to_string)))
+            .unwrap_or_else(|| "root=1,mimi=2,tama=3,kuro=4,sora=5".into());
+        Roster::parse(&spec).unwrap_or_else(|e| {
+            eprintln!("bad roster: {e}");
+            std::process::exit(2)
+        })
+    })
+}
+
+/// `--flag value` from argv.
+fn arg(flag: &str) -> Option<String> {
+    let a: Vec<String> = std::env::args().collect();
+    a.iter().position(|x| x == flag).and_then(|i| a.get(i + 1).cloned())
+}
+
+/// An account field, resolved through the roster; `?` when null.
+fn name_of(eff: &serde_json::Value, field: &str) -> String {
+    eff[field]
+        .as_str()
+        .map(|s| miot_keys::from_hex(s).map(|a| roster().name_of(&a)).unwrap_or_else(|_| s.to_string()))
+        .unwrap_or_else(|| "?".into())
+}
+
+/// Local HH:MM for a unix time, via the shell's `date` — the mock has no tz
+/// tables of its own.
+fn hhmm(unix: i64) -> String {
+    let try_args = |a: &[&str]| {
+        std::process::Command::new("date")
+            .args(a)
+            .output()
+            .ok()
+            .filter(|o| o.status.success())
+            .and_then(|o| String::from_utf8(o.stdout).ok())
+            .map(|s| s.trim().to_string())
+    };
+    try_args(&["-r", &unix.to_string(), "+%H:%M"]) // bsd / macos
+        .or_else(|| try_args(&["-d", &format!("@{unix}"), "+%H:%M"])) // gnu
+        .unwrap_or_else(|| "--:--".into())
+}
+
+fn human(secs: u64) -> String {
+    match secs {
+        s if s < 60 => format!("{s}s"),
+        s if s < 3600 => format!("{}m{:02}s", s / 60, s % 60),
+        s => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// The time column for an event at `block`, given the head is now: an
+/// estimate marked `≈`, plus the exact gap in blocks since `prev`.
+fn when(block: u64, prev: Option<u64>, head: u64, now: i64) -> String {
+    let secs_per_block = kot::node::BLOCK_MS / 1000;
+    let at = now - (head.saturating_sub(block) * secs_per_block) as i64;
+    match prev {
+        Some(p) => format!("≈{} (+{})", hhmm(at), human(block.saturating_sub(p) * secs_per_block)),
+        None => format!("≈{}", hhmm(at)),
+    }
+}
+
+/// One effect, in the protocol's own words and the skin's colours —
+/// field-for-field what `client.rs`' `render_effect` says, so the two never
+/// disagree on what happened.
+fn render(time: &str, block: u64, eff: &serde_json::Value) {
+    let task_id = || task(eff["task"].as_str().unwrap_or("?"));
+    let text = |f: &str| eff[f].as_str().unwrap_or("").to_string();
+    match eff["t"].as_str().unwrap_or("") {
+        "said" => {
+            let from = name_of(eff, "from");
+            let to = if eff["to"].is_null() { "litter".to_string() } else { name_of(eff, "to") };
+            if eff["root"].as_bool().unwrap_or(false) || from == "root" {
+                me(time, block, &to, &text("body"));
+            } else {
+                said(time, block, &from, &to, &text("body"));
+            }
+        }
+        "opened" => obs(time, block, format!("{} opened {}: {}", who(&name_of(eff, "who")), task_id(), plain(&text("text")))),
+        "planned" => obs(time, block, format!("{} planned {} into {} subtasks", who(&name_of(eff, "who")), task_id(), plain(&eff["count"].to_string()))),
+        "assigned" => obs(time, block, format!("{} assigned to {}: {}", task_id(), who(&name_of(eff, "to")), dim(&text("what")))),
+        "directed" => obs(time, block, format!("{} directed on {}: {}", who(&name_of(eff, "to")), task_id(), directed(eff["directive"].as_str().unwrap_or("?")))),
+        "nudge" => {
+            let last = if eff["last"].as_bool().unwrap_or(false) { ", last" } else { "" };
+            obs(time, block, format!("{} {} {} {}", who(&name_of(eff, "to")), nudged(), task_id(), dim(&format!("({} left{last})", eff["remaining"]))));
+        }
+        "record" => {
+            let act = eff["act"].as_str().unwrap_or("?");
+            let v = match act {
+                "claimed" => claimed(),
+                "submitted" => submitted(),
+                other => verb("·", other, theme().progress),
+            };
+            let t = text("text");
+            let suffix = if t.is_empty() { String::new() } else { format!(": {}", dim(&t)) };
+            obs(time, block, format!("{} {v} {}{suffix}", who(&name_of(eff, "who")), task_id()));
+        }
+        "requeued" => obs(time, block, format!("{} requeued from {}: {}", task_id(), who(&name_of(eff, "from")), dim(eff["why"].as_str().unwrap_or("?")))),
+        "budget_spent" => obs(time, block, format!("{} spent its nudge budget on {}", who(&name_of(eff, "holder")), task_id())),
+        "closed" => obs(time, block, format!("{} {} by {}: {}", task_id(), closed(), who(&name_of(eff, "author")), plain(&text("title")))),
+        "failed" => obs(time, block, format!("{} {}", task_id(), bold(theme().alarm, "✗ failed"))),
+        "rehomed" => obs(time, block, format!("{} rehomed from {} to {}", task_id(), who(&name_of(eff, "from")), who(&name_of(eff, "to")))),
+        other => obs(time, block, format!("{} {}", dim(other), faint(&eff.to_string()))),
+    }
+}
+
+async fn get(http: &reqwest::Client, node: &str, path: &str) -> Result<serde_json::Value, String> {
+    let r = http.get(format!("{node}{path}")).send().await.map_err(|e| format!("{node}{path}: {e}"))?;
+    r.json().await.map_err(|e| format!("{node}{path}: bad json: {e}"))
+}
+
+/// The session, from a real node: header, the last `--last` events, the
+/// mesh as it stands, the composer. Then exit — the real REPL would keep
+/// tailing `/events` and redraw the composer under each new line.
+async fn live(node: &str, last: usize) -> Result<(), String> {
+    let t = theme();
+    let node = node.trim_end_matches('/');
+    let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap();
+
+    let t0 = std::time::Instant::now();
+    let head = get(&http, node, "/head").await?;
+    let latency = t0.elapsed().as_millis();
+    let head_block = head["block"].as_u64().unwrap_or(0);
+    let leader = head["leader"].as_str().and_then(|s| miot_keys::from_hex(s).ok()).map(|a| roster().name_of(&a));
+    let events = match get(&http, node, "/events?since=0").await? {
+        serde_json::Value::Array(v) => v,
+        _ => Vec::new(),
+    };
+    let mesh_v = get(&http, node, "/mesh/peers").await.ok();
+    // Two leaders, deliberately: `/head`'s is the litter's leader *cat*
+    // (pallet `set_leader`, who plans), the mesh's is the elected node that
+    // seals blocks. Writes go to the second.
+    let primary = mesh_v.as_ref().and_then(|m| {
+        std::iter::once(&m["me"])
+            .chain(m["peers"].as_array().into_iter().flatten().map(|p| &p["status"]))
+            .find(|st| st["role"].as_str() == Some("leader"))
+            .and_then(|st| st["account"].as_str())
+            .and_then(|s| miot_keys::from_hex(s).ok())
+            .map(|a| roster().name_of(&a))
+    });
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+
+    let me_id = kot::common::load_or_create_identity(&kot::common::root_identity_path(), "miot-root");
+    let me_name = roster().name_of(&me_id.account());
+
+    banner();
+    let role = mesh_v.as_ref().and_then(|m| m["me"]["role"].as_str()).unwrap_or("?").to_string();
+    let fwd = if role == "leader" { "primary, seals blocks itself" } else { "forwards writes to the primary" };
+    kv("节点", "node", format!("{}  {}", plain(node), dim(&format!("{role} · {latency}ms · {fwd}"))));
+    kv("身份", "you", format!("{}  {}", sealed(&me_name), dim(&format!("{}  {}", miot_keys::short(&me_id.account()), kot::common::root_identity_path().display()))));
+    kv("猫群", "litter", roster().names().filter(|n| *n != me_name).map(sealed).collect::<Vec<_>>().join("   "));
+    let blocks: Vec<u64> = events.iter().filter_map(|e| e["block"].as_u64()).collect();
+    let gaps: Vec<u64> = blocks.windows(2).map(|w| w[1].saturating_sub(w[0])).rev().take(16).collect::<Vec<_>>().into_iter().rev().collect();
+    let term = mesh_v.as_ref().and_then(|m| m["me"]["term"].as_u64()).unwrap_or(0);
+    kv(
+        "链",
+        "chain",
+        format!(
+            "{}  {}  {}",
+            dim(&format!("head {}", block_id(head_block))),
+            if gaps.is_empty() { dim("no events yet") } else { sparkline(&gaps) },
+            dim(&format!(
+                "{}s blocks · primary {} · term {} · leader cat {}",
+                kot::node::BLOCK_MS / 1000,
+                primary.clone().unwrap_or_else(|| "nobody".into()),
+                term,
+                leader.clone().unwrap_or_else(|| "unset".into())
+            ))
+        ),
+    );
+
+    let shown = events.len().min(last);
+    section("回放", &format!("replay · last {shown} of {} events · ≈ times from {}s blocks", events.len(), kot::node::BLOCK_MS / 1000));
+    println!();
+    if events.is_empty() {
+        println!("{}{}", " ".repeat(STAMP_W), dim("nothing on this chain yet"));
+    }
+    let start = events.len() - shown;
+    let mut prev: Option<u64> = if start > 0 { events[start - 1]["block"].as_u64() } else { None };
+    for e in &events[start..] {
+        let block = e["block"].as_u64().unwrap_or(0);
+        let time = when(block, prev, head_block, now);
+        render(&time, block, &e["effect"]);
+        prev = Some(block);
+    }
+    section("回放结束", "end replay");
+    println!();
+
+    if let Some(m) = &mesh_v {
+        let peers = m["peers"].as_array().cloned().unwrap_or_default();
+        let total = 1 + peers.len();
+        let mut alive = 1;
+        let mut stale = Vec::new();
+        for p in &peers {
+            let seen = p["seen_ms_ago"].as_u64();
+            let name = p["status"]["account"].as_str().and_then(|s| miot_keys::from_hex(s).ok()).map(|a| roster().name_of(&a));
+            match (seen, name) {
+                (Some(ms), Some(n)) if ms <= 5_000 => {
+                    alive += 1;
+                    let _ = n;
+                }
+                (Some(_), Some(n)) => stale.push(format!("{} {}", who(&n), paint(t.warm, "stale"))),
+                (_, _) => stale.push(format!("{} {}", dim(p["route"].as_str().unwrap_or("?")), paint(t.warm, "never answered"))),
+            }
+        }
+        mesh(format!(
+            "primary {} · term {} · {} alive · quorum {} · checkpoint {}",
+            primary.as_deref().map(who).unwrap_or_else(|| dim("nobody (election)")),
+            plain(&term.to_string()),
+            plain(&format!("{alive}/{total}")),
+            plain(&m["quorum"].to_string()),
+            plain(&block_id(m["last_checkpoint"].as_u64().unwrap_or(0)))
+        ));
+        for s in stale {
+            mesh(s);
+        }
+    }
+
+    composer(node.trim_start_matches("http://"), primary.as_deref().unwrap_or("?"), head_block, "litter", "");
+    Ok(())
+}
+
+/// The canned session — the same rendering with invented events, for
+/// working on the look without a node.
+fn demo() {
     let t = theme();
     banner();
     kv("节点", "node", format!("{}  {}", plain("http://192.168.1.123:9944"), dim("replica · 12ms · forwards to the primary")));
@@ -669,6 +921,23 @@ fn main() {
     keys();
 
     composer("192.168.1.123:9944", "meow", 1188, "tama", "@tama can you re-run the build with -j1 and paste ");
+}
+
+#[tokio::main]
+async fn main() {
+    let t = theme();
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--demo") {
+        demo();
+    } else {
+        let node = arg("--node").or_else(|| std::env::var("MIOT_NODE").ok()).unwrap_or_else(|| "http://127.0.0.1:9944".into());
+        let last = arg("--last").and_then(|n| n.parse().ok()).unwrap_or(30);
+        if let Err(e) = live(&node, last).await {
+            eprintln!("  {}", paint(t.alarm, &format!("✗ {e}")));
+            eprintln!("  {}", dim("no node? `repl-mock --demo` shows the canned session."));
+            std::process::exit(1);
+        }
+    }
     let others = ["bund", "neon", "ink"].iter().filter(|s| **s != t.name).cloned().collect::<Vec<_>>().join(" · ");
     println!("\n  {}  {}", plain("再见 · bye."), dim(&format!("skin {}  ·  try {others}  ·  repl-mock <skin> or KOT_THEME", t.name)));
 }

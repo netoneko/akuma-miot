@@ -145,10 +145,12 @@ impl Llm {
 /// The tool a cat uses to talk.
 ///
 /// Separate from [`task_tools`] because a cat that is being *spoken to* has no
-/// task to act on, and offering it six task verbs it cannot use is how a small
-/// model ends up calling one of them anyway.
+/// task to act on, and offering it the task-state verbs it cannot use is how a
+/// small model ends up calling one of them anyway. [`local_tools`] carries no
+/// task state, so those are fine here — a DM is exactly how an operator hands
+/// a cat a one-off job outside the formal task lifecycle.
 pub fn chat_tools() -> Vec<Tool> {
-    vec![Tool::new("SendMessage")
+    let mut tools = vec![Tool::new("SendMessage")
         .with_description("Say something. Use this to reply.")
         .with_schema(serde_json::json!({
             "type": "object",
@@ -158,7 +160,42 @@ pub fn chat_tools() -> Vec<Tool> {
                 "body": {"type": "string"}
             },
             "required": ["body"]
-        }))]
+        }))];
+    tools.extend(local_tools());
+    tools
+}
+
+/// Stubs: local to this cat's own host, no sandbox. A turn is one LLM call
+/// in, tool calls out — there is no loop that feeds a result back for a
+/// further reply, so these don't help decide what to do next; use them to do
+/// work, then a separate `SendMessage`/`TaskUpdate` to report it.
+fn local_tools() -> Vec<Tool> {
+    vec![
+        Tool::new("Bash")
+            .with_description("Run one shell command on this cat's own host (/bin/sh -c).")
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+                "required": ["command"]
+            })),
+        Tool::new("ReadFile")
+            .with_description("Read one text file from this cat's own host.")
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            })),
+        Tool::new("WriteFile")
+            .with_description("Write text to a file on this cat's own host, overwriting it.")
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string"},
+                    "content": {"type": "string"}
+                },
+                "required": ["path", "content"]
+            })),
+    ]
 }
 
 /// The public tool surface, as the model sees it.
@@ -170,7 +207,7 @@ pub fn chat_tools() -> Vec<Tool> {
 /// `TaskPlan` and `TaskReassign` are separate because they are leader acts that
 /// take another cat's name rather than text.
 pub fn task_tools() -> Vec<Tool> {
-    vec![
+    let mut tools = vec![
         Tool::new("TaskUpdate")
             .with_description("Act on one task. Use the status you were told to use.")
             .with_schema(serde_json::json!({
@@ -220,33 +257,7 @@ pub fn task_tools() -> Vec<Tool> {
                 },
                 "required": ["task", "to"]
             })),
-        // Stubs: local to this cat's own host, no sandbox. A turn is one LLM
-        // call in, tool calls out — there is no loop that feeds a result back
-        // for a further reply, so these don't help decide what to do next;
-        // use them to do work, then a separate TaskUpdate to report it.
-        Tool::new("Bash")
-            .with_description("Run one shell command on this cat's own host (/bin/sh -c).")
-            .with_schema(serde_json::json!({
-                "type": "object",
-                "properties": {"command": {"type": "string"}},
-                "required": ["command"]
-            })),
-        Tool::new("ReadFile")
-            .with_description("Read one text file from this cat's own host.")
-            .with_schema(serde_json::json!({
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"]
-            })),
-        Tool::new("WriteFile")
-            .with_description("Write text to a file on this cat's own host, overwriting it.")
-            .with_schema(serde_json::json!({
-                "type": "object",
-                "properties": {
-                    "path": {"type": "string"},
-                    "content": {"type": "string"}
-                },
-                "required": ["path", "content"]
-            })),
-    ]
+    ];
+    tools.extend(local_tools());
+    tools
 }
