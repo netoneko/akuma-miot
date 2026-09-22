@@ -11,7 +11,7 @@ name = "miot-node"
 path = "src/main.rs"
 
 [dependencies]
-polkadot-sdk = { workspace = true, default-features = true, features = ["frame-support", "frame-system", "sp-io", "sp-runtime", "sp-core"] }
+polkadot-sdk = { workspace = true, default-features = true, features = ["frame-support", "frame-system", "sp-io", "sp-runtime", "sp-core", "sp-storage"] }
 codec = { package = "parity-scale-codec", version = "3", features = ["std"] }
 miot-primitives = { workspace = true, features = ["codec"] }
 miot-runtime = { path = "../miot-runtime" }

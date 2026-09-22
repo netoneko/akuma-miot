@@ -195,6 +195,37 @@ impl Store {
         Ok(pruned)
     }
 
+    /// Adopt an externally-supplied checkpoint directly — what a node does
+    /// when a peer's `last_checkpoint` is ahead of its own, including a
+    /// fresh node with no log at all. There is no way to reach that
+    /// checkpoint by replaying blocks we don't have (the peer already
+    /// dropped them, same as [`Store::compact`] drops ours), so this takes
+    /// the peer's word for the state as of `height` and starts our own log
+    /// clean from there — no `head`/`last_checkpoint` precondition, unlike
+    /// `compact`, since by definition we may hold nothing at all up to
+    /// `height`, or blocks that are about to be superseded regardless.
+    ///
+    /// Discards everything we held before, even blocks below `height` we
+    /// might have coincidentally agreed with the peer on: a checkpoint
+    /// means "everything below this is superseded," not just "everything
+    /// wrong is below this."
+    pub fn adopt_checkpoint(&mut self, height: u64, state: &[u8]) -> Result<()> {
+        let mut ops: Vec<(u8, Vec<u8>, Option<Vec<u8>>)> = Vec::new();
+        for h in 1..=self.head {
+            ops.push((COL_BLOCK, key(h), None));
+        }
+        if self.last_checkpoint > 0 {
+            ops.push((COL_CHECKPOINT, key(self.last_checkpoint), None));
+        }
+        ops.push((COL_CHECKPOINT, key(height), Some(state.to_vec())));
+        ops.push((COL_META, KEY_LAST_CP.to_vec(), Some(height.to_be_bytes().to_vec())));
+        ops.push((COL_META, KEY_HEAD.to_vec(), Some(height.to_be_bytes().to_vec())));
+        self.db.commit(ops)?;
+        self.last_checkpoint = height;
+        self.head = height;
+        Ok(())
+    }
+
     pub fn block(&self, height: u64) -> Result<Option<Vec<u8>>> {
         Ok(self.db.get(COL_BLOCK, &key(height))?)
     }

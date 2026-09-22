@@ -124,11 +124,17 @@ struct Node {
     peer: Option<String>,
     /// Used for the replica's sync loop; unused (but harmless) on a primary.
     http: reqwest::Client,
-    /// Kept so a replica can rebuild genesis from scratch after
-    /// [`reconcile`] detects a real fork — see there for why that's always
-    /// a full rebuild today, not a partial rewind.
+    /// Kept so a replica (or `Node::replay`, or `Node::restore_from_snapshot`
+    /// via [`genesis`]) can rebuild state from scratch when there's no
+    /// compaction checkpoint to restore from instead.
     genesis_root: AccountId,
     genesis_leader: AccountId,
+    /// Set when a submitted `clear_all` dispatches successfully; consumed by
+    /// the *next* [`Node::advance`] once that block actually closes and
+    /// persists — `clear_all`'s effects land in the block currently open,
+    /// which `Store::compact` can't target until it closes (`compact`
+    /// requires `height <= store.head()`).
+    pending_compaction: bool,
 }
 
 const LOG_CAP: usize = 4096;
@@ -226,6 +232,10 @@ impl Node {
         let closing = self.block;
         let header = self.ext.execute_with(Executive::finalize_block);
         self.persist(closing);
+        if self.pending_compaction {
+            self.compact_at(closing);
+            self.pending_compaction = false;
+        }
         self.parent_hash = header.hash();
         self.block += 1;
         let b = self.block;
@@ -291,23 +301,91 @@ impl Node {
         self.ext.execute_with(|| Executive::initialize_block(&next));
     }
 
-    /// Rebuild state from the store on start, one block at a time, from
-    /// height 1 through `store.head()`. Block 1's `initialize_block` was
-    /// already run by [`genesis`] (needed either way, to install root/leader
-    /// and hand out `catnip`), which is what makes it safe for
-    /// [`Node::apply_block`] to assume the height it's given is already open.
+    /// Rebuild state from the store on start. If a compaction checkpoint
+    /// exists, restore from it directly (`restore_from_snapshot`) rather
+    /// than replaying from genesis — required, not optional, once
+    /// `compact_at` ever actually runs: `store.block(h)` returns `None` for
+    /// every `h <= last_checkpoint` (compaction deletes them), so looping
+    /// from 1 unconditionally would panic on the first restart after any
+    /// real compaction. With no checkpoint yet (`last_checkpoint() == 0`,
+    /// still true until `/clear` runs at least once), this is exactly
+    /// today's behavior: start at block 1, whose `initialize_block` was
+    /// already run by [`genesis`].
     fn replay(&mut self, store: &miot_store::Store) {
         let head = store.head();
-        if head == 0 {
+        let cp = store.last_checkpoint();
+        if cp > 0 {
+            let blob = store.checkpoint_state().expect("store read").expect("checkpoint recorded, its state must exist");
+            self.restore_from_snapshot(cp, &blob);
+        }
+        let from = cp + 1;
+        if from > head {
             return;
         }
-        for h in 1..=head {
+        for h in from..=head {
             self.block = h;
-            let body = store.block(h).expect("store read").expect("contiguous store, height already validated by head()");
+            let body = store.block(h).expect("store read").expect("contiguous store above the checkpoint");
             let effects: Vec<Effect<AccountId>> =
                 Decode::decode(&mut &body[..]).expect("corrupt block body in store");
             self.apply_block(h, effects);
         }
+    }
+
+    /// Take a snapshot of `self.ext` as of the just-finalized block `height`
+    /// and record it as a new compaction checkpoint (`Store::compact`) —
+    /// the one trigger this project wires up: root's own `/clear`
+    /// (`Node::submit` sets `pending_compaction`), a deliberate session
+    /// boundary that already sweeps every closed parent immediately
+    /// (`clear_all`'s own `gc(now, keep_for: 0)`), so the state this
+    /// snapshots is already the "nothing worth keeping below here" state
+    /// that boundary is for.
+    ///
+    /// `into_raw_snapshot`/`from_raw_snapshot` (`sp_io::TestExternalities`)
+    /// dump and restore the *entire* storage trie — every pallet, not just
+    /// `pallet-litter`'s own value — as raw key/value bytes; this project's
+    /// `Header`s never carry a real state root to stay consistent with
+    /// (`Header::new` always passes `Default::default()` for it), so the
+    /// round-trip only needs to be internally self-consistent, which those
+    /// two calls already guarantee. `into_raw_snapshot` *drains* the
+    /// externalities it's called on, so a fresh one is rebuilt from the
+    /// same raw data immediately, to keep serving live traffic.
+    fn compact_at(&mut self, height: u64) {
+        let Some(store) = self.store.as_mut() else { return };
+        let mut ext = std::mem::replace(&mut self.ext, sp_io::TestExternalities::new_empty());
+        // `into_raw_snapshot` drains the *backend* only, not the pending
+        // overlay `execute_with` accumulates — without this, the snapshot
+        // silently reflects whatever was last committed (genesis, since
+        // nothing here ever called this before), not current state. Found
+        // live: block production crashed on the very next block with
+        // frame_system's own "block number must be strictly increasing"
+        // assertion, because the restored ext still thought it was at
+        // block 1.
+        ext.commit_all().expect("no open storage transactions to conflict with a plain commit");
+        let (raw, root) = ext.into_raw_snapshot();
+        let version = sp_storage::StateVersion::default();
+        self.ext = sp_io::TestExternalities::from_raw_snapshot(raw.clone(), root, version);
+        let blob = Snapshot { raw, root, version }.encode();
+        match store.compact(height, &blob) {
+            Ok(pruned) => println!("[node] compacted at block {height} ({pruned} block(s) pruned)"),
+            Err(e) => eprintln!("[node] compact failed at block {height}: {e}"),
+        }
+    }
+
+    /// Restore `self.ext` directly from a compaction checkpoint instead of
+    /// replaying from genesis. Leaves block `height + 1` open, the same
+    /// convention [`Node::apply_block`] leaves every block in — a caller
+    /// (`replay`, or `reconcile` once a rewind lands above genesis) picks
+    /// up from there exactly as if `apply_block(height, ...)` had just run.
+    fn restore_from_snapshot(&mut self, height: u64, blob: &[u8]) {
+        let Snapshot { raw, root, version } = Decode::decode(&mut &blob[..]).expect("corrupt checkpoint state");
+        self.ext = sp_io::TestExternalities::from_raw_snapshot(raw, root, version);
+        self.parent_hash = self.ext.execute_with(|| System::block_hash(height));
+        self.log.clear();
+        self.seq = 0;
+        self.pending.clear();
+        self.block = height + 1;
+        let next = Header::new(self.block, Default::default(), Default::default(), self.parent_hash, Default::default());
+        self.ext.execute_with(|| Executive::initialize_block(&next));
     }
 
     /// Check and dispatch one signed extrinsic into the block that is
@@ -315,11 +393,20 @@ impl Node {
     /// (`AlreadySubmitted`, `NotYours`, …) depends on an immediate answer —
     /// the same guarantee `/call` used to give, now backed by a real check.
     fn submit(&mut self, uxt: UncheckedExtrinsic) -> Result<(), String> {
+        // Checked before `uxt` moves into `apply_extrinsic` below — a
+        // successful `clear_all` is the one trigger `compact_at` fires on
+        // (`Node::advance`, once this block actually closes).
+        let is_clear = matches!(uxt.function, miot_runtime::RuntimeCall::Litter(pallet_litter::Call::clear_all {}));
         let r = self.ext.execute_with(|| Executive::apply_extrinsic(uxt));
         let fx = self.drain();
         self.absorb(fx);
         match r {
-            Ok(Ok(())) => Ok(()),
+            Ok(Ok(())) => {
+                if is_clear {
+                    self.pending_compaction = true;
+                }
+                Ok(())
+            }
             Ok(Err(e)) => Err(format!("{e:?}")),
             // Bad signature, stale nonce, wrong genesis/spec/tx version —
             // the extrinsic never reached the pallet at all.
@@ -423,6 +510,28 @@ struct BlocksQuery {
     limit: Option<u64>,
 }
 
+/// The full storage trie, as `Node::compact_at`/`Node::restore_from_snapshot`
+/// round-trip it through `sp_io::TestExternalities::into_raw_snapshot`/
+/// `from_raw_snapshot`. This *is* `Store::compact`'s opaque `state` blob —
+/// `miot-store` never looks inside it, so its shape only has to make sense
+/// to `miot-node`.
+#[derive(Encode, Decode)]
+struct Snapshot {
+    raw: Vec<(Vec<u8>, (Vec<u8>, i32))>,
+    root: H256,
+    version: sp_storage::StateVersion,
+}
+
+/// What `GET /chain/checkpoint` serves — the compaction state a replica
+/// adopts (`reconcile_if_diverged`/`reconcile`) when its own log doesn't
+/// reach as far back as the peer's latest checkpoint. Hex for the same
+/// reason `BlockRow.body_hex` is.
+#[derive(Serialize, Deserialize)]
+struct CheckpointRow {
+    height: u64,
+    state_hex: String,
+}
+
 /// A page is bounded so one replica's catch-up request can't come back as
 /// one huge response; `sync_once` just asks again next tick for the rest.
 const SYNC_PAGE: u64 = 256;
@@ -493,41 +602,69 @@ async fn fetch_blocks(http: &reqwest::Client, peer: &str, from: u64, limit: u64)
     }
 }
 
-/// Compare our *entire* local block range against the peer's, once — at
-/// startup, before the periodic [`sync_once`] tail loop begins. A replica
-/// only ever appends blocks it received from this peer, so once this has
-/// run it cannot diverge from the peer again on its own before the next
-/// restart; there is no need to repeat it per tick.
+async fn fetch_checkpoint(http: &reqwest::Client, peer: &str) -> Option<(u64, Vec<u8>)> {
+    let row: Option<CheckpointRow> = http.get(format!("{peer}/chain/checkpoint")).send().await.ok()?.json().await.ok()?;
+    let row = row?;
+    let state = hex::decode(&row.state_hex).ok()?;
+    Some((row.height, state))
+}
+
+/// Compare our local block range against the peer's, once — at startup,
+/// before the periodic [`sync_once`] tail loop begins. A replica only ever
+/// appends blocks it received from this peer, so once this has run it
+/// cannot diverge from the peer again on its own before the next restart;
+/// there is no need to repeat it per tick.
 ///
-/// Fetches `[1, our head]` from the peer rather than just comparing the
-/// tip. A "quiet" block — no effects that tick, the common case — encodes
-/// as the exact same bytes (an empty `Vec<Effect>`) no matter which chain
-/// produced it, so a tip-only comparison can find a false "agreement" while
-/// a real divergence sits at an earlier, non-quiet height beneath it
-/// (observed live standing this up: a tip check missed a diverged block
-/// holding a real `Opened` effect because both chains' *next* few blocks
-/// happened to be quiet). Comparing the whole range is the only reliable
-/// check without block hashes to compare instead of raw bodies.
+/// Two cases, handled separately:
 ///
-/// This inherits the same cost `compact()` never being wired in already
-/// imposes elsewhere (see [`reconcile`]): with no checkpoint to start from,
-/// there is nowhere to begin this comparison but height 1, so a long-lived,
-/// never-compacted chain makes each reconnect proportionally more
-/// expensive. Wiring in `compact()` — a separate, still-open item — would
-/// let this start from the latest checkpoint instead of genesis.
+/// 1. **The peer has compacted further than we have** (`peer.last_checkpoint
+///    > our own`) — including a fresh node with no log at all. There is no
+///    way to reach that point by replaying blocks the peer already dropped,
+///    so adopt its checkpoint directly (`Store::adopt_checkpoint`) rather
+///    than trying to compare byte ranges we can't get.
+/// 2. **Otherwise**, compare the range above our own checkpoint (or from
+///    block 1, if we have none yet) against the peer's. A "quiet" block —
+///    no effects that tick, the common case — encodes as the exact same
+///    bytes (an empty `Vec<Effect>`) no matter which chain produced it, so
+///    comparing only the tip can find a false "agreement" while a real
+///    divergence sits at an earlier, non-quiet height beneath it (observed
+///    live standing this up, before compaction existed to bound the range).
 async fn reconcile_if_diverged(shared: &Shared) {
-    let (http, peer, my_head) = {
+    let (http, peer, my_head, my_cp) = {
         let n = shared.lock().await;
         let peer = n.peer.clone().expect("reconcile_if_diverged only runs for a replica");
-        let my_head = n.store.as_ref().expect("replica always has a store").head();
-        (n.http.clone(), peer, my_head)
+        let store = n.store.as_ref().expect("replica always has a store");
+        (n.http.clone(), peer, store.head(), store.last_checkpoint())
     };
-    if my_head == 0 {
+
+    let peer_head: Option<ChainHead> = match http.get(format!("{peer}/chain/head")).send().await {
+        Ok(r) => r.json().await.ok(),
+        Err(_) => None,
+    };
+    let Some(peer_head) = peer_head else {
+        eprintln!("[node] reconcile: peer unreachable, will retry next tick");
         return;
+    };
+
+    if peer_head.last_checkpoint > my_cp {
+        let Some((cp_height, cp_state)) = fetch_checkpoint(&http, &peer).await else {
+            eprintln!("[node] reconcile: peer reports a checkpoint but didn't serve one");
+            return;
+        };
+        let mut n = shared.lock().await;
+        let store = n.store.as_mut().expect("replica always has a store");
+        store.adopt_checkpoint(cp_height, &cp_state).expect("adopt_checkpoint");
+        println!("[node] adopted peer's checkpoint at block {cp_height}");
+        n.restore_from_snapshot(cp_height, &cp_state);
+        return; // sync_once's tail loop catches up from here next.
+    }
+
+    if my_head == 0 {
+        return; // fresh, and the peer has no checkpoint either — nothing to compare yet.
     }
 
     let mut theirs = Vec::new();
-    let mut from = 1;
+    let mut from = my_cp + 1;
     while from <= my_head {
         let rows = fetch_blocks(&http, &peer, from, SYNC_PAGE).await;
         if rows.is_empty() {
@@ -546,7 +683,7 @@ async fn reconcile_if_diverged(shared: &Shared) {
     let fork = {
         let mut n = shared.lock().await;
         let store = n.store.as_mut().expect("replica always has a store");
-        store.fork_point(1, &theirs).expect("fork_point")
+        store.fork_point(my_cp + 1, &theirs).expect("fork_point")
     };
     if fork < my_head {
         reconcile(shared, fork).await;
@@ -556,22 +693,12 @@ async fn reconcile_if_diverged(shared: &Shared) {
 /// We diverged from the peer above `fork` (the true last-agreeing height,
 /// from [`reconcile_if_diverged`]). Reconcile the honest way: rewind to the
 /// latest compaction at or below it (`miot_store::Store::rewind_for_fork`),
-/// then rebuild `self.ext` from scratch and let `sync_once`'s catch-up loop
-/// replay everything the peer holds from there.
-///
-/// **`compact()` is never called anywhere in this node yet** (a known,
-/// separate gap — see HANDOFF's "not yet real" list), so `last_checkpoint`
-/// is always 0 and `rewind_for_fork` always lands at genesis today — this
-/// always means "wipe our log, rebuild state from nothing, and replay every
-/// block the peer holds," never a partial rewind. That is the documented
-/// rule working as designed for a litter with no compaction yet
-/// (`docs/references/storage.md`: "a fork below the last compaction lands
-/// at genesis"), not a bug here. Once compaction is wired in, this same
-/// call starts landing on whatever checkpoint the divergence allows, with
-/// no change needed in this function.
+/// then restore `self.ext` from that checkpoint (or, if it landed at
+/// genesis — no checkpoint at or below the fork — rebuild from `genesis()`
+/// instead) and let `sync_once`'s catch-up loop replay everything the peer
+/// holds from there.
 async fn reconcile(shared: &Shared, fork: u64) {
     let mut n = shared.lock().await;
-    let (genesis_root, genesis_leader) = (n.genesis_root.clone(), n.genesis_leader.clone());
     let store = n.store.as_mut().expect("replica always has a store");
     let rewind = store.rewind_for_fork(fork).expect("rewind_for_fork");
     println!(
@@ -579,13 +706,19 @@ async fn reconcile(shared: &Shared, fork: u64) {
         rewind.height, rewind.dropped
     );
 
-    let (ext, genesis_hash) = genesis(genesis_root, genesis_leader);
-    n.ext = ext;
-    n.parent_hash = genesis_hash;
-    n.block = 1;
-    n.log.clear();
-    n.seq = 0;
-    n.pending.clear();
+    if rewind.height > 0 {
+        let state = rewind.state.clone().expect("a rewind above genesis always carries checkpoint state");
+        n.restore_from_snapshot(rewind.height, &state);
+    } else {
+        let (genesis_root, genesis_leader) = (n.genesis_root.clone(), n.genesis_leader.clone());
+        let (ext, genesis_hash) = genesis(genesis_root, genesis_leader);
+        n.ext = ext;
+        n.parent_hash = genesis_hash;
+        n.block = 1;
+        n.log.clear();
+        n.seq = 0;
+        n.pending.clear();
+    }
 }
 
 /// `MIOT_ROOT_PUBKEY` (an `authorized_keys` line — root's real identity, per
@@ -657,10 +790,19 @@ async fn main() {
         http: reqwest::Client::new(),
         genesis_root: root.clone(),
         genesis_leader: leader.clone(),
+        pending_compaction: false,
     };
     if let Some(store) = store {
         if !store.is_empty() {
-            println!("[node] replaying {} block(s) from {db_path}", store.head());
+            let cp = store.last_checkpoint();
+            if cp > 0 {
+                println!(
+                    "[node] restoring from checkpoint at block {cp}, then replaying {} block(s) from {db_path}",
+                    store.head() - cp
+                );
+            } else {
+                println!("[node] replaying {} block(s) from {db_path}", store.head());
+            }
             node.replay(&store);
         }
         node.store = Some(store);
@@ -715,6 +857,7 @@ async fn main() {
         .route("/tasks", get(tasks))
         .route("/chain/head", get(chain_head))
         .route("/chain/blocks", get(chain_blocks))
+        .route("/chain/checkpoint", get(chain_checkpoint))
         .with_state(node);
 
     let addr = format!("0.0.0.0:{port}");
@@ -766,6 +909,22 @@ async fn chain_blocks(AxState(n): AxState<Shared>, Query(q): Query<BlocksQuery>)
         h += 1;
     }
     Json(out)
+}
+
+/// The peer's current compaction checkpoint, if it has one — what a
+/// replica adopts when its own log doesn't reach back as far as the peer's
+/// `last_checkpoint` (see `reconcile_if_diverged`).
+async fn chain_checkpoint(AxState(n): AxState<Shared>) -> Json<Option<CheckpointRow>> {
+    let n = n.lock().await;
+    let Some(store) = n.store.as_ref() else {
+        return Json(None);
+    };
+    let cp = store.last_checkpoint();
+    if cp == 0 {
+        return Json(None);
+    }
+    let state = store.checkpoint_state().expect("store read").expect("checkpoint recorded, its state must exist");
+    Json(Some(CheckpointRow { height: cp, state_hex: hex::encode(state) }))
 }
 
 async fn head(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {

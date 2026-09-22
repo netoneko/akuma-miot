@@ -93,6 +93,43 @@ fn a_compaction_above_the_head_or_below_the_last_is_refused() {
     assert_eq!(s.last_checkpoint(), 4, "both refusals changed nothing");
 }
 
+// ---- adopting a peer's checkpoint ------------------------------------------
+
+/// A fresh store has nothing to reach a peer's checkpoint by replaying —
+/// it just takes the peer's word for it and starts clean from there.
+#[test]
+fn a_fresh_store_adopts_a_peers_checkpoint_directly() {
+    let (mut s, _d) = store();
+    s.adopt_checkpoint(7, &st(7)).unwrap();
+    assert_eq!(s.head(), 7);
+    assert_eq!(s.last_checkpoint(), 7);
+    assert_eq!(s.checkpoint_state().unwrap(), Some(st(7)));
+    assert_eq!(s.block(3).unwrap(), None, "nothing below the adopted checkpoint exists");
+}
+
+/// A store that already held its own history discards *all* of it, even
+/// blocks it might have agreed with the peer on below the new checkpoint —
+/// adopting one is "everything below this is superseded," not a targeted
+/// rewind.
+#[test]
+fn adopting_a_checkpoint_discards_whatever_we_already_held() {
+    let (mut s, _d) = store();
+    fill(&mut s, 4, "");
+    s.compact(2, &st(2)).unwrap();
+    fill(&mut s, 6, "-ours");
+
+    s.adopt_checkpoint(9, &st(9)).unwrap();
+    assert_eq!(s.head(), 9);
+    assert_eq!(s.last_checkpoint(), 9);
+    assert_eq!(s.checkpoint_state().unwrap(), Some(st(9)));
+    assert_eq!(s.block(3).unwrap(), None, "the old checkpoint's surviving blocks are gone too");
+    assert_eq!(s.block(6).unwrap(), None);
+
+    // The peer's chain continues cleanly from the adopted point.
+    fill(&mut s, 11, "-leader");
+    assert_eq!(s.block(10).unwrap(), Some(blk(10, "-leader")));
+}
+
 // ---- the leader wins ------------------------------------------------------
 
 /// The whole rule: we diverged above the last compaction, so we go back to the

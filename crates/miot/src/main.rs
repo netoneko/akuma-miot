@@ -107,7 +107,7 @@ async fn main() {
     let is_chat = args.iter().any(|a| a == "--chat");
     let arg = |k: &str| args.iter().position(|a| a == k).and_then(|i| args.get(i + 1).cloned());
     println!("{}", include_str!("../../../assets/akuma_40.txt"));
-    println!("  {DIM}akuma miot — a litter, against the real runtime, no wasm{OFF}\n");
+    println!("  {DIM}akuma // distributed cat system{OFF}\n");
     if let Some(node) = arg("--rpc") {
         let seed = arg("--identity-seed");
         let roster = arg("--roster").unwrap_or_else(|| "root=1,mimi=2,tama=3,kuro=4,sora=5".to_string());
