@@ -88,8 +88,11 @@ read that first, it is kept current and this file does not repeat it.
 - **No OpenSSH private-key signing.** Root signs with the project-native
   seed at `~/.akuma/miot/id_ed25519.seed`; its `.pub` is what every node's
   `MIOT_ROOT_PUBKEY` holds. Not the operator's `~/.ssh` key.
-- **Mesh membership is static.** `MIOT_MEMBERS` is genesis and `MIOT_PEERS`
-  is config; changing either is a coordinated restart, not an operation.
+- **Mesh membership is static.** `MIOT_ROSTER` is genesis (committed to
+  chain state by name, `pallet_litter::Roster`, served as `/roster`;
+  `MIOT_MEMBERS` is gone, 2026-09-23) and `MIOT_PEERS` is config; changing
+  either is a coordinated restart, not an operation. A block log remembers
+  the genesis it was built under and refuses a different one.
   No joint consensus — fine for one operator, not for anything else.
 - **Election ≠ replication.** A block the primary produced that no replica
   pulled before it died is lost to the rewind (records, not work —

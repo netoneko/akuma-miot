@@ -62,7 +62,27 @@ impl Client {
             .unwrap();
         let mut c = Client { http, candidates, node: String::new(), identity, roster, dm_target: None };
         c.reconnect().await?;
+        c.adopt_chain_roster().await;
         Ok(c)
+    }
+
+    /// Name accounts by the chain's own genesis roster (`/roster`) rather
+    /// than this client's copy, so a stale or mislabeled `MIOT_ROSTER` can't
+    /// put the wrong name on anyone. The local roster still decides which
+    /// node certs to trust — that's needed before anything can be read — so
+    /// it only ever loses its *names* here, never its say over trust. A node
+    /// too old to have `/roster` leaves the local names in place.
+    async fn adopt_chain_roster(&mut self) {
+        let Ok(v) = self.get_json("/roster").await else { return };
+        let rows: Vec<(String, AccountId)> = v
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| Some((r["name"].as_str()?.to_string(), miot_keys::from_hex(r["account"].as_str()?).ok()?)))
+            .collect();
+        if !rows.is_empty() {
+            self.roster = Roster(rows);
+        }
     }
 
     /// Move to the next live node. A dead endpoint is a reconnect, not an
@@ -128,7 +148,7 @@ impl Client {
         if msg.contains("Payment") {
             return Err(format!(
                 "{msg} — {} isn't a member of this chain (no `providers`; see HANDOFF.md's \"catnip\"). \
-                 Add its account to MIOT_MEMBERS/--root on every node, or sign --as a member.",
+                 Add it to MIOT_ROSTER on every node (a new genesis), or sign --as a member.",
                 miot_keys::short(&self.identity.account())
             ));
         }

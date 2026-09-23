@@ -36,7 +36,7 @@ fn cfg(who: u8, name: &str, port: u16, peers: Vec<String>, db: std::path::PathBu
     NodeConfig {
         name: name.into(),
         // `who` matches this node's own position in the `1..=5` seeds
-        // `members` draws from below, so its signed mesh traffic verifies
+        // `roster` draws from below, so its signed mesh traffic verifies
         // against its own genesis.
         identity: Identity::from_seed(&[who; 32]),
         bind: "127.0.0.1".into(),
@@ -45,7 +45,7 @@ fn cfg(who: u8, name: &str, port: u16, peers: Vec<String>, db: std::path::PathBu
         peers,
         root: seed(1),
         leader: seed(2),
-        members: (1..=5).map(seed).collect(),
+        roster: (1..=5u8).map(|n| (format!("cat{n}"), seed(n))).collect(),
         block_ms: 200,
         sync_ms: 100,
         poll_ms: 100,
@@ -284,5 +284,50 @@ async fn a_mesh_of_one_produces_on_its_own() {
     assert!(r.shared.lock().await.is_producing());
     assert!(r.shared.lock().await.head() > 0);
     assert_eq!(task_texts(&http, &url).await, vec!["alone".to_string()]);
+    r.abort();
+}
+
+/// The roster a node was started with is genesis state, served by name.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_genesis_roster_is_on_chain() {
+    let http = trusted_client();
+    let dir = tempfile::tempdir().unwrap();
+    let port = free_port();
+    let r = node::start(cfg(1, "solo", port, vec![], dir.path().join("db"))).await.unwrap();
+    let rows: Vec<serde_json::Value> = http
+        .get(format!("https://127.0.0.1:{port}/roster"))
+        .headers(node::sign_headers(&Identity::from_seed(&[1; 32]), b""))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = rows.iter().map(|r| r["name"].as_str().unwrap()).collect();
+    assert_eq!(names, ["cat1", "cat2", "cat3", "cat4", "cat5"]);
+    assert_eq!(rows[2]["account"].as_str().unwrap(), miot_keys::to_hex(&Identity::from_seed(&[3; 32]).account()));
+    r.abort();
+}
+
+/// A block log remembers its genesis. Reopened under a different roster —
+/// a new chain — the node refuses instead of replaying the old one, which
+/// the chain's own (constant) genesis hash could never catch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_store_refuses_a_different_genesis() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("db");
+    let r = node::start(cfg(1, "solo", free_port(), vec![], db.clone())).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    r.abort();
+    drop(r); // `Running` holds the node, and so the store's lock
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let mut renamed = cfg(1, "solo", free_port(), vec![], db.clone());
+    renamed.roster[4].0 = "yuki".into();
+    let err = node::start(renamed).await.err().expect("a relabeled roster is a different genesis");
+    assert!(err.contains("different genesis"), "{err}");
+
+    // The same genesis still opens.
+    let r = node::start(cfg(1, "solo", free_port(), vec![], db)).await.unwrap();
     r.abort();
 }

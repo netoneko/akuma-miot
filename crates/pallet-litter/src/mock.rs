@@ -64,7 +64,11 @@ pub const KURO: u64 = 4;
 
 pub fn new_test_ext() -> sp_io::TestExternalities {
     let mut t = frame_system::GenesisConfig::<Test>::default().build_storage().unwrap();
-    crate::GenesisConfig::<Test> { root: Some(ROOT), leader: Some(LEAD) }
+    crate::GenesisConfig::<Test> {
+        root: Some(ROOT),
+        leader: Some(LEAD),
+        roster: [("root", ROOT), ("lead", LEAD), ("tama", TAMA), ("kuro", KURO)].map(|(n, a)| (n.into(), a)).to_vec(),
+    }
         .assimilate_storage(&mut t)
         .unwrap();
     let mut ext: sp_io::TestExternalities = t.into();

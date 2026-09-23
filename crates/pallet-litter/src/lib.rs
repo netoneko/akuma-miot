@@ -197,6 +197,20 @@ pub mod pallet {
     #[pallet::storage]
     pub type Stats<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, CatStats, ValueQuery>;
 
+    /// Who is in this litter, by name: `(name, account)`, in genesis order.
+    /// Written once at genesis and never changed by any call — membership is
+    /// static (a new member is a new genesis), so there is no dispatchable
+    /// that touches it.
+    ///
+    /// On chain rather than only in each node's `MIOT_ROSTER` so the names
+    /// are agreed on like everything else in genesis: every node's roster
+    /// ends up in state, a compaction snapshot carries it, and a client reads
+    /// it from `/roster` instead of trusting its own copy for names. (The
+    /// node still takes it from config: it needs the accounts for mTLS
+    /// pinning before any state exists.)
+    #[pallet::storage]
+    pub type Roster<T: Config> = StorageValue<_, Vec<(String, T::AccountId)>, ValueQuery>;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -252,6 +266,8 @@ pub mod pallet {
         pub root: Option<T::AccountId>,
         /// Who starts as leader.
         pub leader: Option<T::AccountId>,
+        /// Every member, by name. See [`Roster`].
+        pub roster: Vec<(String, T::AccountId)>,
     }
 
     #[pallet::genesis_build]
@@ -261,6 +277,7 @@ pub mod pallet {
                 s.root = self.root.clone();
                 s.leader = self.leader.clone();
             });
+            Roster::<T>::put(self.roster.clone());
         }
     }
 
@@ -544,6 +561,11 @@ pub mod pallet {
             let mut table = Self::table();
             table.apply(effect, now);
             Litter::<T>::put(table.into_state());
+        }
+
+        /// See [`Roster`].
+        pub fn roster() -> Vec<(String, T::AccountId)> {
+            Roster::<T>::get()
         }
 
         /// See [`Replaying`]. Plain function, not a call: whether this node

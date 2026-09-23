@@ -66,6 +66,22 @@ impl Roster {
     pub fn names(&self) -> impl Iterator<Item = &str> {
         self.0.iter().map(|(n, _)| n.as_str())
     }
+
+    /// Refuse a roster that can't be a genesis: a name or an account listed
+    /// twice (two labels for one key, or one label for two), or a `root`
+    /// entry that isn't `root`'s account. Once the roster is genesis state,
+    /// a mistake here is a chain that has to be thrown away.
+    pub fn check_genesis(&self, root: &AccountId) -> Result<(), String> {
+        for (i, (n, a)) in self.0.iter().enumerate() {
+            if let Some((m, _)) = self.0[..i].iter().find(|(m, b)| m == n || b == a) {
+                return Err(if m == n { format!("{n} is listed twice") } else { format!("{m} and {n} are the same account") });
+            }
+        }
+        match self.account("root") {
+            Some(r) if r != *root => Err("its root entry is not --root's account".into()),
+            _ => Ok(()),
+        }
+    }
 }
 
 /// The *seed* a roster spec gives `name`, if it gives a seed at all (a
@@ -159,4 +175,22 @@ pub fn parse_account(spec: &str) -> Result<AccountId, String> {
         return Ok(Identity::from_seed(&[n; 32]).account());
     }
     miot_keys::from_hex(spec).map_err(|e| format!("account {spec:?}: {e:?}"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_genesis_roster_refuses_duplicates_and_a_wrong_root() {
+        let root = Identity::from_seed(&[1; 32]).account();
+        assert!(Roster::parse("root=1,meow=2,tama=3").unwrap().check_genesis(&root).is_ok());
+        // The fcguest double-listing `deploy.py ids` used to write: same key, two labels.
+        let e = Roster::parse("root=1,mimi=4,mac-akuma-aarch64=4").unwrap().check_genesis(&root).unwrap_err();
+        assert!(e.contains("same account"), "{e}");
+        let e = Roster::parse("root=1,tama=2,tama=3").unwrap().check_genesis(&root).unwrap_err();
+        assert!(e.contains("twice"), "{e}");
+        let e = Roster::parse("root=9,tama=2").unwrap().check_genesis(&root).unwrap_err();
+        assert!(e.contains("root"), "{e}");
+    }
 }

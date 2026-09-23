@@ -48,10 +48,9 @@ chain); it's that `kot`'s own CLI defaults lean on it:
 |---|---|---|
 | `--root` | `MIOT_ROOT_PUBKEY` | `"1"` |
 | `--leader` | `MIOT_LEADER` | `"2"` |
-| `--members` | `MIOT_MEMBERS` | `"1,2,3,4,5"` |
 | `--roster` | `MIOT_ROSTER` | `DEV_ROSTER = "root=1,simlead=2,sima=3,simb=4,simc=5"` |
 
-(`crates/kot/src/main.rs`.) Miss overriding *any one* of these four and that
+(`crates/kot/src/main.rs`.) Miss overriding *any one* of these three and that
 invocation silently rejoins the dev genesis — an attacker doesn't need to
 steal anything, `Identity::from_seed(&[1; 32])` is one line anyone can run,
 and it's now printed in this very doc.
@@ -103,7 +102,9 @@ procedure. What it actually does, in order:
 ## What adding an AWS node changes
 
 The full step-by-step procedure is `docs/runbooks/deploy-aws-node.md`. This
-section is the summary.
+section is the summary. Since 2026-09-23 the roster *is* the membership
+(`MIOT_MEMBERS` is gone; `kot run` takes genesis from `MIOT_ROSTER` and
+commits it to chain state), so read `MIOT_MEMBERS` below as `MIOT_ROSTER`.
 
 An AWS node joining the mesh (as a full peer, not just a client-facing
 gateway — the topology this session settled on) is a new member of a new
@@ -131,7 +132,7 @@ Concretely:
 
 ## Rules for next time
 
-- Never let `--root`/`--leader`/`--members`/`--roster` fall through to
+- Never let `--root`/`--leader`/`--roster` fall through to
   `kot`'s own defaults for anything beyond a disposable local chain —
   source `mesh.env` (or its post-migration, AWS-inclusive successor)
   explicitly, every time.

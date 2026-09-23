@@ -152,12 +152,10 @@ struct RunArgs {
     /// Root: an authorized_keys line, 64-hex account, or dev seed. Genesis.
     #[arg(long, env = "MIOT_ROOT_PUBKEY", default_value = "1")]
     root: String,
-    /// The litter leader (who plans) at genesis. Not the mesh primary.
+    /// The litter leader (who plans) at genesis: a roster name, or anything
+    /// --root takes. Not the mesh primary.
     #[arg(long, env = "MIOT_LEADER", default_value = "2")]
     leader: String,
-    /// Accounts that exist at genesis (hex or dev seeds). Genesis.
-    #[arg(long, env = "MIOT_MEMBERS", value_delimiter = ',', default_value = "1,2,3,4,5")]
-    members: Vec<String>,
     #[arg(long, env = "MIOT_BLOCK_MS", default_value_t = node::BLOCK_MS)]
     block_ms: u64,
     #[arg(long, env = "MIOT_SYNC_MS", default_value_t = 2000)]
@@ -251,6 +249,13 @@ async fn run(cli: &Cli, a: &RunArgs) {
             die(format!("run needs a keypair to sign mesh traffic: --seed-file, --seed, or a seed for {name} in the roster"))
         })
     };
+    // The genesis membership *is* the roster (`--roster`/`MIOT_ROSTER`),
+    // committed to chain state by name — there is no separate members list
+    // to drift from it any more.
+    let roster = Roster::parse(&cli.roster).unwrap_or_else(|e| die(e));
+    let root = account(&a.root);
+    roster.check_genesis(&root).unwrap_or_else(|e| die(format!("--roster: {e}")));
+    let leader = roster.account(&a.leader).unwrap_or_else(|| account(&a.leader));
     let cfg = node::NodeConfig {
         name: name.clone(),
         identity,
@@ -258,9 +263,9 @@ async fn run(cli: &Cli, a: &RunArgs) {
         port: a.port,
         db: expand_home(a.db.as_deref().unwrap_or(&format!("kot-{name}.db"))),
         peers: a.peers.iter().map(|p| p.trim().trim_end_matches('/').to_string()).filter(|p| !p.is_empty()).collect(),
-        root: account(&a.root),
-        leader: account(&a.leader),
-        members: a.members.iter().filter(|m| !m.trim().is_empty()).map(|m| account(m)).collect(),
+        root,
+        leader,
+        roster: roster.0.clone(),
         block_ms: a.block_ms,
         sync_ms: a.sync_ms,
         poll_ms: a.poll_ms,

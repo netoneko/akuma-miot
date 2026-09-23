@@ -27,6 +27,7 @@
 //! |---|---|
 //! | `POST /submit` | a signed extrinsic; checked, dispatched into the *currently open* block (forwarded to the primary from a replica) — its own signature is the gate, no envelope needed |
 //! | `GET /meta` | genesis hash + spec/tx version |
+//! | `GET /roster` | the genesis roster, `[{name, account}]`, from chain state |
 //! | `GET /account/{id}` | that account's nonce (the primary's, from a replica) |
 //! | `GET /events?since=N` | everything the chain emitted after cursor `N` |
 //! | `GET /head` | height, litter leader, closed |
@@ -83,7 +84,7 @@ use crate::common::parse_task;
 use crate::tls;
 
 /// Everything a node needs to start. Every node in one mesh must agree on
-/// `root`, `leader` and `members` — they are genesis.
+/// `root`, `leader` and `roster` — they are genesis.
 #[derive(Clone)]
 pub struct NodeConfig {
     /// This node's mesh name — `--as`.
@@ -101,8 +102,10 @@ pub struct NodeConfig {
     pub root: AccountId,
     /// The *litter* leader at genesis (who plans) — unrelated to the mesh.
     pub leader: AccountId,
-    /// Accounts given [`catnip`] at genesis. Root and leader are always added.
-    pub members: Vec<AccountId>,
+    /// Every member, by name — genesis, committed to chain state
+    /// (`pallet_litter::Roster`, served as `/roster`). Its accounts are the
+    /// ones given [`catnip`]; root and leader are always added.
+    pub roster: Vec<(String, AccountId)>,
     /// How long a block takes. See [`BLOCK_MS`].
     pub block_ms: u64,
     /// How often a replica pulls the primary.
@@ -135,6 +138,8 @@ struct Entry {
 const LOG_CAP: usize = 4096;
 /// The mesh election's persisted state, in the store's aux space.
 const AUX_MESH: &str = "mesh";
+/// See [`genesis_fingerprint`].
+const AUX_GENESIS: &str = "genesis";
 
 pub struct Node {
     ext: sp_io::TestExternalities,
@@ -151,6 +156,8 @@ pub struct Node {
     pending_compaction: bool,
     genesis_root: AccountId,
     genesis_leader: AccountId,
+    genesis_roster: Vec<(String, AccountId)>,
+    /// The roster's accounts — what [`catnip`] and every trust check use.
     members: Vec<AccountId>,
     /// This node's own keypair — signs outgoing mesh-internal traffic.
     identity: Identity,
@@ -222,10 +229,10 @@ fn catnip(who: &AccountId) {
 
 /// A fresh chain at genesis with block 1 open. `replaying` is set *before*
 /// block 1 opens, so its `on_initialize` already knows whether to tick.
-fn genesis(root: &AccountId, leader: &AccountId, members: &[AccountId], replaying: bool) -> (sp_io::TestExternalities, H256) {
+fn genesis(root: &AccountId, leader: &AccountId, roster: &[(String, AccountId)], replaying: bool) -> (sp_io::TestExternalities, H256) {
     use sp_runtime::BuildStorage;
     let mut t = frame_system::GenesisConfig::<Runtime>::default().build_storage().unwrap();
-    pallet_litter::GenesisConfig::<Runtime> { root: Some(root.clone()), leader: Some(leader.clone()) }
+    pallet_litter::GenesisConfig::<Runtime> { root: Some(root.clone()), leader: Some(leader.clone()), roster: roster.to_vec() }
         .assimilate_storage(&mut t)
         .unwrap();
     let mut ext: sp_io::TestExternalities = t.into();
@@ -233,12 +240,7 @@ fn genesis(root: &AccountId, leader: &AccountId, members: &[AccountId], replayin
     // binds a signature to, and what `/meta` reports.
     let genesis_hash = H256::zero();
     let first = Header::new(1, Default::default(), Default::default(), genesis_hash, Default::default());
-    let mut all = members.to_vec();
-    for a in [root, leader] {
-        if !all.contains(a) {
-            all.push(a.clone());
-        }
-    }
+    let all = trusted_accounts(&members_of(roster), root, leader);
     ext.execute_with(|| {
         pallet_litter::Pallet::<Runtime>::set_replaying(replaying);
         Executive::initialize_block(&first);
@@ -247,6 +249,20 @@ fn genesis(root: &AccountId, leader: &AccountId, members: &[AccountId], replayin
         }
     });
     (ext, genesis_hash)
+}
+
+/// The roster's accounts, in order — genesis `members`.
+fn members_of(roster: &[(String, AccountId)]) -> Vec<AccountId> {
+    roster.iter().map(|(_, a)| a.clone()).collect()
+}
+
+/// What a store remembers about the genesis it was built under
+/// ([`AUX_GENESIS`]): a hash over root, leader and the roster, names
+/// included. The chain's own genesis hash can't do this job — it's
+/// `H256::zero()` for every chain — so without it a node started on a new
+/// genesis over an old block log would replay the old chain without a word.
+fn genesis_fingerprint(root: &AccountId, leader: &AccountId, roster: &[(String, AccountId)]) -> [u8; 32] {
+    sp_io::hashing::blake2_256(&(root, leader, roster).encode())
 }
 
 /// Genesis `members` plus root and leader — the account universe every
@@ -274,14 +290,33 @@ struct Snapshot {
 impl Node {
     /// Open the store, rebuild state from it, load the election's vote.
     pub fn open(cfg: &NodeConfig) -> Result<Self, String> {
-        let store = miot_store::Store::open(&cfg.db).map_err(|e| format!("open store at {:?}: {e}", cfg.db))?;
+        let mut store = miot_store::Store::open(&cfg.db).map_err(|e| format!("open store at {:?}: {e}", cfg.db))?;
         let hard: Hard = match store.aux(AUX_MESH).map_err(|e| e.to_string())? {
             Some(b) => serde_json::from_slice(&b).map_err(|e| format!("corrupt mesh state: {e}"))?,
             None => Hard::default(),
         };
         let seed = cfg.name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
         let mesh = Mesh::new(cfg.name.clone(), cfg.peers.clone(), cfg.timing, hard, 0, seed);
-        let (ext, genesis_hash) = genesis(&cfg.root, &cfg.leader, &cfg.members, true);
+        let fingerprint = genesis_fingerprint(&cfg.root, &cfg.leader, &cfg.roster);
+        match store.aux(AUX_GENESIS).map_err(|e| e.to_string())? {
+            Some(had) if had == fingerprint => {}
+            Some(_) => {
+                return Err(format!(
+                    "the block log at {:?} was built under a different genesis (root, leader or roster changed). \
+                     A new genesis is a new chain: move that directory aside and start again",
+                    cfg.db
+                ))
+            }
+            None => {
+                // A store from before this check has no record: it can't be
+                // told apart, so it's adopted, loudly.
+                if !store.is_empty() {
+                    eprintln!("[node] warning: {:?} predates genesis fingerprints; assuming it belongs to this genesis", cfg.db);
+                }
+                store.put_aux(AUX_GENESIS, &fingerprint).map_err(|e| e.to_string())?;
+            }
+        }
+        let (ext, genesis_hash) = genesis(&cfg.root, &cfg.leader, &cfg.roster, true);
         let mut node = Node {
             ext,
             log: VecDeque::new(),
@@ -293,7 +328,8 @@ impl Node {
             pending_compaction: false,
             genesis_root: cfg.root.clone(),
             genesis_leader: cfg.leader.clone(),
-            members: cfg.members.clone(),
+            genesis_roster: cfg.roster.clone(),
+            members: members_of(&cfg.roster),
             identity: cfg.identity,
             mesh,
             producing: false,
@@ -309,7 +345,7 @@ impl Node {
             // handshake to negotiate over.
             http: reqwest::Client::builder()
                 .timeout(Duration::from_secs(10))
-                .use_preconfigured_tls(tls::client_config(&cfg.identity, trusted_accounts(&cfg.members, &cfg.root, &cfg.leader)))
+                .use_preconfigured_tls(tls::client_config(&cfg.identity, trusted_accounts(&members_of(&cfg.roster), &cfg.root, &cfg.leader)))
                 .build()
                 .unwrap(),
             started: Instant::now(),
@@ -492,7 +528,7 @@ impl Node {
     /// demotion (the open block's effects were never persisted) and after
     /// any change the store made underneath us (rewind, adopted checkpoint).
     fn reload_from_store(&mut self) {
-        let (ext, genesis_hash) = genesis(&self.genesis_root, &self.genesis_leader, &self.members, !self.producing);
+        let (ext, genesis_hash) = genesis(&self.genesis_root, &self.genesis_leader, &self.genesis_roster, !self.producing);
         self.ext = ext;
         self.parent_hash = genesis_hash;
         self.block = 1;
@@ -1028,6 +1064,7 @@ pub fn router(shared: Shared) -> Router {
         .route("/events", get(events))
         .route("/submit", post(submit))
         .route("/meta", get(meta))
+        .route("/roster", get(roster))
         .route("/account/{id}", get(account))
         .route("/artifact/{id}", get(artifact))
         .route("/note/{id}", get(standalone_artifact))
@@ -1086,7 +1123,7 @@ pub async fn start(cfg: NodeConfig) -> Result<Running, String> {
     );
     let shared: Shared = Arc::new(Mutex::new(node));
     let tcp = tokio::net::TcpListener::bind((cfg.bind.as_str(), cfg.port)).await.map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
-    let trusted = trusted_accounts(&cfg.members, &cfg.root, &cfg.leader);
+    let trusted = trusted_accounts(&members_of(&cfg.roster), &cfg.root, &cfg.leader);
     let listener = tls::TlsListener::new(tcp, tls::server_config(&cfg.identity, trusted));
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let mut tasks = Vec::new();
@@ -1311,6 +1348,22 @@ async fn meta(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
         "kot_version": crate::version::VERSION,
     }))
     .into_response()
+}
+
+/// The genesis roster, from chain state (`pallet_litter::Roster`): who is
+/// in this litter, by name. What a client names accounts with.
+async fn roster(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+    let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
+    let rows = n.ext.execute_with(|| {
+        pallet_litter::Pallet::<Runtime>::roster()
+            .into_iter()
+            .map(|(name, a)| serde_json::json!({ "name": name, "account": miot_keys::to_hex(&a) }))
+            .collect::<Vec<_>>()
+    });
+    Json(rows).into_response()
 }
 
 /// Where a replica sends what only the primary can answer. `None` while

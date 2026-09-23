@@ -52,6 +52,15 @@ fn genesis_installs_the_operator_and_the_leader() {
 }
 
 #[test]
+fn genesis_commits_the_roster_by_name_and_in_order() {
+    new_test_ext().execute_with(|| {
+        let r = Litter::roster();
+        assert_eq!(r.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(), ["root", "lead", "tama", "kuro"]);
+        assert_eq!(r.iter().map(|(_, a)| *a).collect::<Vec<_>>(), [ROOT, LEAD, TAMA, KURO]);
+    });
+}
+
+#[test]
 fn only_governance_may_hand_out_the_key_to_the_cat_house() {
     new_test_ext().execute_with(|| {
         assert_noop!(
