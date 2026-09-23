@@ -137,11 +137,13 @@ impl Cat {
     async fn prompt(&self, e: &Entry, question: &str) -> Option<(String, Vec<miot_llm::Tool>)> {
         let t = e.effect.get("t")?.as_str()?;
         let task = e.effect.get("task").and_then(|v| v.as_str()).unwrap_or("t1");
+        // Root only — the leader is a valid assignee, itself included
+        // (`miot-tasks::plan` never barred it, only `RootNotAssignable`).
         let workers = || {
             self.roster
                 .0
                 .iter()
-                .filter(|(n, i)| *i != self.account && n != "root")
+                .filter(|(n, _)| n != "root")
                 .map(|(n, _)| n.as_str())
                 .collect::<Vec<_>>()
                 .join(", ")

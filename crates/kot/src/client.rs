@@ -144,27 +144,40 @@ impl Client {
         let rows = match self.get_json("/tasks").await {
             Ok(serde_json::Value::Array(rows)) => rows,
             Ok(_) => Vec::new(),
-            Err(e) => return format!("  {e}"),
+            Err(e) => return format!("  {}", ui::alert(&e)),
         };
         if rows.is_empty() {
-            return format!("{DIM}  no tasks{OFF}");
+            return format!("  {}", ui::dim("no tasks"));
         }
         rows.iter()
             .map(|t| {
+                let id = t["id"].as_str().unwrap_or("?");
+                let status = t["status"].as_str().unwrap_or("?");
                 let who = t["holder"]
                     .as_str()
                     .or_else(|| t["assignee"].as_str())
                     .and_then(|s| miot_keys::from_hex(s).ok())
                     .map(|a| self.roster.name_of(&a));
                 let lease = t["lease_until"].as_u64().map(|b| format!(" lease→{b}")).unwrap_or_default();
-                format!(
-                    "  {DIM}{:<6}{OFF} {:<12} {:<12}{}  {DIM}{}{OFF}",
-                    t["id"].as_str().unwrap_or("?"),
-                    t["status"].as_str().unwrap_or("?"),
-                    who.unwrap_or_default(),
-                    lease,
-                    t["text"].as_str().unwrap_or("").chars().take(60).collect::<String>(),
-                )
+                let text = t["text"].as_str().unwrap_or("");
+
+                let id_plain = format!("{id:<6}");
+                let status_plain = format!("{status:<18}");
+                let who_plain = format!("{:<10}", who.as_deref().unwrap_or("-"));
+                let indent = 2 + ui::vcells(&id_plain) + 1 + ui::vcells(&status_plain) + 1 + ui::vcells(&who_plain) + ui::vcells(&lease) + 2;
+
+                let status_c = match status {
+                    "Open" | "Planned" => ui::ok(&status_plain),
+                    "Failed" => ui::alert(&status_plain),
+                    "Closed" | "Cleared" => ui::dim(&status_plain),
+                    _ => ui::warn(&status_plain), // Pending, AwaitingClearance, ...
+                };
+                let who_c = match &who {
+                    Some(n) => ui::pad(&ui::who(n), 10),
+                    None => ui::dim(&who_plain),
+                };
+
+                format!("  {}  {status_c} {who_c}{}  {}", ui::task(&id_plain), ui::dim(&lease), ui::hang(indent, text))
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -198,15 +211,15 @@ impl Client {
     /// ratatui REPL can feed it through an inline-viewport insert.
     pub async fn peers_text(&mut self) -> String {
         let lit = self.get_json("/head").await.ok().and_then(|h| h["leader"].as_str().map(str::to_string));
-        let mut out = vec![format!("  {DIM}litter{OFF}")];
+        let mut out = vec![format!("  {}", ui::dim("litter"))];
         for (n, a) in &self.roster.0 {
-            let tag = if lit.as_deref() == Some(miot_keys::to_hex(a).as_str()) { "  leader" } else { "" };
-            out.push(format!("    {n:<14} {DIM}{}{OFF}{tag}", miot_keys::short(a)));
+            let tag = if lit.as_deref() == Some(miot_keys::to_hex(a).as_str()) { format!("  {}", ui::ok("leader")) } else { String::new() };
+            out.push(format!("    {}  {}{tag}", ui::pad(&ui::who(n), 14), ui::dim(&miot_keys::short(a))));
         }
         let m = match self.get_json("/mesh/peers").await {
             Ok(m) => m,
             Err(e) => {
-                out.push(format!("  mesh: {e}"));
+                out.push(format!("  mesh: {}", ui::alert(&e)));
                 return out.join("\n");
             }
         };
@@ -215,19 +228,24 @@ impl Client {
         let cat_of = |mesh_name: &str| names.get(mesh_name).cloned().unwrap_or_else(|| mesh_name.to_string());
 
         out.push(format!(
-            "  {DIM}mesh, from {} ({}){OFF}  quorum {}  last checkpoint {}",
-            cat_of(me["name"].as_str().unwrap_or("?")),
-            self.node,
-            m["quorum"],
+            "  {} {} mesh, from {} ({})  quorum {}  last checkpoint #{}",
+            ui::dim("网"),
+            ui::dim("mesh,"),
+            ui::who(&cat_of(me["name"].as_str().unwrap_or("?"))),
+            ui::dim(&self.node),
+            ui::plain(&m["quorum"].to_string()),
             m["last_checkpoint"]
         ));
         let row = |name: String, st: &serde_json::Value, seen: String| {
+            let role = st["role"].as_str().unwrap_or("?");
+            let role_c = if role == "leader" { ui::ok(&format!("{role:<13}")) } else { ui::dim(&format!("{role:<13}")) };
             format!(
-                "    {name:<14} {:<13} term {:<4} head {:<7} leader {:<14} {DIM}{seen}{OFF}",
-                st["role"].as_str().unwrap_or("?"),
+                "    {}  {role_c} term {:<4} head {:<7} leader {}  {}",
+                ui::pad(&ui::who(&name), 14),
                 st["term"],
                 st["head"],
-                st["leader"].as_str().map(&cat_of).unwrap_or_else(|| "-".into()),
+                ui::pad(&st["leader"].as_str().map(&cat_of).map(|n| ui::who(&n)).unwrap_or_else(|| ui::dim("-")), 14),
+                ui::dim(&seen),
             )
         };
         out.push(row(cat_of(me["name"].as_str().unwrap_or("?")), me, "(this node)".into()));
@@ -236,10 +254,10 @@ impl Client {
             match p["status"].as_object() {
                 Some(_) => {
                     let ago = p["seen_ms_ago"].as_u64().unwrap_or(0);
-                    let stale = if ago > 5_000 { "  STALE" } else { "" };
+                    let stale = if ago > 5_000 { format!("  {}", ui::warn("STALE")) } else { String::new() };
                     out.push(row(cat_of(p["status"]["name"].as_str().unwrap_or("?")), &p["status"], format!("{route}  seen {:.1}s ago{stale}", ago as f64 / 1000.0)));
                 }
-                None => out.push(format!("    {:<14} {DIM}{route}  never answered{OFF}", "?")),
+                None => out.push(format!("    {:<14} {}", "?", ui::warn(&format!("{route}  never answered")))),
             }
         }
         out.join("\n")
@@ -491,7 +509,7 @@ struct ComposerState {
     head: u64,
 }
 
-const COMPOSER_HEIGHT: u16 = 3;
+const COMPOSER_HEIGHT: u16 = 2;
 
 /// Feeds one already-ANSI-colored block from `kot::ui` (possibly several
 /// `\n`-joined lines) into the inline viewport's scrollback, above the
@@ -548,7 +566,12 @@ struct Input {
 
 impl Input {
     fn new() -> Self {
-        Input { area: TextArea::new(vec![String::new()]), history: Vec::new(), hist_idx: None, saved: None, tab: None }
+        let mut area = TextArea::new(vec![String::new()]);
+        // The default underlines the whole line the cursor is on — since the
+        // composer is always exactly one line, that's every character typed.
+        // Just the cursor cell (already reversed-video by default) is enough.
+        area.set_cursor_line_style(ratatui::style::Style::default());
+        Input { area, history: Vec::new(), hist_idx: None, saved: None, tab: None }
     }
 
     fn draft(&self) -> &str {
@@ -865,6 +888,7 @@ pub async fn repl(mut c: Client) {
         prev = Some(block);
     }
     header.push(ui::section("回放结束", "end replay"));
+    header.push(ui::keys());
 
     // Everything above is plain, newline-safe stdout — fine to `println!`
     // before raw mode changes what a bare `\n` does to the cursor.
@@ -923,19 +947,16 @@ pub async fn repl(mut c: Client) {
         };
         let status = ui::composer_status(&node, &primary, head);
         let prompt = ui::prompt(&me_name, Some(&target));
-        let hint = format!("  {}{}", " ".repeat(ui::vcells(&prompt)), ui::hint());
         let prompt_w = ui::vcells(&prompt) as u16;
         let _ = terminal.draw(|f| {
             let area = f.area();
-            let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)]).split(area);
+            let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
             let status_text: Text = status.as_str().into_text().unwrap_or_else(|_| Text::raw(status.clone()));
             f.render_widget(Paragraph::new(status_text), rows[0]);
             let cols = Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(1)]).split(rows[1]);
             let prompt_text: Text = prompt.as_str().into_text().unwrap_or_else(|_| Text::raw(prompt.clone()));
             f.render_widget(Paragraph::new(prompt_text), cols[0]);
             f.render_widget(input.widget(), cols[1]);
-            let hint_text: Text = hint.as_str().into_text().unwrap_or_else(|_| Text::raw(hint.clone()));
-            f.render_widget(Paragraph::new(hint_text), rows[2]);
         });
     }
 

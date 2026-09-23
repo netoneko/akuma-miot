@@ -301,6 +301,18 @@ pub fn vcells(s: &str) -> usize {
     cells(&strip_ansi(s))
 }
 
+/// Right-pad an already-colored string to `width` display cells — for
+/// padding *after* coloring a name through [`who`] (padding a name before
+/// `who` would break its cat-color lookup, which matches on the exact name).
+pub fn pad(s: &str, width: usize) -> String {
+    let w = vcells(s);
+    if w >= width {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(width - w))
+    }
+}
+
 /// Word-wrap by display cells, colour codes counting for nothing. A colour
 /// that spans a break simply stays on into the next line.
 pub fn wrap(s: &str, width: usize) -> Vec<String> {
@@ -502,6 +514,19 @@ const TIME_W: usize = 16;
 /// Cells the stamp occupies: two of margin, the time column, block column
 /// and their gaps. Continuation lines hang under the text, not column 0.
 const STAMP_W: usize = 2 + TIME_W + 2 + 6 + 2;
+
+/// Free text under a hanging left `indent`, wrapped to the terminal width —
+/// what `/tasks` and `/peers` use for a task's own text, matching `obs`'s
+/// column without needing a time/block stamp.
+pub fn hang(indent: usize, text: &str) -> String {
+    let width = term_width().saturating_sub(indent).max(20);
+    wrap(text, width)
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { l } else { format!("{}{l}", " ".repeat(indent)) })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
 
 /// A protocol observation — the effect in prose, the protocol's own verbs,
 /// wrapped to the terminal under its own column.
