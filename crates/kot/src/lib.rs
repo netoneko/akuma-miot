@@ -12,4 +12,5 @@ pub mod agent;
 pub mod client;
 pub mod common;
 pub mod node;
+pub mod ui;
 pub mod version;
