@@ -260,20 +260,27 @@ fn shout(s: &str) -> String {
 }
 
 /// Columns of the terminal we are attached to. Honours `COLUMNS`, then asks
-/// `stty` on the inherited stdin, then falls back to 80.
+/// the terminal itself (an ioctl), then falls back to 100.
+///
+/// Never spawns anything. This used to shell out to `stty size` on every
+/// call, which was tolerable while only the REPL rendered — then a cat's
+/// agent loop started drawing every tool call through [`tool`], under herd
+/// on Akuma, where each process spawn is expensive and fragile (sshd's pipe
+/// leak, the spawn-slot class) and a blocked child would stall a tokio
+/// worker the node's own HTTP server shares.
 pub fn term_width() -> usize {
+    use std::io::IsTerminal;
     if let Some(c) = std::env::var("COLUMNS").ok().and_then(|c| c.parse().ok()) {
         return c;
     }
-    std::process::Command::new("stty")
-        .arg("size")
-        .stdin(std::process::Stdio::inherit())
-        .output()
-        .ok()
-        .and_then(|o| String::from_utf8(o.stdout).ok())
-        .and_then(|s| s.split_whitespace().nth(1).and_then(|c| c.parse().ok()))
-        .filter(|&c| c > 20)
-        .unwrap_or(80)
+    if std::io::stdout().is_terminal() {
+        if let Ok((cols, _)) = crossterm::terminal::size() {
+            if cols > 20 {
+                return cols as usize;
+            }
+        }
+    }
+    100
 }
 
 /// Cells a plain (uncoloured) string occupies: CJK is two wide.
@@ -520,8 +527,8 @@ fn stamp(time: &str, block: u64) -> String {
     format!("  {t}{pad}  {}  ", dim(&format!("{:<6}", block_id(block))))
 }
 
-/// The time column: `≈02:20 (+11m30s)` at its widest.
-const TIME_W: usize = 16;
+/// The time column: `09-23 22:35:10Z +11m30s` at its widest.
+const TIME_W: usize = 23;
 /// Cells the stamp occupies: two of margin, the time column, block column
 /// and their gaps. Continuation lines hang under the text, not column 0.
 const STAMP_W: usize = 2 + TIME_W + 2 + 6 + 2;
@@ -939,21 +946,28 @@ pub fn hint() -> String {
 
 // ── time ────────────────────────────────────────────────────────────────
 
-/// Local HH:MM for a unix time, via the shell's `date` — no tz tables of
-/// our own.
+/// A unix-ms instant as UTC: `09-24 01:40:12Z`. Always UTC, always the
+/// same shape — the fleet spans hosts and timezones, and a log is only
+/// comparable across them in one zone.
+pub fn clock(unix_ms: u64) -> String {
+    chrono::DateTime::from_timestamp_millis(unix_ms as i64).map(|t| t.format("%m-%d %H:%M:%SZ").to_string()).unwrap_or_else(|| "--".into())
+}
+
+/// UTC HH:MM for a unix time (seconds).
 pub fn hhmm(unix: i64) -> String {
-    let try_args = |a: &[&str]| {
-        std::process::Command::new("date")
-            .args(a)
-            .output()
-            .ok()
-            .filter(|o| o.status.success())
-            .and_then(|o| String::from_utf8(o.stdout).ok())
-            .map(|s| s.trim().to_string())
-    };
-    try_args(&["-r", &unix.to_string(), "+%H:%M"]) // bsd / macos
-        .or_else(|| try_args(&["-d", &format!("@{unix}"), "+%H:%M"])) // gnu
-        .unwrap_or_else(|| "--:--".into())
+    chrono::DateTime::from_timestamp(unix, 0).map(|t| t.format("%H:%MZ").to_string()).unwrap_or_else(|| "--:--".into())
+}
+
+/// The time column for an event, from its block's real seal time (`at`,
+/// unix ms, from `/events`) — plus the gap since the previous stamped event.
+/// A block with no seal time (sealed before they existed, or by a primary
+/// on an older build) gets no time at all: an honest blank beats a guess.
+pub fn stamp_at(at: Option<u64>, prev: Option<u64>) -> String {
+    match (at, prev) {
+        (Some(t), Some(p)) if t >= p => format!("{} +{}", clock(t), human((t - p) / 1000)),
+        (Some(t), _) => clock(t),
+        (None, _) => String::new(),
+    }
 }
 
 pub fn human(secs: u64) -> String {
@@ -964,8 +978,9 @@ pub fn human(secs: u64) -> String {
     }
 }
 
-/// The time column for an event at `block`, given the head is now: an
-/// estimate marked `≈`, plus the exact gap in blocks since `prev`.
+/// An *estimated* time column for an event at `block`, marked `≈`: head
+/// distance times the nominal block time. Only for `repl-mock`'s canned
+/// events, which have no seal times — real clients use [`stamp_at`].
 pub fn when(block: u64, prev: Option<u64>, head: u64, now: i64, block_ms: u64) -> String {
     let secs_per_block = block_ms / 1000;
     let at = now - (head.saturating_sub(block) * secs_per_block) as i64;
@@ -1054,5 +1069,26 @@ pub fn render(time: &str, block: u64, eff: &serde_json::Value, roster: &Roster, 
             )
         }
         other => obs(time, block, format!("{} {}", dim(other), faint(&eff.to_string()))),
+    }
+}
+
+#[cfg(test)]
+mod time_tests {
+    use super::*;
+
+    #[test]
+    fn clock_is_utc() {
+        // 2026-09-24T01:40:12.345Z
+        assert_eq!(clock(1_790_214_012_345), "09-24 01:40:12Z");
+    }
+
+    #[test]
+    fn stamp_is_blank_without_a_seal_time() {
+        assert_eq!(stamp_at(None, Some(1)), "");
+    }
+
+    #[test]
+    fn stamp_shows_the_gap_since_the_previous() {
+        assert_eq!(stamp_at(Some(1_790_214_012_345), Some(1_790_214_012_345 - 75_000)), "09-24 01:40:12Z +1m15s");
     }
 }

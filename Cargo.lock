@@ -5424,6 +5424,7 @@ version = "0.1.0"
 dependencies = [
  "ansi-to-tui",
  "axum",
+ "chrono",
  "clap",
  "crossterm",
  "futures-util",

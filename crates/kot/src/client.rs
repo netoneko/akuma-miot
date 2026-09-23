@@ -463,6 +463,18 @@ impl Client {
             "closed" => format!("{} closed by {}: {}", task(), self.name(eff, "author"), text("title")),
             "failed" => format!("{} failed", task()),
             "rehomed" => format!("{} rehomed from {} to {}", task(), self.name(eff, "from"), self.name(eff, "to")),
+            "standalone_artifact" => format!("{} published artifact {}: {}", self.name(eff, "author"), eff["id"], text("title")),
+            "stats_reported" => {
+                let n = |f: &str| eff[f].as_u64().unwrap_or(0);
+                format!(
+                    "{} ∑ {} turns · {} tool calls · {} tok · {} thinking",
+                    self.name(eff, "who"),
+                    n("turns"),
+                    n("tool_calls"),
+                    ui::thousands(n("tokens")),
+                    ui::human(n("ms") / 1000)
+                )
+            }
             // A future Effect variant lands here until it earns its own
             // sentence above — still resolves accounts, just not to prose.
             _ => {
@@ -476,7 +488,8 @@ impl Client {
     /// One line per event, grep-friendly — what `kot log` prints when its
     /// stdout isn't a terminal (piped, redirected, a script watching).
     fn print_event(&self, e: &serde_json::Value) {
-        println!("  block {}  {}", e["block"], self.render_effect(&e["effect"]));
+        let at = e["at"].as_u64().map(|t| format!("{}  ", ui::clock(t))).unwrap_or_default();
+        println!("  {at}block {}  {}", e["block"], self.render_effect(&e["effect"]));
     }
 
     /// `kot log`. With `task`, only events about it (or its sub-tasks).
@@ -490,13 +503,7 @@ impl Client {
         use std::io::IsTerminal;
         let pretty = std::io::stdout().is_terminal();
         let me_name = self.roster.name_of(&self.identity.account());
-        let head_block = match self.get_json("/head").await {
-            Ok(h) => h["block"].as_u64().unwrap_or(0),
-            Err(_) => 0,
-        };
-        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-        let started = now();
-        let mut prev: Option<u64> = None;
+        let mut prev_at: Option<u64> = None;
         let mut replaying = true;
 
         let deadline = seconds.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
@@ -517,12 +524,16 @@ impl Client {
                 }
                 if pretty {
                     let block = e["block"].as_u64().unwrap_or(0);
-                    // Replayed history gets an estimated `≈` time from its
-                    // block distance to the head; anything arriving live
-                    // afterwards has a real wall clock.
-                    let time = if replaying { ui::when(block, prev, head_block, started, crate::node::BLOCK_MS) } else { ui::hhmm(now()) };
-                    println!("{}", ui::render(&time, block, &e["effect"], &self.roster, &me_name));
-                    prev = Some(block);
+                    // The block's real seal time. A replayed block without
+                    // one gets no time; a live one still in its open block
+                    // is happening now.
+                    let at = match e["at"].as_u64() {
+                        Some(t) => Some(t),
+                        None if !replaying => Some(unix_ms_now()),
+                        None => None,
+                    };
+                    println!("{}", ui::render(&ui::stamp_at(at, prev_at), block, &e["effect"], &self.roster, &me_name));
+                    prev_at = at.or(prev_at);
                 } else {
                     self.print_event(e);
                 }
@@ -534,6 +545,10 @@ impl Client {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+}
+
+fn unix_ms_now() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 /// `https://192.168.1.126:9944` -> `192.168.1.126:9944` — the scheme is
@@ -686,13 +701,15 @@ async fn tail_events(
             Err(_) => Vec::new(),
         };
         if !batch.is_empty() {
-            let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
             let mut head = None;
             for e in &batch {
                 cursor = cursor.max(e["seq"].as_u64().unwrap_or(cursor));
                 let block = e["block"].as_u64().unwrap_or(0);
                 head = Some(block);
-                let _ = tx.send(ui::render(&ui::hhmm(now), block, &e["effect"], &roster, &me_name));
+                // Live, so an entry whose block is still open (no seal time
+                // yet) really is happening now.
+                let at = e["at"].as_u64().unwrap_or_else(unix_ms_now);
+                let _ = tx.send(ui::render(&ui::clock(at), block, &e["effect"], &roster, &me_name));
             }
             if let Some(h) = head {
                 state.lock().await.head = h;
@@ -1186,19 +1203,19 @@ pub async fn repl(mut c: Client) {
         _ => Vec::new(),
     };
     let cursor = all.iter().filter_map(|e| e["seq"].as_u64()).max().unwrap_or(0);
-    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
-    let shown = all.len().min(30);
-    header.push(ui::section("回放", &format!("replay · last {shown} of {} events", all.len())));
+    // The whole session the node holds (everything since the last
+    // compaction, up to its log cap) — not a tail: scrollback is where the
+    // operator reads what happened while they were away.
+    header.push(ui::section("回放", &format!("replay · this session, {} events", all.len())));
     if all.is_empty() {
         header.push(format!("  {}", ui::dim("nothing on this chain yet")));
     }
-    let start = all.len() - shown;
-    let mut prev: Option<u64> = if start > 0 { all[start - 1]["block"].as_u64() } else { None };
-    for e in &all[start..] {
+    let mut prev_at: Option<u64> = None;
+    for e in &all {
         let block = e["block"].as_u64().unwrap_or(0);
-        let time = ui::when(block, prev, head_block, now, crate::node::BLOCK_MS);
-        header.push(ui::render(&time, block, &e["effect"], &c.roster, &me_name));
-        prev = Some(block);
+        let at = e["at"].as_u64();
+        header.push(ui::render(&ui::stamp_at(at, prev_at), block, &e["effect"], &c.roster, &me_name));
+        prev_at = at.or(prev_at);
     }
     header.push(ui::section("回放结束", "end replay"));
     header.push(ui::keys());

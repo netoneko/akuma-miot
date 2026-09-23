@@ -304,6 +304,21 @@ its history as text (`[called: Bash{...}]`) made qwen3-4b *type*
 `[called: SendMessage{...}]` instead of calling the tool — calls stay out of
 assistant turns; each result names its call instead.
 
+## Block seal times (2026-09-24)
+
+Every block body now ends with the primary's wall clock at seal time
+(unix ms, SCALE `u64`), appended after the effects (`node.rs`
+`seal_body`/`open_body`). `/events` entries carry it as `at`, and every
+client shows it in **UTC** (`09-24 01:40:12Z`). Before this there was no
+time on chain at all and clients *estimated* one backwards from "now" by
+block distance, which was wrong whenever block production paused.
+Backward-compatible by construction: older nodes read a body with
+`Decode::decode` (not `decode_all`), so they get the effects and ignore
+the tail; replicas store the primary's bytes verbatim, so the fork check's
+byte compare is unaffected. Caveat: a block gets a time only if the primary
+that sealed it runs this build — blocks from an older primary (yuki on AWS,
+as of this writing) show no time, deliberately, rather than a guess.
+
 ## What is real and what is not
 
 **Real:** the pallet and its state machine; the FRAME runtime executing

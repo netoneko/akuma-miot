@@ -133,6 +133,13 @@ struct Entry {
     /// Who must take a turn because of it, as hex. Decided here, by the
     /// protocol, not by each cat.
     wakes: Option<String>,
+    /// When its block was sealed, unix ms, by the primary's clock — carried
+    /// in the block body ([`seal_body`]), so every node and every replay
+    /// agree. `None` for a block sealed before this existed (or by a
+    /// primary on an older build), and for an entry whose block is still
+    /// open.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    at: Option<u64>,
 }
 
 const LOG_CAP: usize = 4096;
@@ -173,6 +180,31 @@ pub struct Node {
     needs_reconcile: bool,
     http: reqwest::Client,
     started: Instant,
+}
+
+/// A block body: its effects, SCALE-encoded, then the seal time (unix ms,
+/// `u64`). The time is *appended* rather than wrapped around the effects so
+/// a node on an older build — which reads a body with `Decode::decode`, not
+/// `decode_all` — still reads the effects and ignores the rest; replicas
+/// store the primary's bytes verbatim, so the fork check (a byte compare)
+/// is unaffected either way.
+fn seal_body(effects: &Vec<Effect<AccountId>>, at: u64) -> Vec<u8> {
+    let mut body = effects.encode();
+    body.extend(at.encode());
+    body
+}
+
+/// The inverse of [`seal_body`]; a body from before seal times (nothing
+/// after the effects) reads as `None`.
+fn open_body(body: &[u8]) -> Result<(Vec<Effect<AccountId>>, Option<u64>), codec::Error> {
+    let mut input = body;
+    let effects = Vec::<Effect<AccountId>>::decode(&mut input)?;
+    let at = if input.len() == 8 { u64::decode(&mut input).ok() } else { None };
+    Ok((effects, at))
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
 fn render(e: &Effect<AccountId>) -> serde_json::Value {
@@ -411,7 +443,7 @@ impl Node {
             // degrades to "didn't wake for this broadcast" rather than a
             // parse error, which a shape change would risk instead.
             let wakes = if e.wakes() { Some(e.to().map(miot_keys::to_hex).unwrap_or_else(|| "*".to_string())) } else { None };
-            let entry = Entry { seq: self.seq, block: self.block, effect: render(&e), wakes };
+            let entry = Entry { seq: self.seq, block: self.block, effect: render(&e), wakes, at: None };
             if self.log.len() >= LOG_CAP {
                 self.log.pop_front();
             }
@@ -423,6 +455,18 @@ impl Node {
             // peer that pulls the block later instead of tailing it live.
             if !matches!(&e, Effect::Said { off_record: true, .. }) {
                 self.pending.push(e);
+            }
+        }
+    }
+
+    /// Give every log entry of block `height` its seal time.
+    fn stamp_block(&mut self, height: u64, at: Option<u64>) {
+        for e in self.log.iter_mut().rev() {
+            if e.block < height {
+                break;
+            }
+            if e.block == height {
+                e.at = at;
             }
         }
     }
@@ -473,7 +517,9 @@ impl Node {
     /// Write `height`'s effects as that block's body. Every block gets a row,
     /// even a quiet one — the store is append-only and gap-free.
     fn persist(&mut self, height: u64) {
-        let body = self.pending.encode();
+        let at = unix_ms();
+        let body = seal_body(&self.pending, at);
+        self.stamp_block(height, Some(at));
         match self.store.append(height, &body) {
             Ok(()) => {
                 self.mesh.appended();
@@ -487,7 +533,7 @@ impl Node {
     /// Fold one already-decided block into state. Assumes `height` is the
     /// open block; leaves `height + 1` open. The one place a stored or
     /// peer-fetched block gets folded — replay and sync both call this.
-    fn apply_block(&mut self, height: u64, effects: Vec<Effect<AccountId>>) {
+    fn apply_block(&mut self, height: u64, effects: Vec<Effect<AccountId>>, at: Option<u64>) {
         self.ext.execute_with(|| {
             let now: miot_primitives::BlockNumber = frame_system::Pallet::<Runtime>::block_number().unique_saturated_into();
             for e in &effects {
@@ -497,6 +543,7 @@ impl Node {
         let header = self.ext.execute_with(Executive::finalize_block);
         self.parent_hash = header.hash();
         self.absorb(effects);
+        self.stamp_block(height, at);
         self.pending.clear();
         self.block = height + 1;
         let next = Header::new(self.block, Default::default(), Default::default(), self.parent_hash, Default::default());
@@ -519,8 +566,8 @@ impl Node {
         for h in (cp + 1)..=head {
             self.block = h;
             let body = self.store.block(h).expect("store read").expect("contiguous store above the checkpoint");
-            let effects: Vec<Effect<AccountId>> = Decode::decode(&mut &body[..]).expect("corrupt block body in store");
-            self.apply_block(h, effects);
+            let (effects, at) = open_body(&body).expect("corrupt block body in store");
+            self.apply_block(h, effects, at);
         }
     }
 
@@ -856,8 +903,8 @@ async fn sync_once(shared: &Shared, peer: &str) {
                 eprintln!("[node] sync: append failed at block {}: {e}", row.height);
                 return;
             }
-            let effects: Vec<Effect<AccountId>> = Decode::decode(&mut &body[..]).expect("corrupt block body from peer");
-            n.apply_block(row.height, effects);
+            let (effects, at) = open_body(&body).expect("corrupt block body from peer");
+            n.apply_block(row.height, effects, at);
             n.mesh.appended();
         }
         n.save_hard();
@@ -1547,4 +1594,49 @@ async fn all_stats(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response 
             .collect::<Vec<_>>()
     });
     Json(rows).into_response()
+}
+
+#[cfg(test)]
+mod seal_tests {
+    use super::*;
+
+    fn said(body: &str) -> Effect<AccountId> {
+        let a = AccountId::new([7u8; 32]);
+        Effect::Said { from: a, to: None, body: body.into(), from_root: false, no_ack: false, off_record: false }
+    }
+
+    #[test]
+    fn a_sealed_body_carries_its_time() {
+        let fx = vec![said("hi"), said("there")];
+        let (back, at) = open_body(&seal_body(&fx, 1_790_000_000_123)).unwrap();
+        assert_eq!(back.len(), 2);
+        assert_eq!(at, Some(1_790_000_000_123));
+    }
+
+    /// Every block sealed before this change: effects and nothing after.
+    #[test]
+    fn a_body_from_before_seal_times_reads_as_none() {
+        let fx = vec![said("old")];
+        let (back, at) = open_body(&fx.encode()).unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(at, None);
+    }
+
+    /// The compatibility claim itself: a node on an older build reads a
+    /// body with plain `Decode::decode` into `Vec<Effect>`, and must still
+    /// get exactly the effects out of a new, time-carrying body.
+    #[test]
+    fn an_old_decoder_still_reads_a_new_body() {
+        let fx = vec![said("new"), said("block")];
+        let body = seal_body(&fx, 42);
+        let old: Vec<Effect<AccountId>> = Decode::decode(&mut &body[..]).unwrap();
+        assert_eq!(old, fx);
+    }
+
+    #[test]
+    fn a_quiet_block_seals_too() {
+        let (back, at) = open_body(&seal_body(&Vec::new(), 9)).unwrap();
+        assert!(back.is_empty());
+        assert_eq!(at, Some(9));
+    }
 }
