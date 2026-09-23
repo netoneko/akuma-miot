@@ -507,7 +507,7 @@ impl<A: Clone + Eq> TaskTable<A> {
             // `Pallet::replay_effect` special-cases this variant before it
             // ever reaches `TaskTable::apply`, so this arm never actually
             // runs; it exists only because the match must be exhaustive.
-            Effect::StatsReported { .. } => {}
+            Effect::StatsReported { .. } | Effect::StatsReported2 { .. } => {}
         }
     }
 

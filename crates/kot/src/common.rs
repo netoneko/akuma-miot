@@ -177,9 +177,115 @@ pub fn parse_account(spec: &str) -> Result<AccountId, String> {
     miot_keys::from_hex(spec).map_err(|e| format!("account {spec:?}: {e:?}"))
 }
 
+/// Where a reader of `/events` is — robust to the node rebuilding its log.
+///
+/// `seq` in `/events` restarts from 0 whenever a node rebuilds its log
+/// (a `/clear` compaction, a leader-wins rewind, an adopted checkpoint).
+/// A reader that just keeps asking `since=<old seq>` then hears nothing
+/// until the new log grows past it — found live 2026-09-24: the operator's
+/// REPL showed nothing after a `/clear` while the litter answered on chain.
+/// And a reader that resets to 0 without care re-reads everything the
+/// rebuilt log replays: cats re-woke on long-finished messages after a
+/// rewind.
+///
+/// So: [`EventCursor::check_head`] with `/head`'s `seq` spots the restart,
+/// and from then on [`EventCursor::accept`] skips everything up to and
+/// including what was already handled, by block position — events in a
+/// block below the last one seen, and as many of that block's own as were
+/// seen before. Rewound-and-replaced history at those heights is skipped
+/// too, deliberately: it's old news, and anything still outstanding the
+/// chain re-issues on its own.
+#[derive(Debug, Clone, Default)]
+pub struct EventCursor {
+    /// What to ask `/events?since=` for next.
+    pub seq: u64,
+    block: u64,
+    in_block: usize,
+    /// Set by a rebuild: skip up to (block, that many of its events).
+    floor: Option<(u64, usize)>,
+    floor_seen: usize,
+}
+
+impl EventCursor {
+    pub fn new(since: u64) -> Self {
+        EventCursor { seq: since, ..Default::default() }
+    }
+
+    /// Feed `/head`'s `seq`. `true` if the node's log was rebuilt — the
+    /// cursor now reads it again from the start, skipping what it has seen.
+    pub fn check_head(&mut self, head_seq: u64) -> bool {
+        if head_seq >= self.seq {
+            return false;
+        }
+        self.seq = 0;
+        self.floor = Some((self.block, self.in_block));
+        self.floor_seen = 0;
+        true
+    }
+
+    /// Whether `e` (an `/events` entry) is new to this reader. Always
+    /// advances `seq`.
+    pub fn accept(&mut self, e: &serde_json::Value) -> bool {
+        self.accept_at(e["seq"].as_u64().unwrap_or(self.seq), e["block"].as_u64().unwrap_or(0))
+    }
+
+    /// [`accept`](Self::accept) for a caller that already parsed the entry.
+    pub fn accept_at(&mut self, seq: u64, block: u64) -> bool {
+        self.seq = self.seq.max(seq);
+        if let Some((fb, fcount)) = self.floor {
+            if block < fb {
+                return false;
+            }
+            if block == fb && self.floor_seen < fcount {
+                self.floor_seen += 1;
+                return false;
+            }
+            self.floor = None;
+        }
+        if block == self.block {
+            self.in_block += 1;
+        } else {
+            self.block = block;
+            self.in_block = 1;
+        }
+        true
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ev(seq: u64, block: u64) -> serde_json::Value {
+        serde_json::json!({"seq": seq, "block": block})
+    }
+
+    #[test]
+    fn a_rebuilt_log_is_read_again_without_repeats() {
+        let mut c = EventCursor::new(0);
+        for (s, b) in [(1, 10), (2, 11), (3, 11)] {
+            assert!(c.accept(&ev(s, b)));
+        }
+        assert_eq!(c.seq, 3);
+        assert!(!c.check_head(3), "same log, nothing to do");
+        // The node compacted and replayed: seq restarts, blocks don't.
+        assert!(c.check_head(1));
+        assert_eq!(c.seq, 0, "reads the new log from its start");
+        assert!(!c.accept(&ev(1, 10)), "already shown");
+        assert!(!c.accept(&ev(2, 11)), "already shown (first of block 11)");
+        assert!(!c.accept(&ev(3, 11)), "already shown (second of block 11)");
+        assert!(c.accept(&ev(4, 11)), "a third event in block 11 is new");
+        assert!(c.accept(&ev(5, 12)));
+        assert_eq!(c.seq, 5);
+    }
+
+    #[test]
+    fn a_log_that_grew_is_not_a_rebuild() {
+        let mut c = EventCursor::new(0);
+        assert!(c.accept(&ev(1, 1)));
+        assert!(!c.check_head(9));
+        assert!(c.accept(&ev(2, 2)));
+    }
 
     #[test]
     fn a_genesis_roster_refuses_duplicates_and_a_wrong_root() {

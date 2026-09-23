@@ -640,8 +640,14 @@ pub fn typed(me: &str, target: Option<&str>, line: &str, roster: &Roster) -> Str
 /// Your own line: the echo, then the chain's word that it was sealed — or,
 /// for `off_record`, the word that it deliberately wasn't.
 pub fn me(time: &str, block: u64, me: &str, to: &str, body: &str, roster: &Roster, off_record: bool) -> String {
+    format!("{}\n{}", typed(me, Some(to), body, roster), sealed_line(time, block, off_record))
+}
+
+/// Just the chain's word on a line already echoed: `✓ sealed` in its block,
+/// or that an off-the-record one deliberately wasn't.
+pub fn sealed_line(time: &str, block: u64, off_record: bool) -> String {
     let note = if off_record { "↝ off the record — not sealed" } else { "✓ sealed" };
-    format!("{}\n{}", typed(me, Some(to), body, roster), obs(time, block, paint(theme().progress, note)))
+    obs(time, block, paint(theme().progress, note))
 }
 
 // ── tools and turns ─────────────────────────────────────────────────────
@@ -908,10 +914,15 @@ pub fn keys() -> String {
 /// talks to, the primary that will actually seal the block, the head it has
 /// seen. Its own function since the real REPL renders it as one row of a
 /// ratatui layout, separate from the (live, editable) prompt row.
-pub fn composer_status(node: &str, primary: &str, head: u64) -> String {
+pub fn composer_status(node: &str, primary: &str, head: u64, sealing: usize) -> String {
     let t = theme();
+    let pending = match sealing {
+        0 => String::new(),
+        1 => format!("{}  ", paint(t.warm, "◌ sealing…")),
+        n => format!("{}  ", paint(t.warm, &format!("◌ sealing {n}…"))),
+    };
     let status = format!(
-        "{} {} {} {} {} {}",
+        "{pending}{} {} {} {} {} {}",
         paint(t.progress, "●"),
         dim(node),
         dim("→"),
@@ -927,7 +938,7 @@ pub fn composer_lines(node: &str, primary: &str, head: u64, me: &str, target: &s
     let t = theme();
     let mut out = Vec::new();
     out.push(String::new());
-    out.push(composer_status(node, primary, head));
+    out.push(composer_status(node, primary, head, 0));
     let prompt = prompt(me, Some(target));
     let byte_at = draft.char_indices().nth(cursor).map(|(b, _)| b).unwrap_or(draft.len());
     let (before, after) = draft.split_at(byte_at);

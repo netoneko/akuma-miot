@@ -27,7 +27,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use crate::agent_state_machine::{self, Dispatch, Host, Inbound};
-use crate::common::{parse_task, Roster};
+use crate::common::{parse_task, EventCursor, Roster};
 use crate::ui::{self, ToolOut};
 
 /// This cat's local memory across a process restart — `docs/
@@ -831,7 +831,7 @@ async fn watch_chain(cat: Arc<Cat>, mut head: serde_json::Value, tx: tokio::sync
     let name = cat.name.clone();
     let epoch = head["last_checkpoint"].as_u64().unwrap_or(0);
     let mut session = Session::load(&name, epoch);
-    let mut cursor = session.cursor;
+    let mut cursor = EventCursor::new(session.cursor);
     let mut question = std::mem::take(&mut session.question);
     let mut seen: HashSet<u64> = HashSet::new();
     let my_hex = miot_keys::to_hex(&cat.account);
@@ -840,14 +840,14 @@ async fn watch_chain(cat: Arc<Cat>, mut head: serde_json::Value, tx: tokio::sync
         head = cat.head().await.unwrap_or(head);
 
         // A node that rebuilt its log (demoted, rewound, adopted a
-        // checkpoint) restarts `seq`. A cursor past the new end would go
-        // deaf until the log grew back past it, so jump to the new end.
-        // Skipping what's there is right: those wakes are old news, and the
-        // chain re-issues anything still outstanding on its own.
+        // checkpoint) restarts `seq`. `EventCursor` re-reads the new log
+        // but skips everything up to what this cat already handled — it
+        // used to jump to "the end" while the log was still empty, then
+        // re-wake on every replayed message (found live 2026-09-24: kuro
+        // answering a long-finished exchange after a rewind).
         if let Some(seq) = head["seq"].as_u64() {
-            if seq < cursor {
-                println!("{}", ui::note(&format!("{name}: node's log restarted (seq {seq} < cursor {cursor}); resuming from its end")));
-                cursor = seq;
+            if cursor.check_head(seq) {
+                println!("{}", ui::note(&format!("{name}: node's log rebuilt (seq {seq}); skipping what was already handled")));
                 seen.clear();
             }
         }
@@ -863,9 +863,8 @@ async fn watch_chain(cat: Arc<Cat>, mut head: serde_json::Value, tx: tokio::sync
             }
         }
 
-        let batch = cat.events(cursor).await;
+        let batch: Vec<Entry> = cat.events(cursor.seq).await.into_iter().filter(|e| cursor.accept_at(e.seq, e.block)).collect();
         for e in &batch {
-            cursor = cursor.max(e.seq);
             if e.effect.get("t").and_then(|v| v.as_str()) == Some("said")
                 && e.effect.get("root").and_then(|v| v.as_bool()) == Some(true)
                 && question.is_empty()
@@ -918,8 +917,8 @@ async fn watch_chain(cat: Arc<Cat>, mut head: serde_json::Value, tx: tokio::sync
             }
         }
 
-        if cursor != session.cursor || question != session.question {
-            session.cursor = cursor;
+        if cursor.seq != session.cursor || question != session.question {
+            session.cursor = cursor.seq;
             session.question = question.clone();
             session.save(&name);
         }

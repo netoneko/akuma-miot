@@ -197,6 +197,13 @@ pub mod pallet {
     #[pallet::storage]
     pub type Stats<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, CatStats, ValueQuery>;
 
+    /// Messages a cat has sent (`SendMessage`), counted apart from its tool
+    /// calls — [`Pallet::report_stats2`]. Its own map rather than a new
+    /// `CatStats` field: `CatStats`' encoding is inside every checkpoint
+    /// snapshot already written, and a changed struct would stop decoding.
+    #[pallet::storage]
+    pub type MessagesSent<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, u32, ValueQuery>;
+
     /// Who is in this litter, by name: `(name, account)`, in genesis order.
     /// Written once at genesis and never changed by any call — membership is
     /// static (a new member is a new genesis), so there is no dispatchable
@@ -482,6 +489,21 @@ pub mod pallet {
             Self::deposit_event(Event::Happened(Effect::StatsReported { who, turns, tool_calls, tokens, ms }));
             Ok(())
         }
+
+        /// [`Self::report_stats`] with `messages` (SendMessage calls) split
+        /// out of `tool_calls`. A new call rather than a changed one: an
+        /// agent on an older build still reports through index 10, and a
+        /// node on an older build refuses this one outright instead of
+        /// misreading it.
+        #[pallet::call_index(11)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn report_stats2(origin: OriginFor<T>, turns: u32, tool_calls: u32, messages: u32, tokens: u64, ms: u64) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            Stats::<T>::insert(who.clone(), CatStats { turns, tool_calls, tokens, ms });
+            MessagesSent::<T>::insert(who.clone(), messages);
+            Self::deposit_event(Event::Happened(Effect::StatsReported2 { who, turns, tool_calls, messages, tokens, ms }));
+            Ok(())
+        }
     }
 
     impl<T: Config> Pallet<T> {
@@ -543,6 +565,13 @@ pub mod pallet {
             Stats::<T>::iter().collect()
         }
 
+        /// `who`'s messages sent, from its latest `report_stats2` — `None`
+        /// if it has only ever reported through the old call, which didn't
+        /// count them apart.
+        pub fn messages_sent(who: &T::AccountId) -> Option<u32> {
+            MessagesSent::<T>::contains_key(who).then(|| MessagesSent::<T>::get(who))
+        }
+
         /// Fold a previously-emitted effect into storage — the replay path,
         /// not a new occurrence. Deliberately bypasses `deposit_event`: this
         /// effect already happened and was already told to the litter once,
@@ -556,6 +585,11 @@ pub mod pallet {
             // about `miot_tasks::State`.
             if let Effect::StatsReported { who, turns, tool_calls, tokens, ms } = effect {
                 Stats::<T>::insert(who.clone(), CatStats { turns: *turns, tool_calls: *tool_calls, tokens: *tokens, ms: *ms });
+                return;
+            }
+            if let Effect::StatsReported2 { who, turns, tool_calls, messages, tokens, ms } = effect {
+                Stats::<T>::insert(who.clone(), CatStats { turns: *turns, tool_calls: *tool_calls, tokens: *tokens, ms: *ms });
+                MessagesSent::<T>::insert(who.clone(), *messages);
                 return;
             }
             let mut table = Self::table();

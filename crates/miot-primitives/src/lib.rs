@@ -357,6 +357,14 @@ pub enum Effect<A> {
     /// storage with no effect at all, and `GET /stats` came back correct
     /// on the primary and permanently empty on every replica.
     StatsReported { who: A, turns: u32, tool_calls: u32, tokens: u64, ms: u64 },
+    /// [`Effect::StatsReported`] with messages counted apart from tool
+    /// calls (`pallet_litter::Call::report_stats2`, 2026-09-24): a
+    /// `SendMessage` is a cat talking, not using a tool, and folding the two
+    /// together inflated every tool-call count. A new variant rather than a
+    /// new field, and appended last: the old variant's encoding sits in
+    /// every block already on disk and in every checkpoint, and changing it
+    /// would make every node fail to decode its own log on the next replay.
+    StatsReported2 { who: A, turns: u32, tool_calls: u32, messages: u32, tokens: u64, ms: u64 },
 }
 
 impl<A> Effect<A> {

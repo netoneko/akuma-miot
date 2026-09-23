@@ -245,6 +245,11 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
         Effect::StatsReported { who, turns, tool_calls, tokens, ms } => {
             json!({"t":"stats_reported","who":to_hex(who),"turns":turns,"tool_calls":tool_calls,"tokens":tokens,"ms":ms})
         }
+        // Same `t` as the old variant — one kind of event to readers, with
+        // `messages` present when the reporter counted them apart.
+        Effect::StatsReported2 { who, turns, tool_calls, messages, tokens, ms } => {
+            json!({"t":"stats_reported","who":to_hex(who),"turns":turns,"tool_calls":tool_calls,"messages":messages,"tokens":tokens,"ms":ms})
+        }
     }
 }
 
@@ -1590,7 +1595,13 @@ async fn all_stats(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response 
     let rows = n.ext.execute_with(|| {
         Litter::all_stats()
             .iter()
-            .map(|(who, s)| serde_json::json!({"account":miot_keys::to_hex(who),"turns":s.turns,"tool_calls":s.tool_calls,"tokens":s.tokens,"ms":s.ms}))
+            .map(|(who, s)| {
+                let mut row = serde_json::json!({"account":miot_keys::to_hex(who),"turns":s.turns,"tool_calls":s.tool_calls,"tokens":s.tokens,"ms":s.ms});
+                if let Some(m) = Litter::messages_sent(who) {
+                    row["messages"] = m.into();
+                }
+                row
+            })
             .collect::<Vec<_>>()
     });
     Json(rows).into_response()

@@ -32,7 +32,7 @@ use sp_core::H256;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
-use crate::common::{Roster, DIM, OFF};
+use crate::common::{EventCursor, Roster, DIM, OFF};
 use crate::ui;
 
 pub struct Client {
@@ -508,14 +508,23 @@ impl Client {
 
         let deadline = seconds.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
         let task = task.map(|t| t.trim_start_matches('t').to_string());
-        let mut cursor = since;
+        let mut cursor = EventCursor::new(since);
         loop {
-            let batch = match self.get_json(&format!("/events?since={cursor}")).await {
+            if !replaying {
+                if let Ok(h) = self.get_json("/head").await {
+                    if h["seq"].as_u64().is_some_and(|s| cursor.check_head(s)) && pretty {
+                        println!("{}", ui::note("the node rebuilt its log (a /clear, or a rewind) — following it"));
+                    }
+                }
+            }
+            let batch = match self.get_json(&format!("/events?since={}", cursor.seq)).await {
                 Ok(serde_json::Value::Array(b)) => b,
                 _ => Vec::new(),
             };
             for e in &batch {
-                cursor = cursor.max(e["seq"].as_u64().unwrap_or(cursor));
+                if !cursor.accept(e) {
+                    continue;
+                }
                 if let Some(t) = &task {
                     let et = e["effect"]["task"].as_str().unwrap_or("").trim_start_matches('t');
                     if et != t && !et.starts_with(&format!("{t}.")) {
@@ -688,13 +697,22 @@ async fn tail_events(
     identity: Identity,
     roster: Roster,
     me_name: String,
-    since: u64,
+    mut cursor: EventCursor,
     tx: mpsc::UnboundedSender<String>,
     state: Arc<AsyncMutex<ComposerState>>,
 ) {
-    let mut cursor = since;
     loop {
-        let query = format!("since={cursor}");
+        let head_seq = async {
+            let r = http.get(format!("{node}/head")).headers(crate::node::sign_headers(&identity, b"")).send().await.ok()?;
+            r.json::<serde_json::Value>().await.ok()?["seq"].as_u64()
+        }
+        .await;
+        if let Some(s) = head_seq {
+            if cursor.check_head(s) {
+                let _ = tx.send(ui::note("the node rebuilt its log (a /clear, or a rewind) — following it"));
+            }
+        }
+        let query = format!("since={}", cursor.seq);
         let headers = crate::node::sign_headers(&identity, query.as_bytes());
         let batch: Vec<serde_json::Value> = match http.get(format!("{node}/events?{query}")).headers(headers).send().await {
             Ok(r) => r.json().await.unwrap_or_default(),
@@ -703,13 +721,31 @@ async fn tail_events(
         if !batch.is_empty() {
             let mut head = None;
             for e in &batch {
-                cursor = cursor.max(e["seq"].as_u64().unwrap_or(cursor));
                 let block = e["block"].as_u64().unwrap_or(0);
                 head = Some(block);
+                if !cursor.accept(e) {
+                    continue;
+                }
                 // Live, so an entry whose block is still open (no seal time
                 // yet) really is happening now.
                 let at = e["at"].as_u64().unwrap_or_else(unix_ms_now);
-                let _ = tx.send(ui::render(&ui::clock(at), block, &e["effect"], &roster, &me_name));
+                let eff = &e["effect"];
+                // Our own line, already echoed at ⏎ (`send_and_seal`): only
+                // the seal is news. One sent some other way (`kot say` in
+                // another terminal) wasn't echoed here, so it renders whole.
+                let ours = eff["t"] == "said" && ui::name_of(eff, "from", &roster) == me_name;
+                let echoed = ours && {
+                    let mut s = state.lock().await;
+                    let had = s.sealing > 0;
+                    s.sealing = s.sealing.saturating_sub(1);
+                    had
+                };
+                let line = if echoed {
+                    ui::sealed_line(&ui::clock(at), block, eff["off_record"].as_bool().unwrap_or(false))
+                } else {
+                    ui::render(&ui::clock(at), block, eff, &roster, &me_name)
+                };
+                let _ = tx.send(line);
             }
             if let Some(h) = head {
                 state.lock().await.head = h;
@@ -725,6 +761,10 @@ struct ComposerState {
     node: String,
     primary: String,
     head: u64,
+    /// Lines this client echoed at ⏎ and is waiting to see sealed — shown
+    /// as `◌ sealing…` in the status row until the chain's `said` comes
+    /// back through `tail_events`, which then prints only `✓ sealed`.
+    sealing: usize,
 }
 
 const COMPOSER_HEIGHT: u16 = 2;
@@ -1004,10 +1044,11 @@ fn current_word(s: &str, cursor: usize) -> (usize, String) {
 /// tags). Every line here is a real signed extrinsic; output goes through
 /// `tx` so it lands through the same insert as everything else — no
 /// separate, racing print path. Returns whether the session should end.
-async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<String>) -> bool {
+async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<String>, state: &Arc<AsyncMutex<ComposerState>>) -> bool {
     let send = |s: String| {
         let _ = tx.send(s);
     };
+    let me_name = c.roster.name_of(&c.identity.account());
     match line.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((line, "")) {
         ("/quit" | "/exit", _) => return true,
         ("/keys", _) => send(ui::keys()),
@@ -1134,11 +1175,7 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
             }
             let calls: Vec<Option<AccountId>> =
                 if !targets.is_empty() { targets.into_iter().map(Some).collect() } else { vec![c.dm_target.clone()] };
-            for t in calls {
-                if let Err(e) = c.try_submit(say_call(t, text, true)).await {
-                    send(format!("  {}", ui::alert(&format!("refused: {e}"))));
-                }
-            }
+            send_and_seal(c, &me_name, calls, text, true, &send, state).await;
         }
         (cmd, _) if cmd.starts_with('/') => send(format!("  {}", ui::dim(&format!("unknown command {cmd}")))),
         _ => {
@@ -1154,14 +1191,35 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
             // is set, and only broadcasts to the whole litter when it isn't.
             let calls: Vec<Option<AccountId>> =
                 if !targets.is_empty() { targets.into_iter().map(Some).collect() } else { vec![c.dm_target.clone()] };
-            for t in calls {
-                if let Err(e) = c.try_submit(say_call(t, line, false)).await {
-                    send(format!("  {}", ui::alert(&format!("refused: {e}"))));
-                }
-            }
+            send_and_seal(c, &me_name, calls, line, false, &send, state).await;
         }
     }
     false
+}
+
+/// Echo a line the moment it's sent, count it as sealing (the status row
+/// shows `◌ sealing…`), and submit it once per target. `tail_events` prints
+/// `✓ sealed` under it when the chain's `said` comes back; a refusal says
+/// so here and stops counting it.
+async fn send_and_seal(
+    c: &mut Client,
+    me_name: &str,
+    calls: Vec<Option<AccountId>>,
+    text: &str,
+    off_record: bool,
+    send: &impl Fn(String),
+    state: &Arc<AsyncMutex<ComposerState>>,
+) {
+    for t in calls {
+        let to = t.as_ref().map(|a| c.roster.name_of(a)).unwrap_or_else(|| "litter".to_string());
+        send(ui::typed(me_name, Some(&to), text, &c.roster));
+        state.lock().await.sealing += 1;
+        if let Err(e) = c.try_submit(say_call(t, text, off_record)).await {
+            let mut s = state.lock().await;
+            s.sealing = s.sealing.saturating_sub(1);
+            send(format!("  {}", ui::alert(&format!("refused: {e}"))));
+        }
+    }
 }
 
 /// Bare `kot`: the interactive session, `kot::ui`'s look wired to a live
@@ -1202,7 +1260,7 @@ pub async fn repl(mut c: Client) {
         Ok(serde_json::Value::Array(b)) => b,
         _ => Vec::new(),
     };
-    let cursor = all.iter().filter_map(|e| e["seq"].as_u64()).max().unwrap_or(0);
+    let mut cursor = EventCursor::new(0);
     // The whole session the node holds (everything since the last
     // compaction, up to its log cap) — not a tail: scrollback is where the
     // operator reads what happened while they were away.
@@ -1212,6 +1270,7 @@ pub async fn repl(mut c: Client) {
     }
     let mut prev_at: Option<u64> = None;
     for e in &all {
+        cursor.accept(e);
         let block = e["block"].as_u64().unwrap_or(0);
         let at = e["at"].as_u64();
         header.push(ui::render(&ui::stamp_at(at, prev_at), block, &e["effect"], &c.roster, &me_name));
@@ -1244,7 +1303,7 @@ pub async fn repl(mut c: Client) {
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let state = Arc::new(AsyncMutex::new(ComposerState { node: c.node.clone(), primary: primary.unwrap_or_else(|| "?".into()), head: head_block }));
+    let state = Arc::new(AsyncMutex::new(ComposerState { node: c.node.clone(), primary: primary.unwrap_or_else(|| "?".into()), head: head_block, sealing: 0 }));
 
     tokio::spawn(tail_events(c.http.clone(), c.node.clone(), c.identity, c.roster.clone(), me_name.clone(), cursor, tx.clone(), state.clone()));
     tokio::spawn(poll_mesh_ui(c.http.clone(), c.node.clone(), c.identity, c.roster.clone(), tx.clone(), state.clone()));
@@ -1258,7 +1317,7 @@ pub async fn repl(mut c: Client) {
             maybe_ev = events.next() => match maybe_ev {
                 Some(Ok(Event::Key(key))) => match input.handle(key, &c.roster) {
                     Outcome::Quit => true,
-                    Outcome::Submit(line) => run_command(&mut c, &line, &tx).await,
+                    Outcome::Submit(line) => run_command(&mut c, &line, &tx, &state).await,
                     Outcome::None => false,
                 },
                 Some(Ok(Event::Resize(_, _))) => { let _ = terminal.autoresize(); false }
@@ -1270,11 +1329,11 @@ pub async fn repl(mut c: Client) {
             break;
         }
 
-        let (node, primary, head) = {
+        let (node, primary, head, sealing) = {
             let s = state.lock().await;
-            (s.node.clone(), s.primary.clone(), s.head)
+            (s.node.clone(), s.primary.clone(), s.head, s.sealing)
         };
-        let status = ui::composer_status(&node, &primary, head);
+        let status = ui::composer_status(&node, &primary, head, sealing);
         // Reflects `/dm`'s sticky target fresh every redraw, since
         // `run_command` mutates `c.dm_target` rather than a local here.
         let target = c.dm_target.as_ref().map(|a| c.roster.name_of(a)).unwrap_or_else(|| "litter".to_string());

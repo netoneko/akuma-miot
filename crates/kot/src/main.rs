@@ -20,7 +20,7 @@
 //! `miot` binary had.
 
 use clap::{Args, Parser, Subcommand};
-use kot::common::{self, expand_home, parse_account, Roster, DIM, OFF};
+use kot::common::{self, expand_home, parse_account, Roster};
 use kot::{agent, chat, client, node};
 use miot_keys::Identity;
 use miot_runtime::RuntimeCall;
@@ -61,6 +61,9 @@ struct Cli {
     /// (`/roster`); here it's only where `--as <name>` finds a dev seed.
     #[arg(long, env = "MIOT_ROSTER", global = true, default_value = DEV_ROSTER)]
     roster: String,
+    /// The skin: bund (default), neon, or ink.
+    #[arg(long, env = "KOT_THEME", global = true)]
+    theme: Option<String>,
     #[command(subcommand)]
     cmd: Option<Cmd>,
 }
@@ -315,6 +318,13 @@ async fn run(cli: &Cli, a: &RunArgs) {
 #[tokio::main]
 async fn main() {
     let cli = Cli::parse();
+    // `ui::theme()` reads KOT_THEME once, on first use — set it before
+    // anything renders, so the flag and the env var are the same thing.
+    if let Some(t) = &cli.theme {
+        // SAFETY: single-threaded here — the tokio runtime's workers exist,
+        // but nothing has been spawned onto them yet.
+        unsafe { std::env::set_var("KOT_THEME", t) };
+    }
     match &cli.cmd {
         Some(Cmd::Run(a)) => run(&cli, a).await,
         Some(Cmd::Chat(a)) => {
@@ -383,10 +393,8 @@ async fn main() {
         }
         Some(Cmd::Peers) => connect(&cli).await.print_peers().await,
         Some(Cmd::Log { task, follow }) => connect(&cli).await.log(0, task.as_deref(), *follow, None).await,
-        None => {
-            println!("{}", include_str!("../../../assets/akuma_40.txt"));
-            println!("  {DIM}akuma // distributed cat system{OFF}\n");
-            client::repl(connect(&cli).await).await;
-        }
+        // The banner is `repl()`'s own (`ui::banner`) — printing the bare
+        // cat here too drew the logo twice.
+        None => client::repl(connect(&cli).await).await,
     }
 }
