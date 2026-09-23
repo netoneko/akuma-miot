@@ -148,7 +148,9 @@ struct Cat {
 #[derive(Default, Clone, Copy)]
 struct CatStats {
     turns: u32,
+    /// `SendMessage` not included — that's `messages`.
     tool_calls: u32,
+    messages: u32,
     tokens: u64,
     ms: u64,
 }
@@ -412,6 +414,10 @@ impl Cat {
                 let from = e.effect.get("from")?.as_str()?;
                 let body = e.effect.get("body")?.as_str().unwrap_or("");
                 let who = miot_keys::from_hex(from).map(|a| self.roster.name_of(&a)).unwrap_or_else(|_| "someone".into());
+                // No "(use Peers for who's live)" hint any more: found live
+                // 2026-09-24, qwen3-4b took it as an instruction and called
+                // Peers on every single wake, never replying.
+                //
                 // Found live 2026-09-23: asked to "discuss this with your
                 // littermate" with no name given, two cats each invented a
                 // plausible-sounding one and tried to SendMessage it —
@@ -467,7 +473,7 @@ impl Cat {
                 };
                 format!(
                     "{who} said to the litter:\n\"{body}\"\n\n{framing} The litter's other \
-                     members, by name (use Peers for who's actually live right now): {}.\n\n{ack_note}{otr_note}",
+                     members, by name: {}.\n\n{ack_note}{otr_note}",
                     others.join(", ")
                 )
             }
@@ -569,11 +575,7 @@ impl Cat {
                                     .and_then(|h| miot_keys::from_hex(h).ok())
                                     .map(|a| self.roster.name_of(&a))
                                     .unwrap_or_else(|| "someone".into());
-                                let turns = r.get("turns").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let tool_calls = r.get("tool_calls").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let tokens = r.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-                                let ms = r.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                                format!("{name} — {turns} turns, {tool_calls} tool calls, {} tok, {:.1}s thinking", ui::thousands(tokens), ms as f64 / 1000.0)
+                                format!("{name} — {}", ui::stats_phrase(r))
                             })
                             .collect();
                         ToolOut::new("", true).meta(format!("{} cats", rows.len())).body(lines.join("\n"))
@@ -745,6 +747,8 @@ impl Host for CatHost {
         let body = text.to_string();
         let cat = self.0.clone();
         tokio::spawn(async move {
+            // A message all the same — the next stats report counts it.
+            cat.stats.lock().await.messages += 1;
             let arg = format!("→ {who}  {body}  (auto, no_ack)");
             let out = match cat.submit(RuntimeCall::Litter(pallet_litter::Call::say { to, body, no_ack: true, off_record })).await {
                 Ok(()) => ToolOut::new(arg, true).meta("submitted"),
@@ -759,20 +763,22 @@ impl Host for CatHost {
     /// turn: turns are minutes apart, finer than any timer would need.
     fn after_turn(&self, cost: &ui::TurnCost) {
         let cat = self.0.clone();
-        let (tools, tokens, ms) = (cost.tools as u32, cost.total as u64, cost.ms);
+        let (tools, messages, tokens, ms) = (cost.tools as u32, cost.messages as u32, cost.total as u64, cost.ms);
         tokio::spawn(async move {
             let snapshot = {
                 let mut s = cat.stats.lock().await;
                 s.turns += 1;
                 s.tool_calls += tools;
+                s.messages += messages;
                 s.tokens += tokens;
                 s.ms += ms;
                 *s
             };
             let _ = cat
-                .submit(RuntimeCall::Litter(pallet_litter::Call::report_stats {
+                .submit(RuntimeCall::Litter(pallet_litter::Call::report_stats2 {
                     turns: snapshot.turns,
                     tool_calls: snapshot.tool_calls,
+                    messages: snapshot.messages,
                     tokens: snapshot.tokens,
                     ms: snapshot.ms,
                 }))

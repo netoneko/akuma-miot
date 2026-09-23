@@ -118,7 +118,8 @@ pub fn shared_tools() -> Vec<Tool> {
 }
 
 enum Back {
-    Result(String, ToolOut),
+    /// A query's result, tagged with the session it was asked in.
+    Result(String, ToolOut, u64),
     RecordDone,
 }
 
@@ -139,6 +140,15 @@ struct AgentStateMachine<H: Host> {
     queries: usize,
     records: usize,
     followups: u32,
+    /// Bumped by every [`Inbound::Reset`]. Anything started in an older
+    /// session — a turn still thinking, a query still running, a wake
+    /// queued ahead of the reset — is dropped rather than carried into
+    /// the new one. Found live 2026-09-24: kuro's turn on a pre-`/clear`
+    /// message finished after the clear and its reply was posted anyway.
+    session: u64,
+    /// Inbound traffic read early — while checking for a reset between a
+    /// turn's thinking and its acting — kept for the main loop, in order.
+    pending: std::collections::VecDeque<Inbound>,
 }
 
 /// Think until `inbox` closes and nothing is left in flight.
@@ -162,6 +172,8 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         queries: 0,
         records: 0,
         followups: 0,
+        session: 0,
+        pending: std::collections::VecDeque::new(),
     };
     let mut open = true;
     let mut was_idle = false;
@@ -177,21 +189,26 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
             }
         }
 
-        // Wait for anything at all.
+        // Wait for anything at all — traffic already read early first.
         let mut wakes: Vec<(String, &'static str, serde_json::Value)> = Vec::new();
         let mut results: Vec<(usize, String)> = Vec::new();
-        tokio::select! {
-            got = inbox.recv(), if open => match got {
-                Some(i) => m.take(i, &mut wakes),
-                None => open = false,
-            },
-            Some(b) = back_rx.recv() => m.back(b, &mut results),
+        if m.pending.is_empty() {
+            tokio::select! {
+                got = inbox.recv(), if open => match got {
+                    Some(i) => m.take(i, &mut wakes, &mut results),
+                    None => open = false,
+                },
+                Some(b) = back_rx.recv() => m.back(b, &mut results),
+            }
         }
 
         // Aggregate: everything already queued, then — for results with no
         // wake — the rest of the batch, up to the deadline.
+        while let Some(i) = m.pending.pop_front() {
+            m.take(i, &mut wakes, &mut results);
+        }
         while let Ok(i) = inbox.try_recv() {
-            m.take(i, &mut wakes);
+            m.take(i, &mut wakes, &mut results);
         }
         while let Ok(b) = back_rx.try_recv() {
             m.back(b, &mut results);
@@ -202,7 +219,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
                 tokio::select! {
                     Some(b) = back_rx.recv() => m.back(b, &mut results),
                     got = inbox.recv(), if open => match got {
-                        Some(i) => { m.take(i, &mut wakes); break; }
+                        Some(i) => { m.take(i, &mut wakes, &mut results); break; }
                         None => open = false,
                     },
                     _ = tokio::time::sleep_until(until) => break,
@@ -226,19 +243,26 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
             m.followups = 0;
         }
         was_idle = false;
-        m.turn(wakes, results).await;
+        m.turn(wakes, results, &mut inbox).await;
     }
 }
 
 impl<H: Host> AgentStateMachine<H> {
-    fn take(&mut self, i: Inbound, wakes: &mut Vec<(String, &'static str, serde_json::Value)>) {
+    /// One inbound item into the batch being assembled. A reset empties the
+    /// batch too: wakes and results gathered ahead of it belong to the
+    /// session it just ended.
+    fn take(&mut self, i: Inbound, wakes: &mut Vec<(String, &'static str, serde_json::Value)>, results: &mut Vec<(usize, String)>) {
         match i {
             Inbound::Wake { text, kind, ctx } => wakes.push((text, kind, ctx)),
             Inbound::Reset(why) => {
                 self.host.show(ui::note(&format!("new session — {why}")));
+                self.session += 1;
                 self.history.clear();
                 self.warned_tier = 0;
                 self.pending_warning = None;
+                self.followups = 0;
+                wakes.clear();
+                results.clear();
             }
         }
     }
@@ -248,9 +272,13 @@ impl<H: Host> AgentStateMachine<H> {
     fn back(&mut self, b: Back, results: &mut Vec<(usize, String)>) {
         match b {
             Back::RecordDone => self.records = self.records.saturating_sub(1),
-            Back::Result(name, out) => {
+            Back::Result(name, out, session) => {
                 self.queries = self.queries.saturating_sub(1);
                 self.host.show(ui::tool(self.host.name(), &name, &out));
+                if session != self.session {
+                    self.host.show(ui::note(&format!("{name}'s result is from before the session reset — not fed back")));
+                    return;
+                }
                 let id = self.tool_log.len();
                 self.tool_log.push((name, out.text()));
                 results.push((id, clip(&self.tool_log[id].1, FEED_CHARS)));
@@ -270,7 +298,7 @@ impl<H: Host> AgentStateMachine<H> {
         t
     }
 
-    async fn turn(&mut self, wakes: Vec<(String, &'static str, serde_json::Value)>, results: Vec<(usize, String)>) {
+    async fn turn(&mut self, wakes: Vec<(String, &'static str, serde_json::Value)>, results: Vec<(usize, String)>, inbox: &mut mpsc::UnboundedReceiver<Inbound>) {
         let name = self.host.name().to_string();
         if !wakes.is_empty() {
             self.kinds = wakes.iter().map(|w| w.1).collect();
@@ -300,15 +328,31 @@ impl<H: Host> AgentStateMachine<H> {
                 return;
             }
         };
+        let messages = turn.calls.iter().filter(|c| c.name == "SendMessage").count();
         let cost = TurnCost {
             prompt: turn.prompt_tokens,
             out: turn.tokens,
             total: turn.total_tokens,
             window: self.window,
             ms: turn.ms,
-            tools: turn.calls.len(),
+            tools: turn.calls.len() - messages,
+            messages,
         };
         self.host.show(ui::turn(&name, &cost));
+
+        // Thinking takes minutes; a reset may have landed meanwhile. If so,
+        // this turn answered a session that no longer exists — act on none
+        // of it. (Whatever was read here stays queued, in order, for the
+        // main loop, which applies the reset itself.)
+        while let Ok(i) = inbox.try_recv() {
+            self.pending.push_back(i);
+        }
+        if self.pending.iter().any(|i| matches!(i, Inbound::Reset(_))) {
+            let n = turn.calls.len();
+            self.host.show(ui::note(&format!("session reset while thinking — this turn's {n} call(s) dropped, nothing sent")));
+            self.host.after_turn(&cost);
+            return;
+        }
 
         // The model's own side of the conversation: only what it actually
         // said. Its calls are *not* written in here as text — found live,
@@ -341,7 +385,7 @@ impl<H: Host> AgentStateMachine<H> {
                 "TokenBudget" | "BrowseTools" | "Inspect" | "AboutMe" => {
                     let out = self.session_tool(c, turn.total_tokens);
                     self.queries += 1;
-                    let _ = self.back_tx.send(Back::Result(c.name.clone(), out));
+                    let _ = self.back_tx.send(Back::Result(c.name.clone(), out, self.session));
                 }
                 _ => self.dispatch(c),
             }
@@ -386,9 +430,10 @@ impl<H: Host> AgentStateMachine<H> {
                 self.queries += 1;
                 let tx = self.back_tx.clone();
                 let name = c.name.clone();
+                let session = self.session;
                 tokio::spawn(async move {
                     let out = timed(q.await);
-                    let _ = tx.send(Back::Result(name, out));
+                    let _ = tx.send(Back::Result(name, out, session));
                 });
             }
             Dispatch::Record(r) => {
@@ -406,7 +451,7 @@ impl<H: Host> AgentStateMachine<H> {
             // Fed back, so the model learns it rather than retrying blind.
             Dispatch::Unknown => {
                 self.queries += 1;
-                let _ = self.back_tx.send(Back::Result(c.name.clone(), ToolOut::new("", false).meta("no such tool here")));
+                let _ = self.back_tx.send(Back::Result(c.name.clone(), ToolOut::new("", false).meta("no such tool here"), self.session));
             }
         }
     }

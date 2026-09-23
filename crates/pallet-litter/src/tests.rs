@@ -437,3 +437,45 @@ fn a_folded_block_log_reproduces_the_producers_state_exactly() {
     assert_eq!(fold_log(&blocks, true), live);
     assert_ne!(fold_log(&blocks, false), live, "control: double-ticking must visibly diverge");
 }
+
+/// Messages are counted apart from tool calls, on the primary and — by
+/// replaying the effect — on every replica.
+#[test]
+fn report_stats2_splits_messages_and_replays() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Litter::report_stats2(RuntimeOrigin::signed(TAMA), 3, 2, 5, 900, 1_000));
+        assert_eq!(Litter::messages_sent(&TAMA), Some(5));
+        assert_eq!(Litter::all_stats().into_iter().find(|(w, _)| *w == TAMA).unwrap().1.tool_calls, 2);
+        let fx = effects();
+        assert!(fx.contains(&Effect::StatsReported2 { who: TAMA, turns: 3, tool_calls: 2, messages: 5, tokens: 900, ms: 1_000 }), "{fx:?}");
+    });
+    // A replica: storage rebuilt from the effect alone.
+    new_test_ext().execute_with(|| {
+        Litter::replay_effect(&Effect::StatsReported2 { who: KURO, turns: 1, tool_calls: 0, messages: 1, tokens: 10, ms: 5 }, 1);
+        assert_eq!(Litter::messages_sent(&KURO), Some(1));
+    });
+}
+
+/// An agent on an older build still reports through the old call; its
+/// messages simply aren't known — `None`, not a made-up zero.
+#[test]
+fn old_report_stats_still_works_without_messages() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Litter::report_stats(RuntimeOrigin::signed(TAMA), 4, 7, 100, 50));
+        assert_eq!(Litter::messages_sent(&TAMA), None);
+        Litter::replay_effect(&Effect::StatsReported { who: KURO, turns: 1, tool_calls: 1, tokens: 1, ms: 1 }, 1);
+        assert_eq!(Litter::all_stats().len(), 2);
+    });
+}
+
+/// The encoding claim behind adding a variant instead of a field: the old
+/// variant's index is unchanged (so every block already on disk decodes),
+/// and the new one comes right after it.
+#[test]
+fn stats_variants_keep_their_indices() {
+    use codec::Encode;
+    let old = Effect::<u64>::StatsReported { who: 1, turns: 0, tool_calls: 0, tokens: 0, ms: 0 }.encode();
+    let new = Effect::<u64>::StatsReported2 { who: 1, turns: 0, tool_calls: 0, messages: 0, tokens: 0, ms: 0 }.encode();
+    assert_eq!(old[0], 13, "StatsReported must stay variant 13 (as committed before StatsReported2) — it's in every block on disk");
+    assert_eq!(new[0], 14);
+}

@@ -68,7 +68,7 @@ impl Host for Terminal {
 }
 
 pub async fn run(cfg: ChatConfig) {
-    println!("talking to {} as {} — {}", cfg.llm.label(), ui::sealed(&cfg.name), ui::dim("/quit or Ctrl-D to leave"));
+    println!("talking to {} as {} — {}", cfg.llm.label(), ui::sealed(&cfg.name), ui::dim("/clear to start over · /quit or Ctrl-D to leave"));
     match cfg.llm.context_window().await {
         Some(w) => println!("{}", ui::dim(&format!("context window: {w} tokens"))),
         None => println!("{}", ui::dim("context window: unknown for this model — budget warnings won't fire")),
@@ -92,6 +92,15 @@ pub async fn run(cfg: ChatConfig) {
             }
             if line == "/quit" || line == "/exit" {
                 break;
+            }
+            // Forget the conversation — the same reset a cat gets when the
+            // chain's checkpoint moves, so it also drops anything still in
+            // flight from before it.
+            if line == "/clear" {
+                if tx.send(Inbound::Reset("operator /clear".into())).is_err() {
+                    break;
+                }
+                continue;
             }
             if tx.send(Inbound::Wake { text: line.to_string(), kind: "chat", ctx: serde_json::Value::Null }).is_err() {
                 break;

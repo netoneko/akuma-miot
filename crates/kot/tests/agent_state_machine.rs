@@ -108,6 +108,8 @@ struct Seen {
     spoke: Vec<String>,
     shown: Vec<String>,
     turns: usize,
+    /// (tools, messages) per turn, as reported to `after_turn`.
+    costs: Vec<(usize, usize)>,
 }
 
 struct TestHost(Arc<Mutex<Seen>>);
@@ -153,8 +155,10 @@ impl Host for TestHost {
     fn spoke(&self, text: &str, _ctx: &Value) {
         self.0.lock().unwrap().spoke.push(text.to_string());
     }
-    fn after_turn(&self, _cost: &kot::ui::TurnCost) {
-        self.0.lock().unwrap().turns += 1;
+    fn after_turn(&self, cost: &kot::ui::TurnCost) {
+        let mut s = self.0.lock().unwrap();
+        s.turns += 1;
+        s.costs.push((cost.tools, cost.messages));
     }
     fn show(&self, s: String) {
         self.0.lock().unwrap().shown.push(s);
@@ -462,4 +466,63 @@ async fn close_waits_for_in_flight_work() {
     let (fake, seen) = r.finish().await;
     assert_eq!(fake.requests().len(), 2, "the in-flight result still got its turn");
     assert_eq!(seen.lock().unwrap().turns, 2);
+}
+
+/// A `SendMessage` is talking, not a tool call: a turn that ran `Bash` and
+/// replied reports one of each, not two tool calls.
+#[tokio::test]
+async fn messages_are_counted_apart_from_tools() {
+    let r = rig(vec![calls(vec![("Bash", json!({"command": "true"})), ("SendMessage", json!({"body": "done"}))])]).await;
+    r.wake("go");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (_, seen) = r.finish().await;
+    assert_eq!(seen.lock().unwrap().costs[0], (1, 1));
+}
+
+/// kuro's case, live 2026-09-24: a turn still thinking when the session
+/// resets must not act — its reply belongs to a conversation that's gone.
+#[tokio::test]
+async fn reset_during_a_turn_drops_its_calls() {
+    let mut slow = say("stale reply");
+    slow.delay_ms = 500;
+    let r = rig(vec![slow, say("fresh reply")]).await;
+    r.wake("before the clear");
+    r.until("thinking", |f, _| f.requests().len() == 1).await;
+    r.tx.as_ref().unwrap().send(Inbound::Reset("clear".into())).unwrap();
+    r.wake("after the clear");
+    r.until("fresh reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, seen) = r.finish().await;
+    assert_eq!(seen.lock().unwrap().sent, vec!["fresh reply"], "the stale turn's SendMessage must not go out");
+    assert!(!fake.all(1).contains("before the clear"), "and the new session doesn't remember it: {}", fake.all(1));
+}
+
+/// Wakes queued ahead of a reset in the same batch are the old session's.
+#[tokio::test]
+async fn wakes_queued_before_a_reset_are_dropped() {
+    let r = rig(vec![say("only the new one")]).await;
+    r.wake("old wake");
+    r.tx.as_ref().unwrap().send(Inbound::Reset("clear".into())).unwrap();
+    r.wake("new wake");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(fake.requests().len(), 1);
+    let fed = fake.fed(0);
+    assert!(fed.contains("new wake") && !fed.contains("old wake"), "{fed}");
+}
+
+/// A query still running at the reset finishes, is shown, and is not fed
+/// into the new session.
+#[tokio::test]
+async fn a_query_from_before_a_reset_is_not_fed_back() {
+    let r = rig(vec![calls(vec![("Echo", json!({"v": "stale", "ms": 400}))]), say("fresh")]).await;
+    r.wake("start something slow");
+    r.until("first turn done", |_, s| s.turns == 1).await;
+    r.tx.as_ref().unwrap().send(Inbound::Reset("clear".into())).unwrap();
+    r.wake("new question");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let (fake, seen) = r.finish().await;
+    let all: String = (0..fake.requests().len()).map(|i| fake.all(i)).collect();
+    assert!(!all.contains("echo:stale"), "stale result reached the model: {all}");
+    assert!(seen.lock().unwrap().shown.iter().any(|l| l.contains("before the session reset")));
 }

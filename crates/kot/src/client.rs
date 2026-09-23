@@ -464,17 +464,7 @@ impl Client {
             "failed" => format!("{} failed", task()),
             "rehomed" => format!("{} rehomed from {} to {}", task(), self.name(eff, "from"), self.name(eff, "to")),
             "standalone_artifact" => format!("{} published artifact {}: {}", self.name(eff, "author"), eff["id"], text("title")),
-            "stats_reported" => {
-                let n = |f: &str| eff[f].as_u64().unwrap_or(0);
-                format!(
-                    "{} ∑ {} turns · {} tool calls · {} tok · {} thinking",
-                    self.name(eff, "who"),
-                    n("turns"),
-                    n("tool_calls"),
-                    ui::thousands(n("tokens")),
-                    ui::human(n("ms") / 1000)
-                )
-            }
+            "stats_reported" => format!("{} ∑ {}", self.name(eff, "who"), ui::stats_phrase(eff)),
             // A future Effect variant lands here until it earns its own
             // sentence above — still resolves accounts, just not to prose.
             _ => {

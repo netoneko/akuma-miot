@@ -818,7 +818,10 @@ pub struct TurnCost {
     pub total: u32,
     pub window: Option<u32>,
     pub ms: u64,
+    /// Tool calls this turn, `SendMessage` not included.
     pub tools: usize,
+    /// `SendMessage` calls this turn — talking, counted apart from tools.
+    pub messages: usize,
 }
 
 pub fn turn(caller: &str, c: &TurnCost) -> String {
@@ -849,6 +852,10 @@ pub fn turn(caller: &str, c: &TurnCost) -> String {
         1 => "1 tool".to_string(),
         n => format!("{n} tools"),
     }));
+    if c.messages > 0 {
+        s.push_str(&sep());
+        s.push_str(&dim(&if c.messages == 1 { "1 message".to_string() } else { format!("{} messages", c.messages) }));
+    }
     s
 }
 
@@ -866,6 +873,23 @@ pub fn reply(caller: &str, body: &str) -> String {
         }
     }
     format!("\n{}", rows.join("\n"))
+}
+
+/// One cat's cumulative stats as a phrase — `12 turns · 9 tool calls · 4
+/// messages · 59,635 tok · 22m42s thinking` — from a `stats_reported`
+/// event or a `/stats` row, which share field names. `messages` is left
+/// out when the reporter didn't count them apart (an older build), rather
+/// than shown as a misleading zero.
+pub fn stats_phrase(v: &serde_json::Value) -> String {
+    let n = |f: &str| v[f].as_u64().unwrap_or(0);
+    let plural = |k: u64, one: &str, many: &str| format!("{k} {}", if k == 1 { one } else { many });
+    let mut parts = vec![plural(n("turns"), "turn", "turns"), plural(n("tool_calls"), "tool call", "tool calls")];
+    if let Some(m) = v["messages"].as_u64() {
+        parts.push(plural(m, "message", "messages"));
+    }
+    parts.push(format!("{} tok", thousands(n("tokens"))));
+    parts.push(format!("{} thinking", human(n("ms") / 1000)));
+    parts.join(" · ")
 }
 
 /// A side note from the loop itself — compaction, a budget warning, a
@@ -1061,22 +1085,10 @@ pub fn render(time: &str, block: u64, eff: &serde_json::Value, roster: &Roster, 
         // Cumulative, one per turn — the running meter of what a cat has
         // cost so far, so it reads as a tally rather than an event.
         "stats_reported" => {
-            let n = |f: &str| eff[f].as_u64().unwrap_or(0);
             obs(
                 time,
                 block,
-                format!(
-                    "{} {} {}",
-                    who(&name_of(eff, "who", roster)),
-                    dim("∑"),
-                    dim(&format!(
-                        "{} turns · {} tool calls · {} tok · {} thinking",
-                        n("turns"),
-                        n("tool_calls"),
-                        thousands(n("tokens")),
-                        human(n("ms") / 1000)
-                    ))
-                ),
+                format!("{} {} {}", who(&name_of(eff, "who", roster)), dim("∑"), dim(&stats_phrase(eff))),
             )
         }
         other => obs(time, block, format!("{} {}", dim(other), faint(&eff.to_string()))),
