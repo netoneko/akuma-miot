@@ -279,6 +279,17 @@ cutover above; this is the write-up to work from when that happens.
 
 ---
 
+## The teahouse (2026-09-24)
+
+The mesh and its chain are called **the teahouse** (茶馆). It has seven
+members on one genesis: meow, tama, kuro, mimi and sora at home, yuki and
+shiro on AWS. All links are mTLS, and the primary is elected across the WAN.
+`docs/TEAHOUSE.md` has the diagram, the seat-by-seat table, what was shown
+live (all seven on one chain, tool calls on bare-metal Akuma and Linux,
+results fed back since the agent state machine) and the limits: the three
+Akuma members are the fragile ones, and with them down the mesh runs at
+exactly quorum (4 of 7).
+
 ## The agent state machine (2026-09-24)
 
 `crates/kot/src/agent_state_machine.rs` is **the one agent loop**, hosted by
@@ -638,6 +649,54 @@ when asked). `docs/LOCAL_SIM.md` has the full writeup.
   `../akuma` territory — see that handoff before spending more time here.
 
 ---
+
+## Open theory: Akuma's "disk issues" / spawn failures (2026-09-24)
+
+**The operator's hypothesis, not yet tested.** The failures on the Akuma
+members may be one problem: kernel heap fragmentation or cache exhaustion
+building up while kot runs, possibly caused by something in how ParityDB
+uses the disk (mmap, file growth, compaction) that we missed. The failures
+in question are `failed to spawn '/bin/sh'`, exec returning `241`, herd not
+starting services, and the "disk" symptoms. The theory doesn't explain why
+the Firecracker guests fare better than the metal box. That could be
+platform differences: real disk vs. a virtio block device, different memory
+size, different caching.
+
+What's already known and bears on it:
+
+- **A competing, measured explanation for part of it:** amd64 sshd leaks
+  one pipe per session, and `MAX_PIPES` is 64 machine-wide, so spawns fail
+  from about the 44th session (`../akuma/docs/README.md`, measured at
+  `live=64`). If that were the whole story, failures would track ssh session
+  count only.
+- **For the theory, roughly (not counted exactly):** on 2026-09-24 the
+  freshly rebooted dumpster, with kot running, failed at around the 12th–15th
+  ssh session (`exit 241` on a plain `mkdir`). That's well short of the ~44
+  the pipe leak predicts, so something else is using the budget, or a
+  different resource ran out.
+- **ParityDB and Akuma have history:** the amd64 shared-write mmap fix
+  (`../akuma/docs/reference/subsystems/amd64-shared-write-mmap.md`, see
+  "What is real" above) was found through the block store.
+  `storeprobe`/`mmapprobe` (built by `overlays/local/build.sh`) exist to probe
+  exactly this.
+- **Against "Firecracker is fine":** mimi (Akuma in Firecracker, arm64) also
+  had herd list kot as enabled and never start it, and sora's guest went
+  unresponsive. Weaker symptoms, but possibly the same class.
+
+Cheapest tests to separate the two:
+
+1. **Session count to failure, with kot stopped vs running,** after fresh
+   boots (the one ssh exec that disables herd's kot counts). About 44 both
+   ways means the pipe leak; much fewer with kot running means kot or
+   ParityDB is taking something.
+2. **At the moment of failure, capture whatever the kernel exposes about
+   heap, page cache and pipe/slot counts** (serial console, `/proc`), and
+   compare with a fresh boot. `../akuma/docs/runbooks/` covers what is
+   readable on the metal.
+3. **`storeprobe`/`mmapprobe` soak,** alone, on the metal and in a
+   Firecracker guest, then check whether spawning still works afterwards.
+4. **Point `MIOT_DB` somewhere else, or quiet it** (no compaction, a
+   smaller log), and see whether the failure point moves.
 
 ## Next, in order
 

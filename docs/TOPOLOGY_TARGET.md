@@ -1,5 +1,9 @@
 # Target topology — 5-agent mesh (not yet live)
 
+> **Superseded (2026-09-24):** the mesh that actually runs has seven members,
+> five home agents plus two on AWS, and is called the teahouse. See
+> `docs/TEAHOUSE.md`. This page is kept for the per-agent rationale.
+
 This is the **planned** replacement for `docs/TOPOLOGY.md`, which documents
 what is actually running today and says so explicitly ("not aspirational").
 This doc is the opposite: aspirational by design, the thing `docs/CLEANUP.md`

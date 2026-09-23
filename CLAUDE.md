@@ -60,6 +60,10 @@ read that first, it is kept current and this file does not repeat it.
 ## Where to read
 
 - `HANDOFF.md` — state, traps, roadmap. Start here every session.
+- `docs/TEAHOUSE.md` — **the teahouse** (茶馆), the name of the mesh/chain:
+  the seven-member topology as actually running (5 home + 2 AWS), with a
+  diagram, what was shown live, and the honest limits. Current-state; it
+  supersedes `docs/TOPOLOGY_TARGET.md`'s five-agent plan. Added 2026-09-24.
 - `docs/MAPPING_REPORT.md` — design of record, the findings table (§1.1) is
   the actual asset (timers, "root is not a worker", "accept a submit without
   a claim" — each is a named test in `miot-tasks`).
