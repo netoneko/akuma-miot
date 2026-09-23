@@ -231,7 +231,7 @@ async fn connect(cli: &Cli) -> client::Client {
     let mut candidates: Vec<String> = cli.node.iter().cloned().collect();
     candidates.extend(cli.nodes.iter().filter(|n| !n.is_empty()).cloned());
     if candidates.is_empty() {
-        candidates.push("http://127.0.0.1:9944".into());
+        candidates.push("https://127.0.0.1:9944".into());
     }
     let roster = Roster::parse(&cli.roster).unwrap_or_else(|e| die(e));
     client::Client::connect(candidates, signer(cli), roster).await.unwrap_or_else(|e| die(e))
@@ -280,8 +280,9 @@ async fn run(cli: &Cli, a: &RunArgs) {
             let cfg = agent::AgentConfig {
                 name: name.clone(),
                 identity,
-                // Over HTTP even though it's this process (docs/CLI.md §5a).
-                node: format!("http://127.0.0.1:{}", running.addr.port()),
+                // Over the network stack even though it's this process
+                // (docs/CLI.md §5a) — mTLS included, same as any other caller.
+                node: format!("https://127.0.0.1:{}", running.addr.port()),
                 llm,
                 persona,
                 roster: Roster::parse(&cli.roster).unwrap_or_else(|e| die(e)),

@@ -18,9 +18,14 @@
 //! this process, but it reaches the node over HTTP like any other client
 //! (`docs/CLI.md` §5a: one code path, co-located or not).
 //!
+//! Every route below except `/submit` requires the `x-miot-signer`/
+//! `x-miot-sig` envelope from a trusted genesis account (`is_trusted_signer`)
+//! — a private chain, so an unsigned or stranger-signed request gets a plain
+//! 401, nothing served. See "mesh auth" further down and `docs/MESH_AUTH.md`.
+//!
 //! | | |
 //! |---|---|
-//! | `POST /submit` | a signed extrinsic; checked, dispatched into the *currently open* block (forwarded to the primary from a replica) |
+//! | `POST /submit` | a signed extrinsic; checked, dispatched into the *currently open* block (forwarded to the primary from a replica) — its own signature is the gate, no envelope needed |
 //! | `GET /meta` | genesis hash + spec/tx version |
 //! | `GET /account/{id}` | that account's nonce (the primary's, from a replica) |
 //! | `GET /events?since=N` | everything the chain emitted after cursor `N` |
@@ -59,6 +64,7 @@ use axum::extract::{Path, Query, State as AxState};
 use axum::http::{StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
+use axum::serve::Listener;
 use axum::{Json, Router};
 use codec::{Decode, Encode};
 use http::{HeaderMap, HeaderValue};
@@ -74,6 +80,7 @@ use sp_runtime::traits::UniqueSaturatedInto;
 use tokio::sync::Mutex;
 
 use crate::common::parse_task;
+use crate::tls;
 
 /// Everything a node needs to start. Every node in one mesh must agree on
 /// `root`, `leader` and `members` — they are genesis.
@@ -242,6 +249,20 @@ fn genesis(root: &AccountId, leader: &AccountId, members: &[AccountId], replayin
     (ext, genesis_hash)
 }
 
+/// Genesis `members` plus root and leader — the account universe every
+/// trust decision here draws from: [`Node::is_trusted_signer`]/`trusted_set`,
+/// and the TLS pinning in [`tls`](crate::tls) (needed before a `Node` exists
+/// at all, hence a free function rather than a method).
+fn trusted_accounts(members: &[AccountId], root: &AccountId, leader: &AccountId) -> Vec<AccountId> {
+    let mut v = members.to_vec();
+    for a in [root, leader] {
+        if !v.contains(a) {
+            v.push(a.clone());
+        }
+    }
+    v
+}
+
 /// The full storage trie — `Store::compact`'s opaque `state` blob.
 #[derive(Encode, Decode)]
 struct Snapshot {
@@ -278,13 +299,19 @@ impl Node {
             producing: false,
             peer: None,
             needs_reconcile: false,
-            // Prior knowledge, not negotiated: these are plain `http://`
-            // routes (no TLS/ALPN to negotiate over), and mesh-internal
-            // traffic is a tight poll loop between the same peers over and
-            // over, so one multiplexed connection beats a fresh handshake
-            // per call. axum's server side matches via `http2` feature on
-            // `hyper-util`'s `auto::Builder` (sniffs the h2c preface).
-            http: reqwest::Client::builder().timeout(Duration::from_secs(10)).http2_prior_knowledge().build().unwrap(),
+            // mTLS pinned to the same genesis accounts `is_trusted_signer`
+            // already trusts (`crate::tls`, `docs/MESH_AUTH.md`) — every
+            // outbound call this node makes, peer traffic and forwarded
+            // client requests alike, is both encrypted and authenticated by
+            // the handshake itself. ALPN picks h2 when the peer's listener
+            // (`tls::TlsListener`, same trusted set) offers it — no
+            // `http2_prior_knowledge()` needed now that there's a real
+            // handshake to negotiate over.
+            http: reqwest::Client::builder()
+                .timeout(Duration::from_secs(10))
+                .use_preconfigured_tls(tls::client_config(&cfg.identity, trusted_accounts(&cfg.members, &cfg.root, &cfg.leader)))
+                .build()
+                .unwrap(),
             started: Instant::now(),
         };
         if !node.store.is_empty() {
@@ -326,13 +353,7 @@ impl Node {
     /// [`is_trusted_signer`](Self::is_trusted_signer)'s set, materialized —
     /// for a snapshot ([`PeerAuth`]) that outlives the lock.
     fn trusted_set(&self) -> Vec<AccountId> {
-        let mut v = self.members.clone();
-        for a in [&self.genesis_root, &self.genesis_leader] {
-            if !v.contains(a) {
-                v.push(a.clone());
-            }
-        }
-        v
+        trusted_accounts(&self.members, &self.genesis_root, &self.genesis_leader)
     }
 
     /// The whole litter table, SCALE-encoded — counters `/tasks` doesn't
@@ -927,12 +948,16 @@ async fn rewind(shared: &Shared, peer: &str, fork: u64) {
 
 // ------------------------------------------------------------- mesh auth
 //
-// Signs and verifies mesh-internal HTTP traffic (election, chain sync) —
-// not client-facing endpoints like `/tasks` or `/account`, which stay open
-// to any `kot` client per `CLAUDE.md`. Distinct from `/submit`'s signed
-// `UncheckedExtrinsic`: that authorizes a *state change*; this authenticates
-// *who a mesh peer is* on the wire, which nothing checked before. Full
-// write-up: `docs/MESH_AUTH.md`.
+// Signs and verifies HTTP traffic — mesh-internal (election, chain sync)
+// *and*, since 2026-09-23, every client-facing read too (`/tasks`,
+// `/events`, `/account`, ...). This is a private chain: the account universe
+// is closed (genesis `members` plus root and leader — the same set that
+// gets `catnip`/provider standing), and adding one is a protocol update,
+// not a runtime registration — so an unsigned request, or one signed by a
+// stranger, gets nothing back, full stop. `/submit` is the one exception:
+// its authority comes from the `UncheckedExtrinsic`'s own signature
+// (`CheckNonce` already refuses non-members), so it needs no envelope of
+// its own. Full write-up: `docs/MESH_AUTH.md`.
 //
 // The signature covers exactly the bytes sent — the raw request/response
 // body, or the raw query string for a parameterless GET — never a
@@ -941,10 +966,10 @@ async fn rewind(shared: &Shared, peer: &str, fork: u64) {
 const SIG_HEADER_SIGNER: &str = "x-miot-signer";
 const SIG_HEADER_SIG: &str = "x-miot-sig";
 
-/// `pub` only so `tests/election.rs` can call a mesh-internal endpoint
-/// directly to inspect a node's raw log, the same way a real peer would.
-/// Not part of the client surface: `kot`'s own client never touches
-/// `/mesh/*` or `/chain/*`.
+/// `pub` so `tests/election.rs` can call a mesh-internal endpoint directly,
+/// and so `client.rs`/`agent.rs` can sign every read they make — every
+/// caller of this node, mesh peer or `kot` client alike, proves who it is
+/// the same way.
 pub fn sign_headers(identity: &Identity, bytes: &[u8]) -> HeaderMap {
     let sig = identity.sign(bytes);
     let mut h = HeaderMap::new();
@@ -985,6 +1010,14 @@ fn signed_json<T: Serialize>(identity: &Identity, status: StatusCode, body: &T) 
 
 fn unauthorized(why: &'static str) -> Response {
     (StatusCode::UNAUTHORIZED, why).into_response()
+}
+
+/// The gate every client-facing handler opens with: `bytes` (the raw query
+/// string, or `b""` for a parameterless GET) must carry a trusted member's
+/// signature. Same check `is_trusted_signer` gives mesh traffic — reads
+/// aren't a separate, looser trust boundary.
+fn require_client_auth(n: &Node, headers: &HeaderMap, bytes: &[u8]) -> Result<(), Response> {
+    verify_headers(headers, bytes, |a| n.is_trusted_signer(a)).map(|_| ()).map_err(unauthorized)
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -1052,7 +1085,9 @@ pub async fn start(cfg: NodeConfig) -> Result<Running, String> {
         cfg.block_ms,
     );
     let shared: Shared = Arc::new(Mutex::new(node));
-    let listener = tokio::net::TcpListener::bind((cfg.bind.as_str(), cfg.port)).await.map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
+    let tcp = tokio::net::TcpListener::bind((cfg.bind.as_str(), cfg.port)).await.map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
+    let trusted = trusted_accounts(&cfg.members, &cfg.root, &cfg.leader);
+    let listener = tls::TlsListener::new(tcp, tls::server_config(&cfg.identity, trusted));
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let mut tasks = Vec::new();
 
@@ -1129,9 +1164,14 @@ async fn mesh_vote(AxState(n): AxState<Shared>, headers: HeaderMap, body: Bytes)
     signed_json(&n.identity, StatusCode::OK, &reply)
 }
 
-/// `kot peers`: this node, and every peer as last seen from here.
-async fn mesh_peers(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
+/// `kot peers`: this node, and every peer as last seen from here. Despite
+/// the `/mesh` prefix this is client-facing, not mesh-internal — reachable
+/// over `/mesh/*` for historical reasons, gated the same as `/tasks` et al.
+async fn mesh_peers(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
     let now = n.now_ms();
     let peers: Vec<_> = n
         .mesh
@@ -1150,6 +1190,7 @@ async fn mesh_peers(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
         "last_checkpoint": n.store.last_checkpoint(),
         "peers": peers,
     }))
+    .into_response()
 }
 
 async fn chain_head(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
@@ -1201,23 +1242,33 @@ struct Since {
     since: u64,
 }
 
-async fn head(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
+async fn head(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
     let (block, seq, last_checkpoint) = (n.block, n.seq, n.store.last_checkpoint());
     let (leader, closed) = n.ext.execute_with(|| {
         let t = Litter::table();
         (t.leader().map(miot_keys::to_hex), Litter::artifact(TaskId::parent(1)).is_some())
     });
-    Json(serde_json::json!({"block":block,"seq":seq,"leader":leader,"closed":closed,"last_checkpoint":last_checkpoint}))
+    Json(serde_json::json!({"block":block,"seq":seq,"leader":leader,"closed":closed,"last_checkpoint":last_checkpoint})).into_response()
 }
 
-async fn events(AxState(n): AxState<Shared>, Query(q): Query<Since>) -> Json<Vec<Entry>> {
+async fn events(AxState(n): AxState<Shared>, uri: Uri, headers: HeaderMap, Query(q): Query<Since>) -> Response {
     let n = n.lock().await;
-    Json(n.log.iter().filter(|e| e.seq > q.since).cloned().collect())
+    // Signed over the raw query string, same rule as `/chain/blocks`.
+    if let Err(r) = require_client_auth(&n, &headers, uri.query().unwrap_or("").as_bytes()) {
+        return r;
+    }
+    Json(n.log.iter().filter(|e| e.seq > q.since).cloned().collect::<Vec<_>>()).into_response()
 }
 
-async fn tasks(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
+async fn tasks(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
     let rows = n.ext.execute_with(|| {
         Litter::table()
             .tasks()
@@ -1244,11 +1295,14 @@ async fn tasks(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
             })
             .collect::<Vec<_>>()
     });
-    Json(rows)
+    Json(rows).into_response()
 }
 
-async fn meta(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
+async fn meta(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
     let genesis_hash = n.ext.execute_with(|| System::block_hash(0u64));
     Json(serde_json::json!({
         "genesis_hash": hex::encode(genesis_hash.as_bytes()),
@@ -1256,13 +1310,19 @@ async fn meta(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
         "tx_version": VERSION.transaction_version,
         "kot_version": crate::version::VERSION,
     }))
+    .into_response()
 }
 
 /// Where a replica sends what only the primary can answer. `None` while
 /// nobody leads.
 enum Route {
     Here,
-    Primary(String, reqwest::Client),
+    /// The primary's route, this node's own `http`, and this node's own
+    /// identity — a replica forwarding `/account` re-signs as itself rather
+    /// than relaying the caller's headers, since it's a trusted member in
+    /// its own right and the caller's signature was already checked (or,
+    /// for `/submit`, isn't the gate at all) before we got here.
+    Primary(String, reqwest::Client, Identity),
     Nobody,
 }
 
@@ -1272,7 +1332,7 @@ async fn route(n: &Shared) -> Route {
         Route::Here
     } else {
         match &n.peer {
-            Some(p) => Route::Primary(p.clone(), n.http.clone()),
+            Some(p) => Route::Primary(p.clone(), n.http.clone(), n.identity),
             None => Route::Nobody,
         }
     }
@@ -1297,12 +1357,23 @@ async fn forward(http: &reqwest::Client, req: reqwest::RequestBuilder) -> (Statu
 /// A replica's nonce lags the primary's by up to a sync interval — enough to
 /// get a signed extrinsic refused as stale — so the nonce comes from
 /// wherever the extrinsic will land.
-async fn account(AxState(n): AxState<Shared>, Path(id): Path<String>) -> (StatusCode, Json<serde_json::Value>) {
+async fn account(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: HeaderMap) -> (StatusCode, Json<serde_json::Value>) {
     let Ok(who) = miot_keys::from_hex(&id) else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"bad account hex"})));
     };
+    {
+        let n = n.lock().await;
+        if require_client_auth(&n, &headers, b"").is_err() {
+            return (StatusCode::UNAUTHORIZED, Json(serde_json::json!({"error":"unauthorized"})));
+        }
+    }
     match route(&n).await {
-        Route::Primary(p, http) => return forward(&http, http.get(format!("{p}/account/{id}"))).await,
+        // Re-signed as this node's own (trusted) identity, not the
+        // caller's headers relayed verbatim — see `Route::Primary`.
+        Route::Primary(p, http, identity) => {
+            let signed = sign_headers(&identity, b"");
+            return forward(&http, http.get(format!("{p}/account/{id}")).headers(signed)).await;
+        }
         Route::Nobody | Route::Here => {}
     }
     let mut n = n.lock().await;
@@ -1316,7 +1387,9 @@ async fn account(AxState(n): AxState<Shared>, Path(id): Path<String>) -> (Status
 async fn submit(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode, Json<serde_json::Value>) {
     match route(&n).await {
         Route::Here => {}
-        Route::Primary(p, http) => return forward(&http, http.post(format!("{p}/submit")).body(body)).await,
+        // `/submit` isn't header-gated — the extrinsic's own signature is
+        // the authority — so nothing needs re-signing on the way through.
+        Route::Primary(p, http, _identity) => return forward(&http, http.post(format!("{p}/submit")).body(body)).await,
         Route::Nobody => return no_primary(),
     }
     let uxt = match UncheckedExtrinsic::decode(&mut &body[..]) {
@@ -1334,38 +1407,49 @@ async fn submit(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode, Json<s
     }
 }
 
-async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>) -> Json<serde_json::Value> {
+async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
     let a = parse_task(&id).and_then(|t| n.ext.execute_with(|| Litter::artifact(t)));
     Json(match a {
         Some(a) => serde_json::json!({"found":true,"title":a.title,"body":a.body,"author":miot_keys::to_hex(&a.author)}),
         None => serde_json::json!({"found":false}),
     })
+    .into_response()
 }
 
 /// A standalone artifact — [`Effect::StandaloneArtifact`], no task behind it.
 /// `id` is its own counter, never a `TaskId`, so this is a separate route
 /// from `/artifact`.
-async fn standalone_artifact(AxState(n): AxState<Shared>, Path(id): Path<String>) -> Json<serde_json::Value> {
+async fn standalone_artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
     let a = id.parse::<u32>().ok().and_then(|id| n.ext.execute_with(|| Litter::standalone_artifact(id)));
     Json(match a {
         Some(a) => serde_json::json!({"found":true,"title":a.title,"body":a.body,"author":miot_keys::to_hex(&a.author)}),
         None => serde_json::json!({"found":false}),
     })
+    .into_response()
 }
 
 /// Every standalone artifact, oldest first — title and author only; `GET
 /// /note/{id}` has the body.
-async fn standalone_artifacts(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
+async fn standalone_artifacts(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
     let rows = n.ext.execute_with(|| {
         Litter::standalone_artifacts()
             .iter()
             .map(|(id, a)| serde_json::json!({"id":id,"title":a.title,"author":miot_keys::to_hex(&a.author),"at":a.at}))
             .collect::<Vec<_>>()
     });
-    Json(rows)
+    Json(rows).into_response()
 }
 
 /// Every artifact reachable by id, task-closed and standalone alike, merged
@@ -1376,8 +1460,11 @@ async fn standalone_artifacts(AxState(n): AxState<Shared>) -> Json<Vec<serde_jso
 /// collide as long as callers keep the `t` prefix on the task ones —
 /// `ArtifactRead` in `agent.rs` relies on exactly that to route a read to
 /// `/artifact/{id}` or `/note/{id}`.
-async fn all_artifacts(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
+async fn all_artifacts(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
     let rows = n.ext.execute_with(|| {
         let mut rows: Vec<serde_json::Value> = Litter::artifacts()
             .iter()
@@ -1388,20 +1475,23 @@ async fn all_artifacts(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Valu
         }));
         rows
     });
-    Json(rows)
+    Json(rows).into_response()
 }
 
 /// Every cat's latest self-reported work stats — `report_stats`, no
 /// authority check beyond `ensure_signed` (a cat can only overwrite its
 /// own row), so this is a straight dump of whatever every account most
 /// recently reported about itself.
-async fn all_stats(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
+async fn all_stats(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
     let rows = n.ext.execute_with(|| {
         Litter::all_stats()
             .iter()
             .map(|(who, s)| serde_json::json!({"account":miot_keys::to_hex(who),"turns":s.turns,"tool_calls":s.tool_calls,"tokens":s.tokens,"ms":s.ms}))
             .collect::<Vec<_>>()
     });
-    Json(rows)
+    Json(rows).into_response()
 }

@@ -49,9 +49,17 @@ pub struct Client {
 }
 
 impl Client {
-    /// Pick the first node in `candidates` that answers `/head`.
+    /// Pick the first node in `candidates` that answers `/head`. `roster`
+    /// doubles as the trusted-account set for mTLS pinning (`crate::tls`) —
+    /// the same accounts this client can already resolve names for are the
+    /// only ones it will accept a cert from.
     pub async fn connect(candidates: Vec<String>, identity: Identity, roster: Roster) -> Result<Self, String> {
-        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap();
+        let trusted = roster.0.iter().map(|(_, a)| a.clone()).collect();
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .use_preconfigured_tls(crate::tls::client_config(&identity, trusted))
+            .build()
+            .unwrap();
         let mut c = Client { http, candidates, node: String::new(), identity, roster, dm_target: None };
         c.reconnect().await?;
         Ok(c)
@@ -61,7 +69,8 @@ impl Client {
     /// outage.
     pub async fn reconnect(&mut self) -> Result<(), String> {
         for n in &self.candidates {
-            let probe = self.http.get(format!("{n}/head")).timeout(std::time::Duration::from_secs(3)).send().await;
+            let headers = crate::node::sign_headers(&self.identity, b"");
+            let probe = self.http.get(format!("{n}/head")).headers(headers).timeout(std::time::Duration::from_secs(3)).send().await;
             if matches!(probe, Ok(ref r) if r.status().is_success()) {
                 if self.node != *n && !self.node.is_empty() {
                     eprintln!("  {DIM}switched to {n}{OFF}");
@@ -74,8 +83,13 @@ impl Client {
     }
 
     async fn get_json(&mut self, path: &str) -> Result<serde_json::Value, String> {
+        // Signed over the raw query string (or `b""` for a parameterless
+        // path) — same rule `node.rs`'s handlers check against, so this
+        // must match `require_client_auth`'s bytes exactly.
+        let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
+        let headers = crate::node::sign_headers(&self.identity, query.as_bytes());
         for attempt in 0..2 {
-            match self.http.get(format!("{}{path}", self.node)).send().await {
+            match self.http.get(format!("{}{path}", self.node)).headers(headers.clone()).send().await {
                 Ok(r) => return r.json().await.map_err(|e| format!("bad response from {}{path}: {e}", self.node)),
                 Err(e) if attempt == 0 => {
                     eprintln!("  {DIM}{} unreachable ({e}); trying the next node{OFF}", self.node);
@@ -506,13 +520,21 @@ fn mesh_names(m: &serde_json::Value, roster: &Roster) -> std::collections::HashM
 /// going stale/coming back — never a full table on a timer (`/peers` still
 /// gives the full picture on demand). Also keeps `state.primary` current
 /// for the composer's hairline.
-async fn poll_mesh_ui(http: reqwest::Client, node: String, roster: Roster, tx: mpsc::UnboundedSender<String>, state: Arc<AsyncMutex<ComposerState>>) {
+async fn poll_mesh_ui(
+    http: reqwest::Client,
+    node: String,
+    identity: Identity,
+    roster: Roster,
+    tx: mpsc::UnboundedSender<String>,
+    state: Arc<AsyncMutex<ComposerState>>,
+) {
     let mut last_leader: Option<String> = None;
     let mut had_quorum: Option<bool> = None;
     let mut stale: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
     loop {
         tokio::time::sleep(std::time::Duration::from_millis(2_000)).await;
-        let Ok(r) = http.get(format!("{node}/mesh/peers")).send().await else { continue };
+        let headers = crate::node::sign_headers(&identity, b"");
+        let Ok(r) = http.get(format!("{node}/mesh/peers")).headers(headers).send().await else { continue };
         let Ok(m) = r.json::<serde_json::Value>().await else { continue };
         let names = mesh_names(&m, &roster);
         let cat_of = |n: &str| names.get(n).cloned().unwrap_or_else(|| n.to_string());
@@ -568,10 +590,21 @@ async fn poll_mesh_ui(http: reqwest::Client, node: String, roster: Roster, tx: m
 /// effects included, so `render`'s `me()` path (echo + "✓ sealed") is the
 /// *only* echo of what we typed; raw mode means the terminal isn't echoing
 /// it locally. Also keeps `state.head` current for the composer's hairline.
-async fn tail_events(http: reqwest::Client, node: String, roster: Roster, me_name: String, since: u64, tx: mpsc::UnboundedSender<String>, state: Arc<AsyncMutex<ComposerState>>) {
+async fn tail_events(
+    http: reqwest::Client,
+    node: String,
+    identity: Identity,
+    roster: Roster,
+    me_name: String,
+    since: u64,
+    tx: mpsc::UnboundedSender<String>,
+    state: Arc<AsyncMutex<ComposerState>>,
+) {
     let mut cursor = since;
     loop {
-        let batch: Vec<serde_json::Value> = match http.get(format!("{node}/events?since={cursor}")).send().await {
+        let query = format!("since={cursor}");
+        let headers = crate::node::sign_headers(&identity, query.as_bytes());
+        let batch: Vec<serde_json::Value> = match http.get(format!("{node}/events?{query}")).headers(headers).send().await {
             Ok(r) => r.json().await.unwrap_or_default(),
             Err(_) => Vec::new(),
         };
@@ -1119,8 +1152,8 @@ pub async fn repl(mut c: Client) {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
     let state = Arc::new(AsyncMutex::new(ComposerState { node: c.node.clone(), primary: primary.unwrap_or_else(|| "?".into()), head: head_block }));
 
-    tokio::spawn(tail_events(c.http.clone(), c.node.clone(), c.roster.clone(), me_name.clone(), cursor, tx.clone(), state.clone()));
-    tokio::spawn(poll_mesh_ui(c.http.clone(), c.node.clone(), c.roster.clone(), tx.clone(), state.clone()));
+    tokio::spawn(tail_events(c.http.clone(), c.node.clone(), c.identity, c.roster.clone(), me_name.clone(), cursor, tx.clone(), state.clone()));
+    tokio::spawn(poll_mesh_ui(c.http.clone(), c.node.clone(), c.identity, c.roster.clone(), tx.clone(), state.clone()));
 
     let mut input = Input::new();
     let mut events = EventStream::new();

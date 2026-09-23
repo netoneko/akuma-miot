@@ -17,6 +17,20 @@ fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
 }
 
+/// Every call in this file signs and connects as root (seed 1) — mTLS
+/// pinning now gates the connection itself, not just the header envelope,
+/// so the test's `reqwest::Client` needs root's identity too, not just its
+/// header signatures.
+fn trusted_client() -> reqwest::Client {
+    let root = Identity::from_seed(&[1; 32]);
+    let trusted: Vec<_> = (1..=5u8).map(|n| Identity::from_seed(&[n; 32]).account()).collect();
+    reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .use_preconfigured_tls(kot::tls::client_config(&root, trusted))
+        .build()
+        .unwrap()
+}
+
 fn cfg(who: u8, name: &str, port: u16, peers: Vec<String>, db: std::path::PathBuf) -> NodeConfig {
     let seed = |n: u8| Identity::from_seed(&[n; 32]).account();
     NodeConfig {
@@ -48,7 +62,7 @@ struct Mesh3 {
 
 impl Mesh3 {
     fn url(&self, i: usize) -> String {
-        format!("http://127.0.0.1:{}", self.ports[i])
+        format!("https://127.0.0.1:{}", self.ports[i])
     }
 
     fn cfg(&self, i: usize) -> NodeConfig {
@@ -160,14 +174,26 @@ impl Mesh3 {
 async fn submit(http: &reqwest::Client, node: &str, call: RuntimeCall) {
     let root = Identity::from_seed(&[1; 32]);
     for _ in 0..50 {
-        let v: serde_json::Value = http.get(format!("{node}/meta")).send().await.unwrap().json().await.unwrap();
+        // `/meta` and `/account` are client-facing but still gated
+        // (`require_client_auth`) — sign as root, a trusted genesis account,
+        // same as any real `kot` client would.
+        let v: serde_json::Value =
+            http.get(format!("{node}/meta")).headers(node::sign_headers(&root, b"")).send().await.unwrap().json().await.unwrap();
         let meta = client::Meta {
             genesis_hash: H256::from_slice(&hex::decode(v["genesis_hash"].as_str().unwrap()).unwrap()),
             spec_version: v["spec_version"].as_u64().unwrap() as u32,
             tx_version: v["tx_version"].as_u64().unwrap() as u32,
         };
         let acct = miot_keys::to_hex(&root.account());
-        let n: serde_json::Value = http.get(format!("{node}/account/{acct}")).send().await.unwrap().json().await.unwrap();
+        let n: serde_json::Value = http
+            .get(format!("{node}/account/{acct}"))
+            .headers(node::sign_headers(&root, b""))
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
         let Some(nonce) = n["nonce"].as_u64() else {
             tokio::time::sleep(Duration::from_millis(100)).await;
             continue;
@@ -189,13 +215,15 @@ fn open(text: &str) -> RuntimeCall {
 }
 
 async fn task_texts(http: &reqwest::Client, node: &str) -> Vec<String> {
-    let rows: Vec<serde_json::Value> = http.get(format!("{node}/tasks")).send().await.unwrap().json().await.unwrap();
+    let root = Identity::from_seed(&[1; 32]);
+    let rows: Vec<serde_json::Value> =
+        http.get(format!("{node}/tasks")).headers(node::sign_headers(&root, b"")).send().await.unwrap().json().await.unwrap();
     rows.iter().filter_map(|t| t["text"].as_str().map(str::to_string)).collect()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_mesh_of_three_survives_losing_its_primary() {
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+    let http = trusted_client();
     let mut m = Mesh3::start().await;
 
     // 1. One primary, elected, not configured.
@@ -246,11 +274,11 @@ async fn a_mesh_of_three_survives_losing_its_primary() {
 /// single primary did — the local-dev case.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_mesh_of_one_produces_on_its_own() {
-    let http = reqwest::Client::builder().timeout(Duration::from_secs(5)).build().unwrap();
+    let http = trusted_client();
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
     let r = node::start(cfg(1, "solo", port, vec![], dir.path().join("db"))).await.unwrap();
-    let url = format!("http://127.0.0.1:{port}");
+    let url = format!("https://127.0.0.1:{port}");
     submit(&http, &url, open("alone")).await;
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert!(r.shared.lock().await.is_producing());

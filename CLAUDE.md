@@ -74,6 +74,14 @@ read that first, it is kept current and this file does not repeat it.
   cats against dev `llama-server`s). Two real `agent.rs` bugs and two open
   findings (a non-root broadcast wakes nobody; a failed `/submit` is never
   retried) came out of actually doing this, 2026-09-23.
+- `docs/MESH_AUTH.md` — who a peer/client actually is, on the wire: the
+  `x-miot-signer`/`x-miot-sig` header envelope, then mTLS pinned to the same
+  keys. Added 2026-09-23, prompted by planning an AWS deploy.
+- `docs/KEY_MANAGEMENT.md` — what one account's key now backs (chain writes,
+  every read, the TLS connection itself), the dev-seed footgun in `kot`'s own
+  CLI defaults, and the genesis-generation procedure (`deploy.py`/`deploy.sh
+  ids`) — including what changes when a new node (e.g. on AWS) joins.
+  Added 2026-09-23.
 
 ## Known gaps (don't assume these are fixed without checking the code)
 

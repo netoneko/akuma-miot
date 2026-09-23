@@ -63,11 +63,42 @@ Not the same set `/submit` accepts (`CheckNonce` allows any account with
 standing, which is broader); this is specifically "is this a mesh
 participant," which is narrower and is what was missing.
 
-**Client-facing endpoints are untouched.** `/tasks`, `/account/{id}`,
-`/artifact/{id}`, `/events`, `/head`, `/meta`, `/submit` — any `kot` client
-still talks to any node with no identity of its own, per `CLAUDE.md`'s
-"a replica forwards `/submit` and `/account` to whoever is primary." Only
-the five mesh-internal endpoints above gained the auth gate.
+**Client-facing endpoints were untouched in this first pass** — `/tasks`,
+`/account/{id}`, `/artifact/{id}`, `/events`, `/head`, `/meta`, `/submit`
+still served (or accepted) anything, unsigned. Only the five mesh-internal
+endpoints above got the gate. **Closed 2026-09-23, same day:** this is a
+private chain — the account universe is closed genesis `members` ∪ {root,
+leader}, same as mesh — so an unsigned read of `/tasks`/`/events`/
+`/artifacts`/etc. from a stranger who merely reaches the port is exactly the
+gap the mesh-auth work above was closing for peer traffic, just not yet
+closed for read traffic. Every client-facing GET (`/head`, `/events`,
+`/tasks`, `/meta`, `/account/{id}`, `/artifact/{id}`, `/note/{id}`,
+`/notes`, `/artifacts`, `/stats`, `/mesh/peers`) now runs through the same
+`require_client_auth` → `verify_headers` → `is_trusted_signer` gate as
+`/mesh/status` et al. (`node.rs`), and `kot`'s own client (`client.rs`,
+`agent.rs`) signs every read it makes — a bare `kot` client already resolves
+*some* identity for every invocation (`--seed`/`--seed-file`/`--as`, or the
+operator's persisted `~/.akuma/miot/id_ed25519.seed` as the fallback), so
+this cost it nothing new to lean on.
+
+`/submit` is the one endpoint that stays unsigned at the header level: its
+authority was never the HTTP envelope, it's the `UncheckedExtrinsic`'s own
+signature, and `CheckNonce` already refuses any account with no genesis
+`providers` standing. Adding the envelope there would be a second lock on
+a door that was never open.
+
+A replica forwarding `/account/{id}` to the primary now re-signs the
+forwarded request as *itself* rather than relaying the original caller's
+headers — it already verified the caller against its own `members` set
+before deciding to forward, and a replica is itself always a trusted
+member, so this is simpler than threading someone else's signature through
+a second hop (`Route::Primary` carries the replica's own `Identity` for
+exactly this).
+
+**What this doesn't change:** transport is still plain `http://`, no TLS —
+the envelope proves *who signed a request*, not that the bytes are private
+in flight. **Closed the same day, third pass:** see "mTLS pinned to the same
+keys" below — transport is no longer plain after that pass.
 
 **Scope not covered:** the signature proves *a trusted mesh member sent
 this*, not *the specific candidate named in this `VoteRequest` sent it* —
@@ -131,6 +162,71 @@ document (`solo` isn't in `DEV_ROSTER`) fails with "run needs a keypair to
 sign mesh traffic" until `--seed` is added. Both docs' example commands were
 updated to `--seed 1` alongside this change.
 
+## mTLS pinned to the same keys, 2026-09-23 (third pass, same day)
+
+Prompted by the same AWS-deploy conversation as the read-auth pass above:
+the header envelope proves who signed a request, but the wire itself was
+still plaintext, and mesh-internal traffic (election, replication) would
+have crossed the open internet unencrypted if a LAN node and an AWS node
+ever needed to reach each other directly. Considered and rejected: a
+VPN/tunnel (Tailscale) between mesh members — works, zero code, but every
+peer added is an operational dependency outside this repo. Chosen instead:
+every node's TLS identity *is* its `miot_keys::Identity`. No CA, no cert
+provisioning — `crates/kot/src/tls.rs` builds a self-signed cert from the
+account's own raw ed25519 seed (RFC 8410's fixed PKCS8 prefix + the 32-byte
+seed) fresh on every process start, and a custom `rustls` verifier accepts a
+peer's cert exactly when its embedded public key is in `is_trusted_signer`'s
+set — the identical question the header envelope already asks, now asked of
+the TLS handshake instead of (well, in addition to; the header envelope
+stays) one request's bytes.
+
+**Mutual, not one-directional:** the server requires a client cert too
+(`ClientCertVerifier`, `client_auth_mandatory() == true`) — a `kot`
+CLI/agent connection is pinned exactly like a mesh peer connection, since
+both already resolve an `Identity` for every invocation regardless.
+
+**TLS1.3 only**, deliberately — this is a mesh we control both ends of, not
+a browser-facing server needing TLS1.2 fallback, so there's no reason to
+carry that extra code path (or verify_tls12_signature's extra risk surface)
+along. ALPN offers `h2` then `http/1.1`; `.http2_prior_knowledge()` is gone
+from every `reqwest::Client` builder — there's a real handshake to negotiate
+h2 over now, prior-knowledge mode was specifically for skipping that when
+there wasn't one.
+
+**A hard cutover, not a migration path.** Peer/node URLs are `https://` now,
+not `http://` — reqwest only runs the TLS connector for that scheme, so
+there is no way to keep the old spelling and change the wire underneath it.
+Every mesh member needs the new binary and the new URL scheme at the same
+time or the mesh can't talk to itself. Confirmed acceptable for this
+deployment: a fresh genesis is coming anyway (a coordinated restart, not a
+live migration), so there's no fleet currently depending on the old scheme
+surviving a rolling upgrade. **Not yet applied to the fleet's own configs**
+(`overlays/deploy/*`, `docs/TOPOLOGY.md`, `docs/runbooks/run-the-mesh.md`
+still say `http://...:9944`) — deliberately left for the redeploy pass
+itself rather than hand-edited here, since `deploy.sh`/`deploy.py`'s env
+templating is exactly the fragile area `CLAUDE.md` already warns about
+touching casually.
+
+**Correctness of the SPKI check specifically:** pulling a cert's embedded
+public key back out uses `x509_parser` rather than a hand-rolled byte
+search — a byte search for the fixed Ed25519 SPKI prefix would be a
+spoofing risk (a crafted cert could plant a decoy trusted key elsewhere in
+its DER while the field the handshake signature is actually bound to is
+different). `x509_parser` walks the real ASN.1 grammar, so the field it
+returns is structurally the same one `verify_tls12/13_signature` binds the
+signature check to.
+
+Verified: four unit tests in `tls.rs` run a real loopback TLS1.3 handshake
+(mutual success; a client the server doesn't trust refused; a server the
+client doesn't trust refused; a cert cannot claim an account it wasn't
+built from) — not mocks, an actual `TcpListener`/`TlsAcceptor`/
+`TlsConnector` round trip. `cargo test --workspace` passes unchanged
+otherwise, `election.rs`'s 3-node mesh included (now connecting over real
+mTLS, replica-forwarded `/account` included). Live smoke test against the
+real binary: a plain HTTP request against the port gets nothing (TLS only
+now); `openssl s_client` with no client cert gets a `certificate_required`
+TLS1.3 alert; a real `kot` client, signed and trusted, works normally.
+
 ## Rejected alternatives
 
 - **`sc-network`/`rust-libp2p`** (what Polkadot actually uses) — Kademlia
@@ -143,6 +239,12 @@ updated to `--seed 1` alongside this change.
   work, not a Cargo.toml line.
 - **`Signed<T>` as a nested JSON field** — see "what changed" above:
   rejected for needing JSON round-trip determinism as an invariant.
-- **gRPC** — noted as a longer-term preference (would also ride HTTP/2, so
-  the connection-reuse work here isn't wasted; signing would move from a
-  header pair to an interceptor). Out of scope for this pass.
+- **gRPC** — raised again 2026-09-23 alongside the mTLS pass above ("switch
+  traffic to encrypted gRPC, we do know the target host public key").
+  Decoupled on purpose: the pubkey-pinning idea is sound and is exactly what
+  the mTLS pass above does, but gRPC itself would mean `tonic`/`prost` and
+  redefining every mesh/chain/client endpoint as a `.proto` service — a
+  framework migration, not a transport change, and not required to get
+  encryption-via-pinned-keys. Still a longer-term preference (would also
+  ride HTTP/2, so the connection-reuse work here isn't wasted; signing would
+  move from a header pair to an interceptor); still out of scope.

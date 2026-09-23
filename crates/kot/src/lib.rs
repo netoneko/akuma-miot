@@ -13,5 +13,6 @@ pub mod chat;
 pub mod client;
 pub mod common;
 pub mod node;
+pub mod tls;
 pub mod ui;
 pub mod version;

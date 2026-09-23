@@ -1,6 +1,6 @@
 # Handoff
 
-State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
+State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
@@ -200,7 +200,8 @@ not a peer's identity. Every mesh node now carries its own keypair (`kot run
 attached), and every mesh-internal request and response carries
 `x-miot-signer`/`x-miot-sig` headers, verified against genesis `members` ∪
 {root, leader}. Client-facing endpoints (`/tasks`, `/account`, `/submit`,
-...) are untouched. Alongside it: `reqwest`'s client uses
+...) were untouched in this first pass (**closed the same day, see next
+entry**). Alongside it: `reqwest`'s client uses
 `.http2_prior_knowledge()`, and axum's `http2` feature turns on
 `hyper-util`'s connection-preface sniffing so `axum::serve` accepts it —
 mesh traffic is a tight poll loop between the same peers, so one multiplexed
@@ -208,6 +209,73 @@ connection beats a handshake per call. Verified live (`kot run --as solo`,
 curl with and without a valid signature) and via `cargo test --workspace`
 (unchanged, 108+ tests including the 3-node election integration test);
 **not yet redeployed to the fleet** — host-native only this pass.
+
+**Client-facing reads are authenticated too now, 2026-09-23**
+(`docs/MESH_AUTH.md`). Prompted by planning an AWS deploy: `/tasks`,
+`/events`, `/artifacts`, `/notes`, `/stats`, `/head`, `/meta`,
+`/account/{id}`, `/mesh/peers` served anything to anyone who reached the
+port, no auth at all — fine on a LAN, not fine on the open internet. Product
+call: this is a private chain with a closed account universe (adding one is
+a protocol update, not a runtime registration), so an unsigned request
+should get nothing, full stop — same rule mesh-internal traffic already
+follows, just not yet applied to reads. Every client-facing GET now runs
+through the same `x-miot-signer`/`x-miot-sig` envelope and
+`is_trusted_signer` check as `/mesh/status`; `kot`'s own client and agent
+loop sign every read they make (they already resolve an `Identity` for
+every invocation, so this was free). `/submit` is unchanged — its
+authority was always the extrinsic's own signature, not the HTTP envelope.
+A replica forwarding `/account/{id}` now re-signs as itself rather than
+relaying the caller's headers, since it's a trusted member in its own
+right. **This does not add TLS** — transport is still plain `http://`; the
+envelope proves who signed a request, not that it's private on the wire
+(**closed same day, see next entry**). Verified live (curl with and
+without a signature against a `kot run --as solo` node) and
+`cargo test --workspace` (unchanged, all passing, `election.rs`'s
+replica-forwarded `/account` included); **not deployed anywhere** — this
+pass is host-native only, same as the mesh-auth work above.
+
+**Transport is mTLS now too, 2026-09-23, same day.** Every node's TLS
+identity is its own `Identity` — a self-signed cert built from the same
+ed25519 seed fresh on every start, no CA, pinned by a custom `rustls`
+verifier (`crates/kot/src/tls.rs`) against exactly `is_trusted_signer`'s
+set, mutual (the server requires a client cert too, since every caller
+already resolves an `Identity` regardless). This is a hard cutover — peer
+and node URLs are `https://` now, since reqwest only runs the TLS connector
+for that scheme — accepted because a fresh genesis is coming anyway (see
+"what's next"), so nothing needs the old scheme to survive a rolling
+upgrade. `x-miot-signer`/`x-miot-sig` header signing stays (redundant for
+auth now, still what binds a signature to one request's exact bytes rather
+than "this connection"). Considered gRPC for this instead (the operator's
+own suggestion, since the target host's pubkey is already known) — decoupled
+on purpose: pinning ed25519 keys via mTLS gets the same guarantee without
+the `tonic`/`prost` framework migration gRPC would actually require; see
+`docs/MESH_AUTH.md`'s "Rejected alternatives" for the fuller reasoning.
+Verified: 4 new `tls.rs` unit tests running a real loopback TLS1.3
+handshake (mutual success; either direction's untrusted-peer refusal; a
+cert can't claim an account it wasn't built from), `cargo test --workspace`
+unchanged otherwise (`election.rs`'s 3-node mesh now running over real
+mTLS), and a live smoke test against the real binary (plain HTTP gets
+nothing; `openssl s_client` with no client cert gets a TLS1.3
+`certificate_required` alert; a real trusted `kot` client works normally).
+**Not applied to `overlays/deploy/*`, `docs/TOPOLOGY.md`, or
+`docs/runbooks/run-the-mesh.md`** — those still say `http://...:9944` and
+need their URLs (and `deploy.sh`/`deploy.py`'s templated env) updated as
+part of the redeploy itself, left alone here on purpose rather than
+hand-edited mid-conversation given how fragile that templating already is
+(`CLAUDE.md`'s own warning). New dependencies: `rustls`, `tokio-rustls`
+(both already pulled in transitively by `reqwest`'s `rustls-tls` feature,
+now direct), `rcgen`, `x509-parser`.
+
+**Key management written up separately, same day — `docs/KEY_MANAGEMENT.md`.**
+Once an account's key started backing mTLS and not just chain writes, "which
+key" stopped being a dev-convenience question: the doc covers what one key
+now backs, the dev-seed footgun in `kot`'s own CLI defaults (`--root`
+defaults to `"1"`, etc. — checked and confirmed the deployed fleet's own
+`overlays/deploy/mesh.env` does *not* have this problem, real keys
+throughout), and the existing genesis procedure (`deploy.py`/`deploy.sh
+ids`) including what changes when a new node joins. Not yet acted on — the
+operator is migrating later, alongside the new genesis and the mTLS
+cutover above; this is the write-up to work from when that happens.
 
 ---
 

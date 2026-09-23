@@ -168,12 +168,25 @@ impl Cat {
     // letting the next tick paper over a blip is correct, not an
     // oversight. Retrying inside these would only add latency nothing
     // downstream is waiting on.
+    /// Sign a GET with no query params — `b""`, same rule `node.rs`'s
+    /// `require_client_auth` checks against. Every read below a node now
+    /// gates on this envelope; this is the one place that builds it.
+    fn signed_get(&self, path: &str) -> reqwest::RequestBuilder {
+        self.signed_get_query(path, "")
+    }
+
+    fn signed_get_query(&self, path: &str, query: &str) -> reqwest::RequestBuilder {
+        let headers = crate::node::sign_headers(&self.identity, query.as_bytes());
+        self.http.get(format!("{}{path}", self.node)).headers(headers)
+    }
+
     async fn head(&self) -> Option<serde_json::Value> {
-        self.http.get(format!("{}/head", self.node)).send().await.ok()?.json().await.ok()
+        self.signed_get("/head").send().await.ok()?.json().await.ok()
     }
 
     async fn events(&self, since: u64) -> Vec<Entry> {
-        match self.http.get(format!("{}/events?since={since}", self.node)).send().await {
+        let query = format!("since={since}");
+        match self.signed_get_query(&format!("/events?{query}"), &query).send().await {
             Ok(r) => r.json().await.unwrap_or_default(),
             // A node that isn't answering isn't an error to hang on. Fail
             // fast, keep polling — the litter's WAYWARD rule.
@@ -189,7 +202,7 @@ impl Cat {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(READ_RETRY_MS)).await;
             }
-            match self.http.get(format!("{}/tasks", self.node)).send().await {
+            match self.signed_get("/tasks").send().await {
                 Ok(r) => match r.json().await {
                     Ok(v) => return v,
                     Err(_) if attempt + 1 < READ_ATTEMPTS => continue,
@@ -203,7 +216,7 @@ impl Cat {
     }
 
     async fn fetch_meta(&self) -> Option<client::Meta> {
-        let v: serde_json::Value = self.http.get(format!("{}/meta", self.node)).send().await.ok()?.json().await.ok()?;
+        let v: serde_json::Value = self.signed_get("/meta").send().await.ok()?.json().await.ok()?;
         let genesis_hash = H256::from_slice(&hex::decode(v.get("genesis_hash")?.as_str()?).ok()?);
         Some(client::Meta {
             genesis_hash,
@@ -213,8 +226,8 @@ impl Cat {
     }
 
     async fn fetch_nonce(&self) -> u32 {
-        let url = format!("{}/account/{}", self.node, miot_keys::to_hex(&self.account));
-        match self.http.get(url).send().await {
+        let path = format!("/account/{}", miot_keys::to_hex(&self.account));
+        match self.signed_get(&path).send().await {
             Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| v.get("nonce")?.as_u64()).unwrap_or(0) as u32,
             Err(_) => 0,
         }
@@ -503,7 +516,7 @@ impl Cat {
             // Merged: task-closed and standalone artifacts alike — asked for
             // live, 2026-09-23, "task artifacts should be accessible all the
             // same by id since they are on chain in session."
-            "ArtifactList" => match self.http.get(format!("{}/artifacts", self.node)).send().await {
+            "ArtifactList" => match self.signed_get("/artifacts").send().await {
                 Ok(r) => match r.json::<Vec<serde_json::Value>>().await {
                     Ok(rows) if rows.is_empty() => println!("  [{}] no artifacts yet", self.name),
                     Ok(rows) => {
@@ -533,7 +546,7 @@ impl Cat {
             "ArtifactRead" => {
                 let id = c.str("id").unwrap_or_default();
                 let path = if id.trim_start().starts_with(['t', 'T']) { format!("/artifact/{id}") } else { format!("/note/{id}") };
-                match self.http.get(format!("{}{path}", self.node)).send().await {
+                match self.signed_get(&path).send().await {
                     Ok(r) => match r.json::<serde_json::Value>().await {
                         Ok(v) if v.get("found").and_then(|f| f.as_bool()) == Some(true) => {
                             println!("  [{}] artifact {id}:\n{}", self.name, v.get("body").and_then(|b| b.as_str()).unwrap_or(""));
@@ -544,7 +557,7 @@ impl Cat {
                     Err(e) => println!("  [{}] ArtifactRead {id}: node unreachable: {e}", self.name),
                 }
             }
-            "Peers" => match self.http.get(format!("{}/mesh/peers", self.node)).send().await {
+            "Peers" => match self.signed_get("/mesh/peers").send().await {
                 Ok(r) => match r.json::<serde_json::Value>().await {
                     Ok(v) => {
                         let me_role = v.get("me").and_then(|m| m.get("role")).and_then(|r| r.as_str()).unwrap_or("?");
@@ -574,7 +587,7 @@ impl Cat {
                 },
                 Err(e) => println!("  [{}] Peers: node unreachable: {e}", self.name),
             },
-            "Stats" => match self.http.get(format!("{}/stats", self.node)).send().await {
+            "Stats" => match self.signed_get("/stats").send().await {
                 Ok(r) => match r.json::<Vec<serde_json::Value>>().await {
                     Ok(rows) if rows.is_empty() => println!("  [{}] no stats reported yet", self.name),
                     Ok(rows) => {
@@ -685,12 +698,20 @@ impl Cat {
 
 pub async fn run(cfg: AgentConfig) {
     let account = cfg.identity.account();
+    // mTLS pinned to the roster's accounts (`crate::tls`) — same trust
+    // boundary as `client.rs`'s `Client`, since a cat's node connection is
+    // just another caller of a node, not a special case.
+    let trusted = cfg.roster.0.iter().map(|(_, a)| a.clone()).collect();
     let cat = Cat {
         name: cfg.name.clone(),
         identity: cfg.identity,
         account: account.clone(),
         node: cfg.node,
-        http: reqwest::Client::builder().timeout(std::time::Duration::from_secs(900)).build().unwrap(),
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(900))
+            .use_preconfigured_tls(crate::tls::client_config(&cfg.identity, trusted))
+            .build()
+            .unwrap(),
         llm: cfg.llm,
         persona: format!("{}{AGENT_RULES}", cfg.persona),
         roster: cfg.roster,

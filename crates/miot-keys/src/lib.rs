@@ -74,6 +74,14 @@ impl Identity {
         &self.0
     }
 
+    /// The raw 32-byte seed this identity was built from — what
+    /// [`from_seed`](Self::from_seed) takes back in, and the same bytes a
+    /// PKCS8-wrapped Ed25519 private key carries (RFC 8410 §7), so a TLS
+    /// identity can be derived from this without minting a second secret.
+    pub fn seed(&self) -> [u8; 32] {
+        self.0.seed()
+    }
+
     /// This identity as an `authorized_keys` line — the inverse of
     /// [`account_from_ssh`], which is what lets the parser be tested against
     /// keys generated here rather than against somebody's real one.
