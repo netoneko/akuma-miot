@@ -330,25 +330,31 @@ pub fn local_tools() -> Vec<Tool> {
 /// Session/context-window management — offered only where a session
 /// actually accumulates history across turns (`kot chat`; not `agent.rs`,
 /// whose turns are stateless per wake and so have nothing to compact).
-/// `TokenBudget` and `Inspect` are the one exception in this project to "a
-/// local tool's result is never fed back to the model": their entire
-/// purpose is to put something back in front of the model on request, so
-/// the caller feeds their result into the next turn's history rather than
-/// only printing it.
+/// `TokenBudget`, `BrowseTools` and `Inspect` are the one exception in this
+/// project to "a local tool's result is never fed back to the model":
+/// their entire purpose is to put something back in front of the model on
+/// request, so the caller feeds their result into the next turn's history
+/// rather than only printing it. `BrowseTools`/`Inspect` is the same
+/// list-then-read shape as `ArtifactList`/`ArtifactRead`, for the same
+/// reason: naming an id without first being able to see what it is would
+/// just be guessing blind.
 pub fn budget_tools() -> Vec<Tool> {
     vec![
         Tool::new("TokenBudget")
+            .with_description("Check how much of your context window this session has used.")
+            .with_schema(serde_json::json!({"type": "object", "properties": {}})),
+        Tool::new("BrowseTools")
             .with_description(
-                "Check how much of your context window this session has used, and list the ids \
-                 of past tool-call results you can still Inspect — compaction clears the \
-                 conversation but keeps those.",
+                "List every tool-call result stored this session — id, tool name, one-line \
+                 preview — so you can pick one to Inspect. Survives Compact; the conversation \
+                 doesn't.",
             )
             .with_schema(serde_json::json!({"type": "object", "properties": {}})),
         Tool::new("Compact")
             .with_description(
                 "Replace your own conversation history with a summary you write, to free up \
-                 context. Past tool-call results are NOT cleared by this — list them again with \
-                 TokenBudget and Inspect one back if you need it after compacting.",
+                 context. Past tool-call results are NOT cleared by this — BrowseTools and \
+                 Inspect one back if you need it after compacting.",
             )
             .with_schema(serde_json::json!({
                 "type": "object",
@@ -356,13 +362,23 @@ pub fn budget_tools() -> Vec<Tool> {
                 "required": ["summary"]
             })),
         Tool::new("Inspect")
-            .with_description("Pull one of your own past tool-call results (by id, from TokenBudget's list) back into view.")
+            .with_description("Pull one of your own past tool-call results (by id, from BrowseTools) back into view.")
             .with_schema(serde_json::json!({
                 "type": "object",
-                "properties": {"id": {"type": "integer", "description": "an id TokenBudget listed"}},
+                "properties": {"id": {"type": "integer", "description": "an id BrowseTools listed"}},
                 "required": ["id"]
             })),
     ]
+}
+
+/// Self-identity — persona, model, platform, build version — for a model
+/// that has no other way to introspect its own system prompt as data.
+/// Same feedback exception as the rest of [`budget_tools`]: the caller
+/// feeds the answer into history rather than only printing it.
+pub fn about_me_tool() -> Tool {
+    Tool::new("AboutMe")
+        .with_description("Your own persona, model, and what host/build you're running on — check this if you're unsure who you are.")
+        .with_schema(serde_json::json!({"type": "object", "properties": {}}))
 }
 
 /// The public tool surface, as the model sees it.

@@ -253,10 +253,23 @@ Every non-`SendMessage` tool call's output (`Bash`, `ReadFile`, ...) is
 kept in a `tool_log: Vec<(String, String)>` — name and full result — that
 `Compact`/force-compaction never touches, only `history` does. Nothing
 about this is auto-restored into context after a compaction, on purpose:
-a cat that needs something it read before must deliberately call `Inspect
-{id}` (new tool; `TokenBudget`'s report lists the ids currently held) to
-pull one result back into `history` — the two tools that actually inform
-the model (`TokenBudget`, `Inspect`) are the exception to the rest of this
-project's "a local tool's result is never fed back" rule, because their
-entire point is to put something back in front of the model on request;
-`Bash`/`ReadFile`/`WriteFile`/`Artifact*` stay fire-and-forget as before.
+a cat that needs something it read before must first call `BrowseTools`
+(id, tool name, one-line preview of everything stored — the same
+list-then-read shape as `ArtifactList`/`ArtifactRead`, so naming an id
+isn't guessing blind) and then `Inspect{id}` to pull one result back into
+`history`. `TokenBudget`, `BrowseTools`, `Inspect`, and `AboutMe` (below)
+are the exception to the rest of this project's "a local tool's result is
+never fed back" rule, because their entire point is to put something back
+in front of the model on request; `Bash`/`ReadFile`/`WriteFile`/`Artifact*`
+stay fire-and-forget as before.
+
+**`AboutMe`** — persona, model label, host platform, and `kot`'s build
+version (`kot::version::VERSION`), fed back the same way. A model has no
+other way to see its own system prompt as data; asked "what are you"
+without this, it can only guess from training data instead of reading its
+actual instructions. Verified live: reported the exact persona file passed
+via `--persona` (and, when that flag was accidentally given literal text
+instead of a file path — it takes a path, same as `kot run --persona` —
+correctly reported the real fallback default rather than the mistaken
+string, confirming it reflects what was actually loaded, not the argument
+as typed).

@@ -32,13 +32,14 @@ machine before replying — their output is shown to the operator, not fed \
 back to you, so make each call self-contained.\n\
 - Always call SendMessage with your reply, even if you called nothing else. \
 Never answer in plain text alone.\n\
-- TokenBudget tells you how much context you have left and lists ids of \
-past tool results. Compact writes a summary of the conversation so far and \
-replaces it, to free up room — past tool results survive a Compact; \
-Inspect one back by id if you need it again.";
+- TokenBudget tells you how much context you have left. BrowseTools lists \
+past tool results (id, name, preview); Inspect one back by id for the full \
+thing. Compact writes a summary of the conversation so far and replaces it, \
+to free up room — past tool results survive a Compact. AboutMe reminds you \
+of your own persona, model, and what you're running on.";
 
 fn tools() -> Vec<miot_llm::Tool> {
-    let mut t = vec![miot_llm::send_message_tool()];
+    let mut t = vec![miot_llm::send_message_tool(), miot_llm::about_me_tool()];
     t.extend(miot_llm::local_tools());
     t.extend(miot_llm::budget_tools());
     t
@@ -97,11 +98,40 @@ fn budget_report(pct: Option<u32>, context_window: Option<u32>, total_tokens: u3
         (Some(p), Some(w)) => format!("{total_tokens}/{w} tokens ({p}%) used last turn"),
         _ => format!("{total_tokens} tokens used last turn (context window unknown for this model)"),
     };
-    if tool_log_len == 0 {
-        format!("{usage}. No tool results stored yet.")
-    } else {
-        format!("{usage}. Tool results stored: ids 0..{} — Inspect{{id}} to pull one back.", tool_log_len - 1)
+    format!("{usage}. {} tool result(s) stored — BrowseTools to list them.", tool_log_len)
+}
+
+/// One line per stored result — name and a one-line preview, not just a
+/// bare count — so the model can pick which id to `Inspect` instead of
+/// guessing blind. The chain-side equivalent is `ArtifactList` before
+/// `ArtifactRead`; `tool_log` needed the same two-step shape.
+fn browse_tools_report(tool_log: &[(String, String)]) -> String {
+    if tool_log.is_empty() {
+        return "No tool results stored yet.".to_string();
     }
+    let lines: Vec<String> = tool_log
+        .iter()
+        .enumerate()
+        .map(|(id, (name, out))| {
+            let preview: String = out.lines().next().unwrap_or("").chars().take(60).collect();
+            format!("  {id}: {name} — {preview}")
+        })
+        .collect();
+    format!("Tool results stored (Inspect{{id}} for the full one):\n{}", lines.join("\n"))
+}
+
+/// A model has no other way to see its own system prompt as data — this is
+/// that, plus what host and build it's actually running on, since a small
+/// model asked "what are you" otherwise has to guess from training data
+/// instead of its actual instructions.
+fn about_me_report(llm: &Llm, persona: &str) -> String {
+    format!(
+        "Model: {}\nPlatform: {} {}\nBuild: kot {}\nPersona:\n{persona}",
+        llm.label(),
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+        crate::version::VERSION,
+    )
 }
 
 /// One extra call, no tools, asking the model to summarize itself — used
@@ -177,6 +207,16 @@ pub async fn run(cfg: ChatConfig) {
                             let report = budget_report(pct_used(turn.total_tokens, context_window), context_window, turn.total_tokens, tool_log.len());
                             println!("{DIM}  {report}{OFF}");
                             history.push((Speaker::User, format!("[TokenBudget] {report}")));
+                        }
+                        "BrowseTools" => {
+                            let report = browse_tools_report(&tool_log);
+                            println!("{DIM}  {}{OFF}", report.replace('\n', "\n  "));
+                            history.push((Speaker::User, format!("[BrowseTools] {report}")));
+                        }
+                        "AboutMe" => {
+                            let report = about_me_report(&cfg.llm, &cfg.persona);
+                            println!("{DIM}  {}{OFF}", report.replace('\n', "\n  "));
+                            history.push((Speaker::User, format!("[AboutMe] {report}")));
                         }
                         "Inspect" => {
                             let id = call.args.get("id").and_then(|v| v.as_u64()).map(|n| n as usize);
