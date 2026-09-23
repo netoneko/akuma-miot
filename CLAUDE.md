@@ -48,7 +48,9 @@ read that first, it is kept current and this file does not repeat it.
   primary. `chat` (`chat.rs`, added 2026-09-23) is the one verb that isn't:
   a model in this process with no node and no chain at all, real tool
   execution (`Bash`/`ReadFile`/`WriteFile`/`SendMessage`) via
-  `miot_llm::local_tools`. `crates/miot` (the old node+client binary) was
+  `miot_llm::local_tools`. Both `run`'s agent loop and `chat` are hosts of
+  `agent_state_machine.rs` (2026-09-24) — one loop: tool results are fed
+  back through the same inbox as wakes (HANDOFF, "The agent state machine"). `crates/miot` (the old node+client binary) was
   merged in and deleted 2026-09-22 (`docs/CLEANUP.md` item 2).
   `tests/election.rs` runs three real nodes over localhost HTTP, kills the
   primary, revives it.

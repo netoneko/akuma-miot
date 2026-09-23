@@ -217,14 +217,17 @@ async fn query_result_is_fed_back_and_answered() {
     let fed = fake.fed(1);
     assert!(fed.contains("[#0 Bash]"), "result labelled by id and tool: {fed}");
     assert!(fed.contains("meow-from-bash"), "the actual output: {fed}");
-    // Its own call is in history, so the result lines up with it.
-    assert!(fake.all(1).contains("[called: Bash"), "{}", fake.all(1));
+    // The result names the call that asked for it...
+    assert!(fed.contains("$ echo meow-from-bash"), "{fed}");
+    // ...and the model's own turns never carry a call written as text —
+    // a small model copies that pattern instead of calling the tool.
+    assert!(!fake.all(1).contains("[called:"), "{}", fake.all(1));
     assert_eq!(seen.lock().unwrap().sent, vec!["bash said meow"]);
 }
 
 /// A result isn't a one-turn flash: it enters the conversation history, so
-/// a later turn, woken by something else entirely, still has it — along
-/// with the call that asked for it, in order.
+/// a later turn, woken by something else entirely, still has it — in order,
+/// between the wake that led to it and the one after.
 #[tokio::test]
 async fn results_stay_in_history() {
     let r = rig(vec![calls(vec![("Bash", json!({"command": "echo kept-in-history"}))]), say("noted"), say("still know it")]).await;
@@ -238,10 +241,10 @@ async fn results_stay_in_history() {
     assert!(!fake.fed(2).contains("kept-in-history"), "turn 3 was fed only the new wake");
     let msgs = fake.requests()[2]["messages"].as_array().unwrap().clone();
     let pos = |needle: &str, role: &str| msgs.iter().position(|m| m["role"] == role && m["content"].as_str().unwrap_or("").contains(needle));
-    let asked = pos("[called: Bash", "assistant").expect("the call is in history");
-    let result = pos("kept-in-history", "user").expect("the result is in history");
+    let asked = pos("remember this", "user").expect("the first wake is in history");
+    let result = pos("[#0 Bash] $ echo kept-in-history", "user").expect("the result, with its call, is in history");
     let next = pos("what did bash say", "user").expect("the new wake");
-    assert!(asked < result && result < next, "call, then result, then the new wake: {msgs:#?}");
+    assert!(asked < result && result < next, "wake, then result, then the new wake: {msgs:#?}");
 }
 
 /// A host query (not a shared tool) comes back the same way.

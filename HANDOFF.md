@@ -50,7 +50,7 @@ any node will do (`--node` then `--nodes a,b,c`), because a replica forwards
 | `miot-mesh` | **leader election** — Raft's, election only, with pre-vote + check-quorum + stickiness. Pure state machine; tests are a simulated network with partitions and kills | 10 |
 | `miot-keys` | ed25519 identity: seeds for cats, the operator's SSH *public* key → `AccountId32`, hex wire encoding | 14 |
 | `miot-llm` | provider layer on `genai` (15 providers, GLM included) | — |
-| `kot` | **the one binary** (`dist/<arch>/kot`), 2026-09-22: `kot run --as <name>` = a mesh node + that cat's agent loop in one process; every other verb is a stateless client of any node. Absorbed `crates/miot` (node + RPC client), which is deleted. `tests/election.rs` = three real nodes over localhost, kill the primary, revive it | 2 |
+| `kot` | **the one binary** (`dist/<arch>/kot`), 2026-09-22: `kot run --as <name>` = a mesh node + that cat's agent loop in one process; every other verb is a stateless client of any node. Absorbed `crates/miot` (node + RPC client), which is deleted. `tests/election.rs` = three real nodes over localhost, kill the primary, revive it. `tests/agent_state_machine.rs` (2026-09-24) = the one agent loop against a scripted fake model server | 2 + 18 |
 
 **`miot-tasks` is the real thing.** Everything else hosts it. That is why the
 pallet is thin and why the same machine runs with or without a chain.
@@ -278,6 +278,31 @@ operator is migrating later, alongside the new genesis and the mTLS
 cutover above; this is the write-up to work from when that happens.
 
 ---
+
+## The agent state machine (2026-09-24)
+
+`crates/kot/src/agent_state_machine.rs` is **the one agent loop**, hosted by
+both a cat (`agent.rs`, `kot run`) and `kot chat` (`chat.rs`). Hosts differ
+only in where input comes from (chain `/events` vs stdin), their own extra
+tools, and how things are shown; the logic is shared. It is
+`docs/MAPPING_REPORT.md` §2.3 actually built, after the first `agent.rs`
+shortcut it: that loop's inbox held **only chain events** — every tool call
+was awaited, `println!`ed and dropped, so no model ever saw a `Bash`/`Peers`/
+`ArtifactRead` result. Live symptom, 2026-09-24: tama and sora answered every
+message by calling `Peers`, auto-replying "(ran Peers — no further reply)",
+then burning turns on 2-token nothing; yuki said "I don't have an AboutMe
+tool" (true: cats were never offered it).
+
+Now: queries (reads, `Bash`, `AboutMe`, ...) are spawned, not awaited; their
+results enter the same inbox as wakes and are fed back labelled `[#id Tool]`.
+Records (chain writes, a chat reply) are fire-and-forget and never fed back.
+A wake assembles a turn at once; results alone wait for their batch (or
+10 s); result-only turns are capped at 4 in a row. Both hosts keep a
+conversation with the same budget warnings/compaction, reset by the chain
+checkpoint moving. Trap already paid for: writing the model's own calls into
+its history as text (`[called: Bash{...}]`) made qwen3-4b *type*
+`[called: SendMessage{...}]` instead of calling the tool — calls stay out of
+assistant turns; each result names its call instead.
 
 ## What is real and what is not
 

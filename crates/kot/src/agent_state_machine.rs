@@ -310,15 +310,18 @@ impl<H: Host> AgentStateMachine<H> {
         };
         self.host.show(ui::turn(&name, &cost));
 
-        // The model's own side of the conversation, as it'll read it back:
-        // what it said and what it asked for — so a result arriving later
-        // lines up with the call that wanted it.
-        let mut own = turn.text.trim().to_string();
-        if !turn.calls.is_empty() {
-            let calls: Vec<String> = turn.calls.iter().map(|c| format!("{}{}", c.name, c.args)).collect();
-            own = format!("{own}\n[called: {}]", calls.join(", ")).trim().to_string();
+        // The model's own side of the conversation: only what it actually
+        // said. Its calls are *not* written in here as text — found live,
+        // 2026-09-24: with `[called: Bash{...}]` in its own past turns,
+        // qwen3-4b started typing `[called: SendMessage{...}]` as its reply
+        // instead of calling the tool. What it asked for is recoverable
+        // anyway: every result comes back labelled with its tool and
+        // argument (`[#3 Bash] $ uname -sm`). A tool-only turn leaves no
+        // assistant message, and the results follow as the next user one.
+        let own = turn.text.trim();
+        if !own.is_empty() {
+            self.history.push((Speaker::Assistant, own.to_string()));
         }
-        self.history.push((Speaker::Assistant, own));
 
         let mut compacted = false;
         for c in &turn.calls {
