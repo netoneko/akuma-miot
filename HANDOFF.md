@@ -302,6 +302,23 @@ agent loop despite `Effect::wakes()` saying it should (`Effect::to()`
 collapses to the same `None`), and a failed `/submit` is never retried by
 the agent loop — full writeup, repro commands and what's still open in
 `docs/LOCAL_SIM.md`.
+**a second debate, same day, published `docs/TOPOLOGY.md` itself as
+artifact 1** (new `kot publish <file>` verb — there was no operator-side
+way to publish a standalone artifact before) and asked the litter to
+propose tooling for itself. Found and fixed a third bug doing it: a turn
+whose tool calls included more than one on-chain submission (`Artifact` +
+`SendMessage` together) could race — both read the same nonce over HTTP
+before either applied, one came back `Invalid(Stale)`. `Cat` now tracks
+its own nonce locally (it's the only signer for its account, so it was
+always the real authority on it) instead of asking the node before every
+submit, fixed under one lock so concurrent calls in a turn get distinct
+sequential values instead of racing a read; `meta` is now fetched once,
+ever, and cached too, since nothing on this chain can change it. Verified:
+the exact repro landed both calls in the same block afterward. Also found,
+not fixed: a cat can claim it published something it never actually
+called the tool for (`tama` said "Joint report published" via
+`SendMessage` with no matching `Artifact` call; `kuro` did it for real
+when asked). `docs/LOCAL_SIM.md` has the full writeup.
 
 **Not yet real:**
 

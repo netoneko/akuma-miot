@@ -26,6 +26,20 @@ use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 use std::time::Instant;
 
+/// Above this, a session force-compacts rather than waiting for the model
+/// to call [`compact_tool`] itself — past this point a turn risks not
+/// fitting the window at all.
+pub const FORCE_COMPACT_PCT: u32 = 98;
+
+/// The next checkpoint strictly above `last_warned`, at or below `used_pct`
+/// — `None` if nothing new was crossed since the last check. 25% first,
+/// then every 10 up to 80%, then every 2% (the last stretch is where a
+/// session actually runs out, so it gets finer warning).
+pub fn budget_checkpoint(used_pct: u32, last_warned: u32) -> Option<u32> {
+    let cps = std::iter::once(25).chain((30..=80).step_by(10)).chain((82..=100).step_by(2));
+    cps.filter(|&c| c > last_warned && c <= used_pct).max()
+}
+
 /// One tool call the model asked for, arguments already parsed.
 #[derive(Debug, Clone)]
 pub struct Call {

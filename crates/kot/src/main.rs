@@ -70,6 +70,10 @@ enum Cmd {
     Note { id: String },
     /// Every standalone note: id, title, author.
     Notes,
+    /// Publish a file's contents as a standalone artifact — anyone may
+    /// (`pallet_litter::Call::publish_standalone_artifact` has no
+    /// authority check), same as a cat's own `Artifact` tool call.
+    Publish { file: String },
     /// Say something to the litter, or one cat.
     Say {
         body: String,
@@ -313,6 +317,14 @@ async fn main() {
         }
         Some(Cmd::Notes) => {
             connect(&cli).await.print_notes().await;
+        }
+        Some(Cmd::Publish { file }) => {
+            let text = std::fs::read_to_string(expand_home(file)).unwrap_or_else(|e| die(format!("{file}: {e}")));
+            let mut c = connect(&cli).await;
+            let since = c.head_seq().await;
+            if c.submit(RuntimeCall::Litter(pallet_litter::Call::publish_standalone_artifact { text })).await {
+                c.log(since, None, true, Some(8)).await;
+            }
         }
         Some(Cmd::Say { body, to }) => {
             let mut c = connect(&cli).await;

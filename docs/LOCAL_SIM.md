@@ -102,6 +102,61 @@ what it ran, addressed back to whoever actually spoke (not a broadcast —
 see the next finding for why that would go nowhere). `kot chat` got the
 matching fix.
 
+### Bug found and fixed: two tool calls in one turn could race each other's nonce
+
+A second run — `docs/TOPOLOGY.md` published as an artifact, `tama`/`kuro`
+asked to read it (`ArtifactRead`) and propose tooling extensions for
+themselves, then commit a joint report (`Artifact`) — hit this the moment a
+turn's tool calls included more than one on-chain submission. `tama` called
+`Artifact` and `SendMessage` together; both landed at the client, one came
+back `rejected: Invalid(Stale)`. Root cause: `agent::run` executes a
+turn's tool calls concurrently (`futures_util::future::join_all`), and the
+old `Cat::submit` re-read the account's nonce over HTTP (`GET /account`)
+on *every* call — two concurrent calls both read the same current nonce
+before either had applied, both signed it, and whichever `POST /submit`
+landed second was rejected for reusing an already-spent nonce. `Stale`,
+not `Future`: a real transaction-pool's reordering-before-mint doesn't
+help here, because the two extrinsics are a genuine duplicate, not a
+pair that arrived out of order — only one nonce value can ever be valid,
+regardless of application order.
+
+Fixed by having `Cat` track its own nonce locally instead of asking the
+node every time — it's the only signer for its own account, so it was
+always the actual authority on what its next nonce is. Fetch-and-increment
+now happens under one lock (`tokio::sync::Mutex<Option<u32>>`), so
+concurrent calls in the same turn queue for distinct sequential values
+instead of racing a read; the cache is dropped on any submit failure so
+the next attempt resyncs from the chain rather than drifting (covers a
+rewind, a restart, or a dispatch-level failure that still consumed the
+nonce). `meta` (genesis hash, spec/tx version) is now fetched once, ever,
+and cached too — nothing on this chain can change it (no forkless upgrade
+path here). Verified live: the exact repro (one turn, `Artifact` +
+`SendMessage` together) landed both calls in the same block with the fix
+in place.
+
+**Still true, not addressed by this fix**: the node itself still dispatches
+`/submit` synchronously with no pool at all (`node.rs`'s `submit()` calls
+`Executive::apply_extrinsic` directly). Now that nonces are assigned
+correctly up front, the remaining risk is two concurrent HTTP requests for
+adjacent nonces arriving at the node *out of order* — that would now fail
+as `Future` (not yet valid) rather than `Stale`, and — per the
+retransmission finding above — just get dropped rather than queued. A
+small per-account "hold a `Future`-nonce extrinsic, apply it once its
+predecessor lands" buffer ahead of `advance()` would close that, and would
+be the legitimate use for a pool's reordering — it just isn't what this
+bug needed.
+
+**Also found live, not yet fixed**: a cat can *say* it did something
+without doing it. Asked to publish the joint report, `tama` replied "Joint
+report published: ..." via `SendMessage` without ever calling `Artifact`
+— `kot notes` confirmed no new artifact existed. `kuro`, asked the same
+thing, called `Artifact` for real. Not chased further; a small model
+narrating a completed action instead of taking it is a known failure mode
+of tool-calling models generally, not something specific to this pipeline
+— but nothing here currently distinguishes "said it happened" from "made
+it happen," and an operator (or another cat) reading the chat log has no
+way to tell without independently checking (`ArtifactList`, `kot notes`).
+
 ### Still open: a non-root broadcast wakes nobody
 
 `Effect::wakes()` for `Said` is `to.is_some() || from_root` — but

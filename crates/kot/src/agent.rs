@@ -125,6 +125,18 @@ struct Cat {
     llm: Llm,
     persona: String,
     roster: Roster,
+    // `meta` never changes for this chain's life (no forkless upgrade path
+    // here — see HANDOFF's "FRAME, executed natively... we do not
+    // upgrade"), so one fetch, ever, is correct, not just cheaper.
+    // `nonce` is this cat's own count of its own signed extrinsics — the
+    // one thing here it never needed the node's help to know. Tracking it
+    // locally instead of re-reading `/account` before every submit is what
+    // actually fixes the concurrent-submit race found live 2026-09-23
+    // (two calls in one turn both reading the same current nonce and both
+    // signing it — reordering at the node can't rescue a genuinely
+    // duplicate nonce, only a distinct one that arrived out of order).
+    meta: tokio::sync::OnceCell<client::Meta>,
+    nonce: tokio::sync::Mutex<Option<u32>>,
 }
 
 impl Cat {
@@ -148,7 +160,7 @@ impl Cat {
         }
     }
 
-    async fn meta(&self) -> Option<client::Meta> {
+    async fn fetch_meta(&self) -> Option<client::Meta> {
         let v: serde_json::Value = self.http.get(format!("{}/meta", self.node)).send().await.ok()?.json().await.ok()?;
         let genesis_hash = H256::from_slice(&hex::decode(v.get("genesis_hash")?.as_str()?).ok()?);
         Some(client::Meta {
@@ -158,7 +170,7 @@ impl Cat {
         })
     }
 
-    async fn nonce(&self) -> u32 {
+    async fn fetch_nonce(&self) -> u32 {
         let url = format!("{}/account/{}", self.node, miot_keys::to_hex(&self.account));
         match self.http.get(url).send().await {
             Ok(r) => r.json::<serde_json::Value>().await.ok().and_then(|v| v.get("nonce")?.as_u64()).unwrap_or(0) as u32,
@@ -166,25 +178,52 @@ impl Cat {
         }
     }
 
-    /// Sign `call` and submit it. `/meta` and the nonce are fetched fresh
-    /// every time. Two extra requests against a turn that costs tens of
-    /// seconds isn't the bottleneck. On a replica, both calls reach the
-    /// primary, so the nonce is never stale.
+    /// Sign `call` and submit it.
+    ///
+    /// `meta` is fetched once, ever, and cached — nothing on this chain
+    /// ever changes it. `nonce` is read from the node once, then tracked
+    /// locally and incremented under a lock before the next call can read
+    /// it: this cat is the only signer for its own account, so it is
+    /// already the authority on what its next nonce is, and asking the
+    /// node again every time was the actual bug, not just an extra round
+    /// trip — two calls in the same turn (`agent::run`'s `join_all`) used
+    /// to both read the current nonce before either had applied, both sign
+    /// it, and the second lose to `Invalid(Stale)` no matter what order it
+    /// reached the node in. On any failure the cached nonce is dropped so
+    /// the next attempt resyncs from the chain — cheap, and correct after
+    /// a rewind or a restart this cat didn't cause.
     async fn submit(&self, call: RuntimeCall) -> bool {
-        let Some(meta) = self.meta().await else {
-            println!("  [{}] node unreachable (meta)", self.name);
-            return false;
+        let meta = match self.meta.get() {
+            Some(m) => *m,
+            None => {
+                let Some(m) = self.fetch_meta().await else {
+                    println!("  [{}] node unreachable (meta)", self.name);
+                    return false;
+                };
+                // A concurrent call may have already set it — same chain,
+                // same value either way, so losing the race here is fine.
+                let _ = self.meta.set(m);
+                m
+            }
         };
-        let nonce = self.nonce().await;
+        let mut guard = self.nonce.lock().await;
+        let nonce = match *guard {
+            Some(n) => n,
+            None => self.fetch_nonce().await,
+        };
+        *guard = Some(nonce + 1);
+        drop(guard);
         let uxt = client::sign(&self.identity, call, nonce, &meta);
         match self.http.post(format!("{}/submit", self.node)).body(uxt.encode()).send().await {
             Ok(r) if r.status().is_success() => true,
             Ok(r) => {
+                *self.nonce.lock().await = None;
                 let e: serde_json::Value = r.json().await.unwrap_or_default();
                 println!("  [{}] refused: {}", self.name, e.get("error").unwrap_or(&e));
                 false
             }
             Err(e) => {
+                *self.nonce.lock().await = None;
                 println!("  [{}] node unreachable: {e}", self.name);
                 false
             }
@@ -474,6 +513,8 @@ pub async fn run(cfg: AgentConfig) {
         llm: cfg.llm,
         persona: format!("{}{AGENT_RULES}", cfg.persona),
         roster: cfg.roster,
+        meta: tokio::sync::OnceCell::new(),
+        nonce: tokio::sync::Mutex::new(None),
     };
     let name = cat.name.clone();
     println!("[{name}] id={} node={} llm={}", miot_keys::short(&account), cat.node, cat.llm.label());
