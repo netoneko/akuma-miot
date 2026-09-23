@@ -492,7 +492,9 @@ def cmd_up(name: str) -> None:
             # Restart = kill: herd restarts it (restart = true), and
             # re-reads /etc/herd/enabled every 20s on its own, so a new
             # conf needs nothing else.
-            on(a, "for p in $(ps | grep '/root/kot/bin/kot run' | grep -v grep | awk '{print $1}'); do kill $p; done")
+            # Akuma's ps lists every thread: after the first kill ends the
+            # process, the rest are gone. `|| true` so that isn't a failure.
+            on(a, "for p in $(ps | grep '/root/kot/bin/kot run' | grep -v grep | awk '{print $1}'); do kill $p 2>/dev/null || true; done")
         else:
             say(f"{a.name}: NO_ENABLE set — staged, not enabled/restarted")
 
