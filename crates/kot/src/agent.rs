@@ -18,6 +18,7 @@
 use codec::Encode;
 use miot_keys::Identity;
 use miot_llm::{task_tools, Llm};
+use std::sync::Arc;
 use miot_runtime::{client, AccountId, RuntimeCall};
 use polkadot_sdk::*;
 use serde::{Deserialize, Serialize};
@@ -25,7 +26,9 @@ use sp_core::H256;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use crate::agent_state_machine::{self, Dispatch, Host, Inbound};
 use crate::common::{parse_task, Roster};
+use crate::ui::{self, ToolOut};
 
 /// This cat's local memory across a process restart — `docs/
 /// AGENT_SESSION_EPOCH.md`. A turn is stateless and the chain is the only
@@ -96,11 +99,9 @@ with plain text alone. The one exception: a message that tells you it \
 doesn't need a reply (no_ack) — there, calling nothing is the correct \
 response, not a rule violation. Don't manufacture a reply just to have said \
 something.\n\
-- You may call several tools in the same response — for example Bash then \
-SendMessage, or Artifact then TaskUpdate. Each one runs independently and \
-asynchronously: none of them feed their result back to you, so make every \
-call self-contained rather than depending on what an earlier one in the \
-same response will return.";
+- You may call several tools in the same response. They all run at once, so \
+don't make one depend on another's output within a response — call what you \
+need, and act on the results when they come back.";
 
 pub struct AgentConfig {
     pub name: String,
@@ -125,8 +126,6 @@ struct Cat {
     account: AccountId,
     node: String,
     http: reqwest::Client,
-    llm: Llm,
-    persona: String,
     roster: Roster,
     // `meta` never changes for this chain's life (no forkless upgrade path
     // here — see HANDOFF's "FRAME, executed natively... we do not
@@ -254,14 +253,15 @@ impl Cat {
     /// (`NotAuthorized`, `WrongKind`, `NoSuchTask`, ...) will fail
     /// identically every time — retrying it would just spend wall clock
     /// confirming what the first attempt already proved.
-    async fn submit(&self, call: RuntimeCall) -> bool {
+    async fn submit(&self, call: RuntimeCall) -> Result<(), String> {
         const ATTEMPTS: u32 = 4;
         const BACKOFF_MS: [u64; 3] = [1000, 2000, 4000];
 
+        let mut last = String::new();
         for attempt in 0..ATTEMPTS {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt as usize - 1])).await;
-                println!("  [{}] retrying submit (attempt {}/{ATTEMPTS})", self.name, attempt + 1);
+                println!("{}", ui::note(&format!("{}: retrying submit (attempt {}/{ATTEMPTS}) — {last}", self.name, attempt + 1)));
             }
 
             let meta = match self.meta.get() {
@@ -275,7 +275,7 @@ impl Cat {
                         m
                     }
                     None => {
-                        println!("  [{}] node unreachable (meta)", self.name);
+                        last = "node unreachable (meta)".to_string();
                         continue;
                     }
                 },
@@ -289,29 +289,28 @@ impl Cat {
             drop(guard);
             let uxt = client::sign(&self.identity, call.clone(), nonce, &meta);
             match self.http.post(format!("{}/submit", self.node)).body(uxt.encode()).send().await {
-                Ok(r) if r.status().is_success() => return true,
+                Ok(r) if r.status().is_success() => return Ok(()),
                 Ok(r) => {
                     *self.nonce.lock().await = None;
                     let e: serde_json::Value = r.json().await.unwrap_or_default();
                     let msg = e.get("error").unwrap_or(&e).to_string();
-                    println!("  [{}] refused: {msg}", self.name);
                     if !(msg.contains("Stale") || msg.contains("Future")) {
-                        return false;
+                        return Err(format!("refused: {msg}"));
                     }
+                    last = format!("refused: {msg}");
                 }
                 Err(e) => {
                     *self.nonce.lock().await = None;
-                    println!("  [{}] node unreachable: {e}", self.name);
+                    last = format!("node unreachable: {e}");
                 }
             }
         }
-        println!("  [{}] submit gave up after {ATTEMPTS} attempts", self.name);
-        false
+        Err(format!("gave up after {ATTEMPTS} attempts — {last}"))
     }
 
     /// Build the prompt for one woken event. The parent question is carried
     /// into every one: a turn is stateless, so the chain is the only memory.
-    async fn prompt(&self, e: &Entry, question: &str) -> Option<(String, Vec<miot_llm::Tool>)> {
+    async fn prompt(&self, e: &Entry, question: &str) -> Option<(String, &'static str)> {
         let t = e.effect.get("t")?.as_str()?;
         let task = e.effect.get("task").and_then(|v| v.as_str()).unwrap_or("t1");
         // Root only — the leader is a valid assignee, itself included
@@ -474,51 +473,19 @@ impl Cat {
             }
             _ => return None,
         };
-        let tools = if t == "said" { miot_llm::chat_tools() } else { task_tools() };
-        Some((p, tools))
+        Some((p, if t == "said" { "said" } else { "task" }))
     }
 
-    /// Stubs: run locally, log the result, done. No sandbox, no output fed
-    /// back to the model — a turn is one LLM call in, tool calls out, with no
-    /// loop that would let it see what came back and react.
-    async fn act_local(&self, c: &miot_llm::Call) -> bool {
-        match c.name.as_str() {
-            "Bash" => {
-                let command = c.str("command").unwrap_or_default();
-                let run = tokio::process::Command::new("/bin/sh").arg("-c").arg(&command).output();
-                match tokio::time::timeout(std::time::Duration::from_secs(30), run).await {
-                    Ok(Ok(out)) => println!(
-                        "  [{}] bash `{command}` exit={:?}\n{}{}",
-                        self.name,
-                        out.status.code(),
-                        String::from_utf8_lossy(&out.stdout),
-                        String::from_utf8_lossy(&out.stderr),
-                    ),
-                    Ok(Err(e)) => println!("  [{}] bash `{command}` failed to spawn: {e}", self.name),
-                    Err(_) => println!("  [{}] bash `{command}` timed out after 30s", self.name),
-                }
-            }
-            "ReadFile" => {
-                let path = c.str("path").unwrap_or_default();
-                match tokio::fs::read_to_string(&path).await {
-                    Ok(s) => println!("  [{}] read {path} ({} bytes):\n{s}", self.name, s.len()),
-                    Err(e) => println!("  [{}] read {path} failed: {e}", self.name),
-                }
-            }
-            "WriteFile" => {
-                let path = c.str("path").unwrap_or_default();
-                let content = c.str("content").unwrap_or_default();
-                match tokio::fs::write(&path, &content).await {
-                    Ok(()) => println!("  [{}] wrote {path} ({} bytes)", self.name, content.len()),
-                    Err(e) => println!("  [{}] write {path} failed: {e}", self.name),
-                }
-            }
+    /// A node-backed read — a query in `agent_state_machine`'s terms: it runs on its own
+    /// and its result is fed back to the model on a later turn. `None`: not
+    /// one of these.
+    async fn query(&self, c: &miot_llm::Call) -> Option<ToolOut> {
+        let out = match c.name.as_str() {
             // Merged: task-closed and standalone artifacts alike — asked for
             // live, 2026-09-23, "task artifacts should be accessible all the
             // same by id since they are on chain in session."
             "ArtifactList" => match self.signed_get("/artifacts").send().await {
                 Ok(r) => match r.json::<Vec<serde_json::Value>>().await {
-                    Ok(rows) if rows.is_empty() => println!("  [{}] no artifacts yet", self.name),
                     Ok(rows) => {
                         let lines: Vec<String> = rows
                             .iter()
@@ -534,11 +501,11 @@ impl Cat {
                                 format!("{id}: {title} ({author})")
                             })
                             .collect();
-                        println!("  [{}] artifacts:\n{}", self.name, lines.join("\n"));
+                        ToolOut::new("", true).meta(format!("{} artifacts", rows.len())).body(lines.join("\n"))
                     }
-                    Err(e) => println!("  [{}] ArtifactList: bad response: {e}", self.name),
+                    Err(e) => ToolOut::new("", false).meta("bad response").body(e.to_string()),
                 },
-                Err(e) => println!("  [{}] ArtifactList: node unreachable: {e}", self.name),
+                Err(e) => ToolOut::new("", false).meta("node unreachable").body(e.to_string()),
             },
             // A `t`-prefixed id (as `ArtifactList` renders a task's) is a
             // closed parent's report; anything else is a standalone id — the
@@ -549,12 +516,13 @@ impl Cat {
                 match self.signed_get(&path).send().await {
                     Ok(r) => match r.json::<serde_json::Value>().await {
                         Ok(v) if v.get("found").and_then(|f| f.as_bool()) == Some(true) => {
-                            println!("  [{}] artifact {id}:\n{}", self.name, v.get("body").and_then(|b| b.as_str()).unwrap_or(""));
+                            let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("");
+                            ToolOut::new(id, true).meta(ui::bytes(body.len())).body(body)
                         }
-                        Ok(_) => println!("  [{}] no artifact {id}", self.name),
-                        Err(e) => println!("  [{}] ArtifactRead {id}: bad response: {e}", self.name),
+                        Ok(_) => ToolOut::new(id, false).meta("no such artifact"),
+                        Err(e) => ToolOut::new(id, false).meta("bad response").body(e.to_string()),
                     },
-                    Err(e) => println!("  [{}] ArtifactRead {id}: node unreachable: {e}", self.name),
+                    Err(e) => ToolOut::new(id, false).meta("node unreachable").body(e.to_string()),
                 }
             }
             "Peers" => match self.signed_get("/mesh/peers").send().await {
@@ -573,23 +541,24 @@ impl Cat {
                                         .map(|a| self.roster.name_of(&a))
                                         .unwrap_or_else(|| route.to_string());
                                     let role = status.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                                    let addr = route.split_once("://").map(|(_, r)| r).unwrap_or(route);
                                     match p.get("seen_ms_ago").and_then(|s| s.as_u64()) {
-                                        Some(ms) => lines.push(format!("{name} — {role}, seen {ms}ms ago")),
-                                        None => lines.push(format!("{name} — {role}")),
+                                        Some(ms) => lines.push(format!("{name} — {role}, at {addr}, seen {ms}ms ago")),
+                                        None => lines.push(format!("{name} — {role}, at {addr}")),
                                     }
                                 }
                                 None => lines.push(format!("{route} — never answered")),
                             }
                         }
-                        println!("  [{}] peers (live):\n  {}\n  [{}] roster (configured, not all necessarily live): {}", self.name, lines.join("\n  "), self.name, self.roster.names().collect::<Vec<_>>().join(", "));
+                        lines.push(format!("roster (configured, not all necessarily live): {}", self.roster.names().collect::<Vec<_>>().join(", ")));
+                        ToolOut::new("", true).meta(format!("{} live", lines.len() - 1)).body(lines.join("\n"))
                     }
-                    Err(e) => println!("  [{}] Peers: bad response: {e}", self.name),
+                    Err(e) => ToolOut::new("", false).meta("bad response").body(e.to_string()),
                 },
-                Err(e) => println!("  [{}] Peers: node unreachable: {e}", self.name),
+                Err(e) => ToolOut::new("", false).meta("node unreachable").body(e.to_string()),
             },
             "Stats" => match self.signed_get("/stats").send().await {
                 Ok(r) => match r.json::<Vec<serde_json::Value>>().await {
-                    Ok(rows) if rows.is_empty() => println!("  [{}] no stats reported yet", self.name),
                     Ok(rows) => {
                         let lines: Vec<String> = rows
                             .iter()
@@ -604,26 +573,27 @@ impl Cat {
                                 let tool_calls = r.get("tool_calls").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let tokens = r.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0);
                                 let ms = r.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
-                                format!("{name} — {turns} turns, {tool_calls} tool calls, {tokens} tok, {:.1}s thinking", ms as f64 / 1000.0)
+                                format!("{name} — {turns} turns, {tool_calls} tool calls, {} tok, {:.1}s thinking", ui::thousands(tokens), ms as f64 / 1000.0)
                             })
                             .collect();
-                        println!("  [{}] stats:\n  {}", self.name, lines.join("\n  "));
+                        ToolOut::new("", true).meta(format!("{} cats", rows.len())).body(lines.join("\n"))
                     }
-                    Err(e) => println!("  [{}] Stats: bad response: {e}", self.name),
+                    Err(e) => ToolOut::new("", false).meta("bad response").body(e.to_string()),
                 },
-                Err(e) => println!("  [{}] Stats: node unreachable: {e}", self.name),
+                Err(e) => ToolOut::new("", false).meta("node unreachable").body(e.to_string()),
             },
-            _ => return false,
-        }
-        true
+            _ => return None,
+        };
+        Some(out)
     }
 
-    async fn act(&self, c: &miot_llm::Call) {
-        if self.act_local(c).await {
-            return;
-        }
+    /// A chain write — a record in `agent_state_machine`'s terms: signed, submitted, shown,
+    /// never fed back (what it did arrives later as a chain event). The
+    /// `ToolOut` says what was asked and whether the node took it.
+    async fn record(&self, c: &miot_llm::Call) -> ToolOut {
         let task = c.str("task").unwrap_or_default();
-        let call = match c.name.as_str() {
+        let refuse = |arg: String, why: &str| ToolOut::new(arg, false).meta(why.to_string());
+        let (call, arg) = match c.name.as_str() {
             "TaskPlan" => {
                 let assignments: Vec<miot_primitives::PlanItem<AccountId>> = c
                     .args
@@ -641,26 +611,32 @@ impl Cat {
                             .collect()
                     })
                     .unwrap_or_default();
-                let Some(parent) = parse_task(&task) else { return };
-                RuntimeCall::Litter(pallet_litter::Call::plan { parent, assignments })
+                let Some(parent) = parse_task(&task) else { return refuse(task, "bad task id") };
+                let arg = format!("{task} → {} sub-tasks", assignments.len());
+                (RuntimeCall::Litter(pallet_litter::Call::plan { parent, assignments }), arg)
             }
             "TaskUpdate" => {
-                let Some(id) = parse_task(&task) else { return };
-                let act = match c.str("status").unwrap_or_default().as_str() {
+                let status = c.str("status").unwrap_or_default();
+                let text = c.str("text").unwrap_or_default();
+                let arg = format!("{task} {status}  {text}");
+                let Some(id) = parse_task(&task) else { return refuse(arg, "bad task id") };
+                let act = match status.as_str() {
                     "claim" => miot_primitives::Act::Claim,
                     "done" => miot_primitives::Act::Done,
                     "failed" => miot_primitives::Act::Failed,
                     "clear" => miot_primitives::Act::Clear,
                     "reopen" => miot_primitives::Act::Reopen,
                     "artifact" => miot_primitives::Act::Artifact,
-                    _ => return,
+                    _ => return refuse(arg, "unknown status"),
                 };
-                RuntimeCall::Litter(pallet_litter::Call::update { task: id, act, text: c.str("text").unwrap_or_default() })
+                (RuntimeCall::Litter(pallet_litter::Call::update { task: id, act, text }), arg)
             }
             "TaskReassign" => {
-                let Some(to) = c.str("to").and_then(|n| self.roster.account(&n)) else { return };
-                let Some(id) = parse_task(&task) else { return };
-                RuntimeCall::Litter(pallet_litter::Call::reassign { task: id, to })
+                let to_name = c.str("to").unwrap_or_default();
+                let arg = format!("{task} → {to_name}");
+                let Some(to) = self.roster.account(&to_name) else { return refuse(arg, "no such cat") };
+                let Some(id) = parse_task(&task) else { return refuse(arg, "bad task id") };
+                (RuntimeCall::Litter(pallet_litter::Call::reassign { task: id, to }), arg)
             }
             // `to` was silently dropped here until found live running a
             // two-cat debate: every reply went out as a broadcast
@@ -673,26 +649,135 @@ impl Cat {
             // silently broadcasting a misspelled name would put words in
             // front of the wrong audience.
             "SendMessage" => {
-                let to = match c.str("to").as_deref().map(str::trim) {
-                    None | Some("") => None,
-                    Some(n) if matches!(n.trim_start_matches('@').to_ascii_lowercase().as_str(), "all" | "cats" | "litter") => None,
-                    Some(n) => match self.roster.account(n) {
+                let body = c.str("body").unwrap_or_default();
+                let raw_to = c.str("to").map(|s| s.trim().to_string()).unwrap_or_default();
+                let to = match raw_to.as_str() {
+                    "" => None,
+                    n if matches!(n.trim_start_matches('@').to_ascii_lowercase().as_str(), "all" | "cats" | "litter") => None,
+                    n => match self.roster.account(n) {
                         Some(a) => Some(a),
-                        None => {
-                            println!("  [{}] SendMessage: no such cat {n:?} in the roster — not sent", self.name);
-                            return;
-                        }
+                        None => return refuse(format!("→ {n}  {body}"), "no such cat — not sent"),
                     },
                 };
                 let no_ack = c.args.get("no_ack").and_then(|v| v.as_bool()).unwrap_or(false);
                 let off_record = c.args.get("off_record").and_then(|v| v.as_bool()).unwrap_or(false);
-                RuntimeCall::Litter(pallet_litter::Call::say { to, body: c.str("body").unwrap_or_default(), no_ack, off_record })
+                let who = if to.is_some() { raw_to.trim_start_matches('@').to_string() } else { "litter".to_string() };
+                let mut flags = Vec::new();
+                if no_ack {
+                    flags.push("no_ack");
+                }
+                if off_record {
+                    flags.push("off record");
+                }
+                let flags = if flags.is_empty() { String::new() } else { format!("  ({})", flags.join(", ")) };
+                (RuntimeCall::Litter(pallet_litter::Call::say { to, body: body.clone(), no_ack, off_record }), format!("→ {who}  {body}{flags}"))
             }
-            "Artifact" => RuntimeCall::Litter(pallet_litter::Call::publish_standalone_artifact { text: c.str("text").unwrap_or_default() }),
-            "RequestCompaction" => RuntimeCall::Litter(pallet_litter::Call::request_compaction {}),
-            _ => return,
+            "Artifact" => {
+                let text = c.str("text").unwrap_or_default();
+                let title = text.lines().next().unwrap_or("").to_string();
+                let bytes = text.len();
+                (RuntimeCall::Litter(pallet_litter::Call::publish_standalone_artifact { text }), format!("{title}  ({})", ui::bytes(bytes)))
+            }
+            "RequestCompaction" => (RuntimeCall::Litter(pallet_litter::Call::request_compaction {}), String::new()),
+            other => return refuse(String::new(), &format!("{other}: not a chain write")),
         };
-        self.submit(call).await;
+        match self.submit(call).await {
+            Ok(()) => ToolOut::new(arg, true).meta("submitted"),
+            Err(why) => ToolOut::new(arg, false).meta(why),
+        }
+    }
+}
+
+/// A cat as `agent_state_machine`'s host. The cat itself stays behind an `Arc` so a
+/// spawned query or record can hold it past the call that started it.
+struct CatHost(Arc<Cat>);
+
+impl Host for CatHost {
+    fn name(&self) -> &str {
+        &self.0.name
+    }
+    fn tools(&self, kind: &'static str) -> Vec<miot_llm::Tool> {
+        if kind == "said" { miot_llm::chat_tools() } else { task_tools() }
+    }
+    fn rules(&self) -> &'static str {
+        AGENT_RULES
+    }
+    fn dispatch(&self, c: &miot_llm::Call) -> Dispatch {
+        let cat = self.0.clone();
+        let c = c.clone();
+        match c.name.as_str() {
+            "ArtifactList" | "ArtifactRead" | "Peers" | "Stats" => {
+                Dispatch::Query(Box::pin(async move { cat.query(&c).await.unwrap_or_else(|| ToolOut::new("", false)) }))
+            }
+            "TaskPlan" | "TaskUpdate" | "TaskReassign" | "SendMessage" | "Artifact" | "RequestCompaction" => {
+                Dispatch::Record(Box::pin(async move { Some(cat.record(&c).await) }))
+            }
+            _ => Dispatch::Unknown,
+        }
+    }
+    fn about(&self) -> String {
+        format!(
+            "Where: a cat in the Akuma Miot litter, account {}, talking to its node at {}",
+            miot_keys::short(&self.0.account),
+            self.0.node
+        )
+    }
+
+    /// Spoken to, a cat must always answer — `AGENT_RULES` tells it to use
+    /// SendMessage, but a small model's plain-text reply would otherwise
+    /// reach nobody. Found live testing `kot chat`'s tool calls, then
+    /// confirmed here. Not for a `no_ack` wake: there, silence was asked
+    /// for, and auto-replying would resurrect the ping-pong `no_ack` stops.
+    fn spoke(&self, text: &str, ctx: &serde_json::Value) {
+        let said = ctx.get("t").and_then(|v| v.as_str()) == Some("said");
+        let no_ack = ctx.get("no_ack").and_then(|v| v.as_bool()).unwrap_or(false);
+        if !said || no_ack {
+            self.show(ui::note(&format!("plain text, no tool call — not sent: {}", text.lines().next().unwrap_or(""))));
+            return;
+        }
+        // Back to whoever spoke, marked `no_ack` (the model never chose to
+        // say this — it's a stand-in for a reply it skipped) and mirroring
+        // the wake's `off_record` (a fallback for a message that was never
+        // committed must not itself commit one).
+        let to = ctx.get("from").and_then(|v| v.as_str()).and_then(|h| miot_keys::from_hex(h).ok());
+        let who = to.as_ref().map(|a| self.0.roster.name_of(a)).unwrap_or_else(|| "litter".into());
+        let off_record = ctx.get("off_record").and_then(|v| v.as_bool()).unwrap_or(false);
+        let body = text.to_string();
+        let cat = self.0.clone();
+        tokio::spawn(async move {
+            let arg = format!("→ {who}  {body}  (auto, no_ack)");
+            let out = match cat.submit(RuntimeCall::Litter(pallet_litter::Call::say { to, body, no_ack: true, off_record })).await {
+                Ok(()) => ToolOut::new(arg, true).meta("submitted"),
+                Err(why) => ToolOut::new(arg, false).meta(why),
+            };
+            println!("{}", ui::tool(&cat.name, "SendMessage", &out));
+        });
+    }
+
+    /// Whole cumulative totals each time, not a delta, so a dropped report
+    /// just gets corrected by the next one instead of drifting. One per
+    /// turn: turns are minutes apart, finer than any timer would need.
+    fn after_turn(&self, cost: &ui::TurnCost) {
+        let cat = self.0.clone();
+        let (tools, tokens, ms) = (cost.tools as u32, cost.total as u64, cost.ms);
+        tokio::spawn(async move {
+            let snapshot = {
+                let mut s = cat.stats.lock().await;
+                s.turns += 1;
+                s.tool_calls += tools;
+                s.tokens += tokens;
+                s.ms += ms;
+                *s
+            };
+            let _ = cat
+                .submit(RuntimeCall::Litter(pallet_litter::Call::report_stats {
+                    turns: snapshot.turns,
+                    tool_calls: snapshot.tool_calls,
+                    tokens: snapshot.tokens,
+                    ms: snapshot.ms,
+                }))
+                .await;
+        });
     }
 }
 
@@ -702,7 +787,7 @@ pub async fn run(cfg: AgentConfig) {
     // boundary as `client.rs`'s `Client`, since a cat's node connection is
     // just another caller of a node, not a special case.
     let trusted = cfg.roster.0.iter().map(|(_, a)| a.clone()).collect();
-    let cat = Cat {
+    let cat = Arc::new(Cat {
         name: cfg.name.clone(),
         identity: cfg.identity,
         account: account.clone(),
@@ -712,33 +797,44 @@ pub async fn run(cfg: AgentConfig) {
             .use_preconfigured_tls(crate::tls::client_config(&cfg.identity, trusted))
             .build()
             .unwrap(),
-        llm: cfg.llm,
-        persona: format!("{}{AGENT_RULES}", cfg.persona),
         roster: cfg.roster,
         meta: tokio::sync::OnceCell::new(),
         nonce: tokio::sync::Mutex::new(None),
         stats: tokio::sync::Mutex::new(CatStats::default()),
-    };
+    });
     let name = cat.name.clone();
-    println!("[{name}] id={} node={} llm={}", miot_keys::short(&account), cat.node, cat.llm.label());
+    println!("{}", ui::note(&format!("{name} id={} node={} llm={}", miot_keys::short(&account), cat.node, cfg.llm.label())));
 
-    let mut head = loop {
+    let head = loop {
         match cat.head().await {
             Some(h) => break h,
             None => {
-                println!("[{name}] waiting for the node...");
+                println!("{}", ui::note(&format!("{name} waiting for the node...")));
                 tokio::time::sleep(std::time::Duration::from_secs(2)).await;
             }
         }
     };
-    println!("[{name}] connected.");
+    println!("{}", ui::note(&format!("{name} connected")));
 
+    // The chain is one source of the inbox; the state machine's own tool
+    // results are the other. This task only turns chain events into wakes.
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(watch_chain(cat.clone(), head, tx));
+    agent_state_machine::run(Arc::new(CatHost(cat)), cfg.llm, cfg.persona, rx).await;
+}
+
+/// Poll the node's `/events`, and send every event that wakes this cat into
+/// the inbox as a prompt — newest per (task, kind), since a turn takes
+/// minutes and the chain ticks in seconds. Also owns the session cursor:
+/// `question`, what the litter is working on, and the checkpoint epoch.
+async fn watch_chain(cat: Arc<Cat>, mut head: serde_json::Value, tx: tokio::sync::mpsc::UnboundedSender<Inbound>) {
+    let name = cat.name.clone();
     let epoch = head["last_checkpoint"].as_u64().unwrap_or(0);
     let mut session = Session::load(&name, epoch);
     let mut cursor = session.cursor;
     let mut question = std::mem::take(&mut session.question);
     let mut seen: HashSet<u64> = HashSet::new();
-    let my_hex = miot_keys::to_hex(&account);
+    let my_hex = miot_keys::to_hex(&cat.account);
 
     loop {
         head = cat.head().await.unwrap_or(head);
@@ -750,18 +846,18 @@ pub async fn run(cfg: AgentConfig) {
         // chain re-issues anything still outstanding on its own.
         if let Some(seq) = head["seq"].as_u64() {
             if seq < cursor {
-                println!("[{name}] node's log restarted (seq {seq} < cursor {cursor}); resuming from its end");
+                println!("{}", ui::note(&format!("{name}: node's log restarted (seq {seq} < cursor {cursor}); resuming from its end")));
                 cursor = seq;
                 seen.clear();
             }
         }
         // Any change to the checkpoint — a routine compaction or an actual
         // fork rewind, treated alike (`docs/AGENT_SESSION_EPOCH.md`) — ends
-        // this session: `question` may name a task the chain no longer
-        // remembers opening.
+        // this session: `question`, and the conversation itself, may name a
+        // task the chain no longer remembers opening.
         if let Some(ep) = head["last_checkpoint"].as_u64() {
             if ep != session.epoch {
-                println!("[{name}] chain checkpoint moved ({} -> {ep}); starting a new session", session.epoch);
+                let _ = tx.send(Inbound::Reset(format!("chain checkpoint moved ({} -> {ep})", session.epoch)));
                 session.epoch = ep;
                 question.clear();
             }
@@ -782,10 +878,9 @@ pub async fn run(cfg: AgentConfig) {
             }
         }
 
-        // COALESCE. A turn takes minutes; the chain ticks in seconds. By
-        // the time a cat finishes thinking, several more wakes for the same
-        // task are waiting, and the newest supersedes them all. Keep the
-        // newest per (task, kind) — the `Coalesce` policy from docs/CLI.md.
+        // COALESCE — keep the newest per (task, kind), the `Coalesce`
+        // policy from docs/CLI.md. The state machine folds whatever is
+        // still queued when its current turn ends into the next one.
         let mut latest: HashMap<(String, String), Entry> = HashMap::new();
         for e in batch.into_iter().filter(|e| {
             match e.wakes.as_deref() {
@@ -816,100 +911,10 @@ pub async fn run(cfg: AgentConfig) {
             if !seen.insert(e.seq) {
                 continue;
             }
-            let Some((prompt, tools)) = cat.prompt(&e, &question).await else { continue };
-            let t = e.effect.get("t").and_then(|v| v.as_str()).unwrap_or("");
-            println!("[{name}] block {} {t} — thinking", e.block);
-            match cat.llm.turn(&cat.persona, &prompt, tools).await {
-                Ok(turn) => {
-                    if turn.calls.is_empty() {
-                        println!("[{name}]   no tool call ({} tok) — turn wasted", turn.tokens);
-                    }
-                    // Several calls in one turn run concurrently, not one
-                    // after another — none of them feeds a result back for
-                    // the next to react to (`AGENT_RULES`), so there is
-                    // nothing sequencing them.
-                    for c in &turn.calls {
-                        println!("[{name}]   {} ({} tok, {:.0}s)", c.name, turn.tokens, turn.ms as f64 / 1000.0);
-                    }
-                    futures_util::future::join_all(turn.calls.iter().map(|c| cat.act(c))).await;
-
-                    // Spoken to, a cat must always answer — `AGENT_RULES`
-                    // tells it to call SendMessage every time, but a small
-                    // model reaching for Bash/ReadFile instead (or a plain-
-                    // text reply the tool-only path above has no way to
-                    // send) left the asker hearing nothing back. Found live
-                    // testing `kot chat`'s tool calls, then confirmed here:
-                    // same gap, same fix — don't require the model to pick
-                    // SendMessage on purpose.
-                    //
-                    // Except when the wake itself was `no_ack`: there, a
-                    // turn that produced neither a reply nor a tool call is
-                    // the *correct* outcome (silence, as asked), not the
-                    // dropped-reply bug this fallback exists to paper over
-                    // — auto-replying anyway would just resurrect the
-                    // ping-pong loop `no_ack` exists to stop.
-                    let was_no_ack = e.effect.get("no_ack").and_then(|v| v.as_bool()).unwrap_or(false);
-                    if t == "said" && !was_no_ack && !turn.calls.iter().any(|c| c.name == "SendMessage") {
-                        let body = if !turn.text.trim().is_empty() {
-                            turn.text.trim().to_string()
-                        } else if !turn.calls.is_empty() {
-                            format!("(ran {} — no further reply)", turn.calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", "))
-                        } else {
-                            String::new()
-                        };
-                        if !body.is_empty() {
-                            // Back to whoever actually spoke, not a
-                            // broadcast further — a fallback reply is
-                            // naturally a reply *to* someone, addressed
-                            // the same way the direct-reply path already
-                            // is. (Before 2026-09-23 this also mattered
-                            // because a non-root broadcast woke nobody at
-                            // all; broadcasts wake everyone now, but
-                            // targeting the original speaker is still the
-                            // right shape for "here's what I did.")
-                            let to = e.effect.get("from").and_then(|v| v.as_str()).and_then(|h| miot_keys::from_hex(h).ok());
-                            println!("[{name}]   (auto) SendMessage: {body}");
-                            // The model never chose to say this — it's a
-                            // synthesized status note standing in for a
-                            // reply it skipped, not a question. Marking it
-                            // `no_ack` keeps a fallback from starting (or
-                            // extending) a ping-pong nobody actually meant.
-                            // Mirrors the wake's own `off_record`: a
-                            // fallback for a message that was never
-                            // committed must not itself commit one — see
-                            // `otr_note` above for why that matters.
-                            let off_record = e.effect.get("off_record").and_then(|v| v.as_bool()).unwrap_or(false);
-                            cat.submit(RuntimeCall::Litter(pallet_litter::Call::say { to, body, no_ack: true, off_record })).await;
-                        }
-                    }
-
-                    // Periodic, one report per turn rather than a timer:
-                    // turns here are already minutes apart, so "after every
-                    // turn" is a finer cadence than a wall-clock interval
-                    // would need to be, with no extra bookkeeping. Whole
-                    // cumulative totals each time, not a delta, so a
-                    // dropped report (same no-retry-queue gap `submit`
-                    // itself now retries around, but a report is fire-and-
-                    // forget by design — worth knowing, not worth an
-                    // agent's own turn budget defending) just gets
-                    // corrected by the next one instead of drifting.
-                    let snapshot = {
-                        let mut s = cat.stats.lock().await;
-                        s.turns += 1;
-                        s.tool_calls += turn.calls.len() as u32;
-                        s.tokens += turn.total_tokens as u64;
-                        s.ms += turn.ms;
-                        *s
-                    };
-                    cat.submit(RuntimeCall::Litter(pallet_litter::Call::report_stats {
-                        turns: snapshot.turns,
-                        tool_calls: snapshot.tool_calls,
-                        tokens: snapshot.tokens,
-                        ms: snapshot.ms,
-                    }))
-                    .await;
-                }
-                Err(e) => println!("[{name}]   llm error: {e}"),
+            let Some((text, kind)) = cat.prompt(&e, &question).await else { continue };
+            let text = format!("[block {}] {text}", e.block);
+            if tx.send(Inbound::Wake { text, kind, ctx: e.effect.clone() }).is_err() {
+                return;
             }
         }
 

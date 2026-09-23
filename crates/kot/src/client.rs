@@ -328,12 +328,31 @@ impl Client {
     /// ratatui REPL can feed it through an inline-viewport insert.
     pub async fn peers_text(&mut self) -> String {
         let lit = self.get_json("/head").await.ok().and_then(|h| h["leader"].as_str().map(str::to_string));
+        let mesh = self.get_json("/mesh/peers").await;
+        // Cat name -> the address the connected node reaches it at (its
+        // `MIOT_PEERS` route, scheme dropped). The connected node itself is
+        // wherever this client dialed it. External members and anything the
+        // node has never heard from still show their configured route.
+        let mut addr_of: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+        if let Ok(m) = &mesh {
+            let names = mesh_names(m, &self.roster);
+            if let Some(n) = m["me"]["name"].as_str() {
+                addr_of.insert(names.get(n).cloned().unwrap_or_else(|| n.to_string()), host_port(&self.node));
+            }
+            for p in m["peers"].as_array().into_iter().flatten() {
+                if let Some(n) = p["status"]["name"].as_str() {
+                    addr_of.insert(names.get(n).cloned().unwrap_or_else(|| n.to_string()), host_port(p["route"].as_str().unwrap_or("?")));
+                }
+            }
+        }
+
         let mut out = vec![format!("  {}", ui::dim("litter"))];
         for (n, a) in &self.roster.0 {
             let tag = if lit.as_deref() == Some(miot_keys::to_hex(a).as_str()) { format!("  {}", ui::ok("leader")) } else { String::new() };
-            out.push(format!("    {}  {}{tag}", ui::pad(&ui::who(n), 14), ui::dim(&miot_keys::short(a))));
+            let addr = addr_of.get(n).map(|s| ui::plain(s)).unwrap_or_else(|| ui::dim("—"));
+            out.push(format!("    {}  {}  {}{tag}", ui::pad(&ui::who(n), 14), ui::dim(&miot_keys::short(a)), ui::pad(&addr, 24)));
         }
-        let m = match self.get_json("/mesh/peers").await {
+        let m = match mesh {
             Ok(m) => m,
             Err(e) => {
                 out.push(format!("  mesh: {}", ui::alert(&e)));
@@ -353,28 +372,33 @@ impl Client {
             ui::plain(&m["quorum"].to_string()),
             m["last_checkpoint"]
         ));
-        let row = |name: String, st: &serde_json::Value, seen: String| {
+        let row = |name: String, addr: &str, st: &serde_json::Value, seen: String| {
             let role = st["role"].as_str().unwrap_or("?");
             let role_c = if role == "leader" { ui::ok(&format!("{role:<13}")) } else { ui::dim(&format!("{role:<13}")) };
             format!(
-                "    {}  {role_c} term {:<4} head {:<7} leader {}  {}",
+                "    {}  {}  {role_c} term {:<4} head {:<7} leader {}  {}",
                 ui::pad(&ui::who(&name), 14),
+                ui::pad(&ui::plain(addr), 24),
                 st["term"],
                 st["head"],
                 ui::pad(&st["leader"].as_str().map(&cat_of).map(|n| ui::who(&n)).unwrap_or_else(|| ui::dim("-")), 14),
-                ui::dim(&seen),
+                seen,
             )
         };
-        out.push(row(cat_of(me["name"].as_str().unwrap_or("?")), me, "(this node)".into()));
+        out.push(row(cat_of(me["name"].as_str().unwrap_or("?")), &host_port(&self.node), me, ui::dim("(this node)")));
         for p in m["peers"].as_array().into_iter().flatten() {
-            let route = p["route"].as_str().unwrap_or("?");
+            let route = host_port(p["route"].as_str().unwrap_or("?"));
             match p["status"].as_object() {
                 Some(_) => {
                     let ago = p["seen_ms_ago"].as_u64().unwrap_or(0);
-                    let stale = if ago > 5_000 { format!("  {}", ui::warn("STALE")) } else { String::new() };
-                    out.push(row(cat_of(p["status"]["name"].as_str().unwrap_or("?")), &p["status"], format!("{route}  seen {:.1}s ago{stale}", ago as f64 / 1000.0)));
+                    let seen = if ago > 5_000 {
+                        format!("{}  {}", ui::dim(&format!("seen {:.1}s ago", ago as f64 / 1000.0)), ui::warn("STALE"))
+                    } else {
+                        ui::dim(&format!("seen {:.1}s ago", ago as f64 / 1000.0))
+                    };
+                    out.push(row(cat_of(p["status"]["name"].as_str().unwrap_or("?")), &route, &p["status"], seen));
                 }
-                None => out.push(format!("    {:<14} {}", "?", ui::warn(&format!("{route}  never answered")))),
+                None => out.push(format!("    {}  {}  {}", ui::pad(&ui::dim("?"), 14), ui::pad(&ui::plain(&route), 24), ui::warn("never answered"))),
             }
         }
         out.join("\n")
@@ -449,14 +473,32 @@ impl Client {
         }
     }
 
+    /// One line per event, grep-friendly — what `kot log` prints when its
+    /// stdout isn't a terminal (piped, redirected, a script watching).
     fn print_event(&self, e: &serde_json::Value) {
-        println!("  {DIM}block {}{OFF}  {}", e["block"], self.render_effect(&e["effect"]));
+        println!("  block {}  {}", e["block"], self.render_effect(&e["effect"]));
     }
 
     /// `kot log`. With `task`, only events about it (or its sub-tasks).
     /// `follow` keeps polling; without it, prints what the node holds and
     /// exits. `seconds` bounds a follow (one-shot verbs watch briefly).
+    ///
+    /// On a terminal every event goes through `ui::render` — the REPL's own
+    /// look: avatars beside speech, verbs by glyph, each cat's `∑` running
+    /// tally of turns/tools/tokens. Piped, it stays one plain line each.
     pub async fn log(&mut self, since: u64, task: Option<&str>, follow: bool, seconds: Option<u64>) {
+        use std::io::IsTerminal;
+        let pretty = std::io::stdout().is_terminal();
+        let me_name = self.roster.name_of(&self.identity.account());
+        let head_block = match self.get_json("/head").await {
+            Ok(h) => h["block"].as_u64().unwrap_or(0),
+            Err(_) => 0,
+        };
+        let now = || std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0);
+        let started = now();
+        let mut prev: Option<u64> = None;
+        let mut replaying = true;
+
         let deadline = seconds.map(|s| tokio::time::Instant::now() + std::time::Duration::from_secs(s));
         let task = task.map(|t| t.trim_start_matches('t').to_string());
         let mut cursor = since;
@@ -473,14 +515,31 @@ impl Client {
                         continue;
                     }
                 }
-                self.print_event(e);
+                if pretty {
+                    let block = e["block"].as_u64().unwrap_or(0);
+                    // Replayed history gets an estimated `≈` time from its
+                    // block distance to the head; anything arriving live
+                    // afterwards has a real wall clock.
+                    let time = if replaying { ui::when(block, prev, head_block, started, crate::node::BLOCK_MS) } else { ui::hhmm(now()) };
+                    println!("{}", ui::render(&time, block, &e["effect"], &self.roster, &me_name));
+                    prev = Some(block);
+                } else {
+                    self.print_event(e);
+                }
             }
+            replaying = false;
             if !follow || deadline.is_some_and(|d| tokio::time::Instant::now() >= d) {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+}
+
+/// `https://192.168.1.126:9944` -> `192.168.1.126:9944` — the scheme is
+/// always https on this mesh, so it's just width.
+fn host_port(route: &str) -> String {
+    route.split_once("://").map(|(_, r)| r).unwrap_or(route).trim_end_matches('/').to_string()
 }
 
 const BROADCAST_ALIASES: [&str; 3] = ["all", "cats", "litter"];

@@ -37,8 +37,13 @@ pub struct Rgb(pub u8, pub u8, pub u8);
 pub const OFF: &str = "\x1b[0m";
 pub const BOLD: &str = "\x1b[1m";
 
+/// Off under `NO_COLOR`, and off when stdout isn't a terminal — a cat's
+/// agent loop under systemd writes to the journal, where escape codes are
+/// just noise. Asked once; neither changes mid-run.
 fn colour() -> bool {
-    std::env::var_os("NO_COLOR").is_none()
+    use std::io::IsTerminal;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("NO_COLOR").is_none() && std::io::stdout().is_terminal())
 }
 
 impl Rgb {
@@ -217,9 +222,15 @@ fn ramp(t: f32) -> Rgb {
 }
 
 pub fn paint(c: Rgb, s: &str) -> String {
+    if !colour() {
+        return s.to_string();
+    }
     format!("{}{s}{OFF}", c.fg())
 }
 pub fn bold(c: Rgb, s: &str) -> String {
+    if !colour() {
+        return s.to_string();
+    }
     format!("{BOLD}{}{s}{OFF}", c.fg())
 }
 pub fn dim(s: &str) -> String {
@@ -626,6 +637,230 @@ pub fn me(time: &str, block: u64, me: &str, to: &str, body: &str, roster: &Roste
     format!("{}\n{}", typed(me, Some(to), body, roster), obs(time, block, paint(theme().progress, note)))
 }
 
+// ── tools and turns ─────────────────────────────────────────────────────
+//
+// What a model *did*, as opposed to what the chain recorded: shared by
+// `kot chat` (one model, no chain) and a cat's agent loop (`kot run`,
+// several cats often tailing into one terminal or journal) so both read the
+// same. Who called it leads every line — in a litter that's the whole point.
+
+/// Most lines of a tool's output shown inline; the rest is counted, not
+/// dropped silently. `kot chat` keeps the full text for `Inspect`.
+const TOOL_BODY_LINES: usize = 12;
+
+/// One tool call's outcome, as its caller wants it shown.
+pub struct ToolOut {
+    /// The call's gist: a command, a path, a recipient — one line.
+    pub arg: String,
+    pub ok: bool,
+    /// Right-hand facts: `exit 0`, `4.1 KB`, `12ms`.
+    pub meta: Vec<String>,
+    /// What came back. Empty for a call with nothing to show.
+    pub body: String,
+}
+
+impl ToolOut {
+    pub fn new(arg: impl Into<String>, ok: bool) -> Self {
+        ToolOut { arg: arg.into(), ok, meta: Vec::new(), body: String::new() }
+    }
+    pub fn meta(mut self, m: impl Into<String>) -> Self {
+        self.meta.push(m.into());
+        self
+    }
+    pub fn body(mut self, b: impl Into<String>) -> Self {
+        self.body = b.into();
+        self
+    }
+    /// The plain-text form a model reads back (`Inspect`), no colour.
+    pub fn text(&self) -> String {
+        let meta = if self.meta.is_empty() { String::new() } else { format!("  ({})", self.meta.join(", ")) };
+        if self.body.is_empty() { format!("{}{meta}", self.arg) } else { format!("{}{meta}\n{}", self.arg, self.body) }
+    }
+}
+
+/// `4.1 KB` — for a file read or written.
+pub fn bytes(n: usize) -> String {
+    match n {
+        n if n < 1024 => format!("{n} B"),
+        n if n < 1024 * 1024 => format!("{:.1} KB", n as f64 / 1024.0),
+        n => format!("{:.1} MB", n as f64 / (1024.0 * 1024.0)),
+    }
+}
+
+/// `1,204` — token counts get big enough to want separators.
+pub fn thousands(n: u64) -> String {
+    let s = n.to_string();
+    let mut out = String::new();
+    for (i, ch) in s.chars().enumerate() {
+        if i > 0 && (s.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// `32k` — a context window, compactly.
+fn kilo(n: u32) -> String {
+    if n >= 1000 && n % 1000 == 0 { format!("{}k", n / 1000) } else if n >= 1000 { format!("{:.1}k", n as f64 / 1000.0) } else { n.to_string() }
+}
+
+pub fn millis(ms: u64) -> String {
+    if ms < 1000 { format!("{ms}ms") } else { format!("{:.1}s", ms as f64 / 1000.0) }
+}
+
+/// Cut `s` to `n` display cells with a trailing `…` if it didn't fit.
+fn clip(s: &str, n: usize) -> String {
+    if cells(s) <= n {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    for ch in s.chars() {
+        let cw = cells(&ch.to_string());
+        if w + cw + 1 > n {
+            break;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    out.push('…');
+    out
+}
+
+/// A tool call: a header row naming who called what with which argument,
+/// facts right-aligned, then the output hung off a gutter and capped at
+/// [`TOOL_BODY_LINES`]:
+///
+/// ```text
+///   ⚙ 玉 tama ▸ Bash  ls -la /tmp                     ✓ exit 0 · 12ms
+///     │ total 8
+///     │ … 23 more lines
+/// ```
+pub fn tool(caller: &str, name: &str, out: &ToolOut) -> String {
+    let t = theme();
+    let width = term_width();
+    let (mark, mc) = if out.ok { ("✓", t.progress) } else { ("✗", t.alarm) };
+    let meta = if out.meta.is_empty() {
+        paint(mc, mark)
+    } else {
+        format!("{} {}", paint(mc, mark), dim(&out.meta.join(" · ")))
+    };
+    let lead = format!("  {} {} {} {}", paint(t.accent, "⚙"), sealed(caller), dim(t.prompt), bold(t.paper, name));
+    let room = width.saturating_sub(vcells(&lead) + 2 + vcells(&meta) + 2).max(8);
+    let arg_line = out.arg.lines().next().unwrap_or("");
+    let arg = if arg_line.is_empty() { String::new() } else { format!("  {}", plain(&clip(arg_line, room))) };
+    let gap = width.saturating_sub(vcells(&lead) + vcells(&arg) + vcells(&meta) + 1).max(2);
+    let mut rows = vec![format!("{lead}{arg}{}{meta}", " ".repeat(gap))];
+
+    let body = out.body.trim_end_matches('\n');
+    if !body.is_empty() {
+        let gutter = paint(if out.ok { t.ink } else { t.alarm }, "│");
+        let lines: Vec<&str> = body.lines().collect();
+        let inner = width.saturating_sub(6).max(20);
+        for l in lines.iter().take(TOOL_BODY_LINES) {
+            rows.push(format!("    {gutter} {}", dim(&clip(&l.replace('\t', "    "), inner))));
+        }
+        if lines.len() > TOOL_BODY_LINES {
+            rows.push(format!("    {gutter} {}", faint(&format!("… {} more lines", lines.len() - TOOL_BODY_LINES))));
+        }
+    }
+    rows.join("\n")
+}
+
+/// A model starting a turn: `◌ 玉 tama thinking · #1176 said`.
+pub fn thinking(caller: &str, what: &str) -> String {
+    format!("\n  {} {} {} {}", paint(theme().warm, "◌"), sealed(caller), dim("thinking ·"), dim(what))
+}
+
+/// A bar for the context window, `▕███▌░░░░░▏`, coloured by how full it is.
+fn meter(pct: u32, n: usize) -> String {
+    const PART: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
+    let t = theme();
+    let c = match pct {
+        p if p >= 80 => t.alarm,
+        p if p >= 50 => t.warm,
+        _ => t.progress,
+    };
+    let eighths = (pct.min(100) as usize * n * 8) / 100;
+    let mut bar = "█".repeat(eighths / 8);
+    if eighths % 8 > 0 && eighths / 8 < n {
+        bar.push(PART[eighths % 8 - 1]);
+    }
+    let rest = n.saturating_sub(cells(&bar));
+    format!("{}{}{}{}", faint("▕"), paint(c, &bar), faint(&"░".repeat(rest)), faint("▏"))
+}
+
+/// What one model turn cost, after its tools have run:
+///
+/// ```text
+///   ◆ 玉 tama  in 1,204 · out 88 · 1,292 tok  ▕█▌░░░░░░░░▏ 4% of 32k · 3.4s · 2 tools
+/// ```
+///
+/// `window` is `None` when the provider can't say — no meter then, rather
+/// than one that's made up.
+pub struct TurnCost {
+    pub prompt: u32,
+    pub out: u32,
+    pub total: u32,
+    pub window: Option<u32>,
+    pub ms: u64,
+    pub tools: usize,
+}
+
+pub fn turn(caller: &str, c: &TurnCost) -> String {
+    let t = theme();
+    let sep = || dim(" · ");
+    let mut s = format!(
+        "  {} {}  {} {}{}{} {}{}{} {}",
+        paint(t.done, "◆"),
+        sealed(caller),
+        dim("in"),
+        plain(&thousands(c.prompt as u64)),
+        sep(),
+        dim("out"),
+        plain(&thousands(c.out as u64)),
+        sep(),
+        bold(t.paper, &thousands(c.total as u64)),
+        dim("tok"),
+    );
+    if let Some(w) = c.window.filter(|&w| w > 0) {
+        let pct = ((c.total as u64 * 100) / w as u64) as u32;
+        s.push_str(&format!("  {} {}", meter(pct, 10), dim(&format!("{pct}% of {}", kilo(w)))));
+    }
+    s.push_str(&sep());
+    s.push_str(&dim(&millis(c.ms)));
+    s.push_str(&sep());
+    s.push_str(&dim(&match c.tools {
+        0 => "no tools".to_string(),
+        1 => "1 tool".to_string(),
+        n => format!("{n} tools"),
+    }));
+    s
+}
+
+/// What a model said, outside the chain (`kot chat`): its chop and name,
+/// then the words at full brightness under a hanging indent.
+pub fn reply(caller: &str, body: &str) -> String {
+    let lead = format!("  {} ", sealed(caller));
+    let indent = vcells(&lead);
+    let width = term_width().saturating_sub(indent).max(20);
+    let mut rows = Vec::new();
+    for (p, para) in body.split('\n').enumerate() {
+        for (i, l) in wrap(para, width).into_iter().enumerate() {
+            let head = if p == 0 && i == 0 { lead.clone() } else { " ".repeat(indent) };
+            rows.push(format!("{head}{}", plain(&l)));
+        }
+    }
+    format!("\n{}", rows.join("\n"))
+}
+
+/// A side note from the loop itself — compaction, a budget warning, a
+/// retry — quieter than a tool, louder than nothing.
+pub fn note(s: &str) -> String {
+    format!("  {} {}", paint(theme().warm, "↯"), dim(s))
+}
+
 // ── keys ────────────────────────────────────────────────────────────────
 
 /// A key and what it does: the key legible, the label quiet.
@@ -792,6 +1027,32 @@ pub fn render(time: &str, block: u64, eff: &serde_json::Value, roster: &Roster, 
         "closed" => obs(time, block, format!("{} {} by {}: {}", task_id(), closed(), who(&name_of(eff, "author", roster)), plain(&text("title")))),
         "failed" => obs(time, block, format!("{} {}", task_id(), bold(theme().alarm, "✗ failed"))),
         "rehomed" => obs(time, block, format!("{} rehomed from {} to {}", task_id(), who(&name_of(eff, "from", roster)), who(&name_of(eff, "to", roster)))),
+        "standalone_artifact" => obs(
+            time,
+            block,
+            format!("{} published {} {}: {}", who(&name_of(eff, "author", roster)), paint(theme().done, "▤ artifact"), task(&eff["id"].as_str().map(str::to_string).unwrap_or_else(|| eff["id"].to_string())), plain(&text("title"))),
+        ),
+        // Cumulative, one per turn — the running meter of what a cat has
+        // cost so far, so it reads as a tally rather than an event.
+        "stats_reported" => {
+            let n = |f: &str| eff[f].as_u64().unwrap_or(0);
+            obs(
+                time,
+                block,
+                format!(
+                    "{} {} {}",
+                    who(&name_of(eff, "who", roster)),
+                    dim("∑"),
+                    dim(&format!(
+                        "{} turns · {} tool calls · {} tok · {} thinking",
+                        n("turns"),
+                        n("tool_calls"),
+                        thousands(n("tokens")),
+                        human(n("ms") / 1000)
+                    ))
+                ),
+            )
+        }
         other => obs(time, block, format!("{} {}", dim(other), faint(&eff.to_string()))),
     }
 }

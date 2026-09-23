@@ -325,7 +325,7 @@ async fn main() {
                 .as_deref()
                 .and_then(|p| std::fs::read_to_string(expand_home(p)).ok())
                 .unwrap_or_else(|| format!("You are {name}, a cat, talking directly to your operator — no task, no chain, just conversation."));
-            chat::run(chat::ChatConfig { llm, persona }).await;
+            chat::run(chat::ChatConfig { name, llm, persona }).await;
         }
         Some(Cmd::Id { comment }) => {
             let path = expand_home(cli.seed_file.as_deref().unwrap_or_else(|| die("id needs --seed-file <path>")));

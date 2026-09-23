@@ -371,10 +371,9 @@ fn note_tools() -> Vec<Tool> {
     ]
 }
 
-/// Stubs: local to this cat's own host, no sandbox. A turn is one LLM call
-/// in, tool calls out — there is no loop that feeds a result back for a
-/// further reply, so these don't help decide what to do next; use them to do
-/// work, then a separate `SendMessage`/`TaskUpdate` to report it.
+/// Local to the caller's own host, no sandbox. Run in the background by
+/// `kot`'s agent state machine, their output fed back to the model on a
+/// later turn.
 pub fn local_tools() -> Vec<Tool> {
     vec![
         Tool::new("Bash")
@@ -404,14 +403,11 @@ pub fn local_tools() -> Vec<Tool> {
     ]
 }
 
-/// Session/context-window management — offered only where a session
-/// actually accumulates history across turns (`kot chat`; not `agent.rs`,
-/// whose turns are stateless per wake and so have nothing to compact).
-/// `TokenBudget`, `BrowseTools` and `Inspect` are the one exception in this
-/// project to "a local tool's result is never fed back to the model":
-/// their entire purpose is to put something back in front of the model on
-/// request, so the caller feeds their result into the next turn's history
-/// rather than only printing it. `BrowseTools`/`Inspect` is the same
+/// Session/context-window management — offered by `kot`'s agent state
+/// machine to every host (`kot chat` and a cat alike), since both keep a
+/// conversation that grows.
+/// Every tool result is fed back now; these just exist to put something back
+/// in front of the model on request. `BrowseTools`/`Inspect` is the same
 /// list-then-read shape as `ArtifactList`/`ArtifactRead`, for the same
 /// reason: naming an id without first being able to see what it is would
 /// just be guessing blind.
@@ -450,8 +446,6 @@ pub fn budget_tools() -> Vec<Tool> {
 
 /// Self-identity — persona, model, platform, build version — for a model
 /// that has no other way to introspect its own system prompt as data.
-/// Same feedback exception as the rest of [`budget_tools`]: the caller
-/// feeds the answer into history rather than only printing it.
 pub fn about_me_tool() -> Tool {
     Tool::new("AboutMe")
         .with_description("Your own persona, model, and what host/build you're running on — check this if you're unsure who you are.")
