@@ -321,6 +321,13 @@ pub enum Effect<A> {
     Failed { task: TaskId },
     /// Broadcast, non-waking: the leader moved a sub-task to a different cat.
     Rehomed { task: TaskId, from: Option<A>, to: A },
+    /// Broadcast, non-waking: a standalone artifact published with no task
+    /// behind it — the usual artifact lifecycle needs a parent and every
+    /// sub-task cleared, which is real ceremony for "I looked at something,
+    /// here's what I found" with nobody coordinating it. `id` is a running
+    /// counter, its own namespace, never a [`TaskId`] — this was never part
+    /// of a plan.
+    StandaloneArtifact { author: A, id: u32, title: String, body: String },
 }
 
 impl<A> Effect<A> {

@@ -379,6 +379,17 @@ pub mod pallet {
             Litter::<T>::mutate(|s| s.root = Some(who));
             Ok(())
         }
+
+        /// Publish a standalone artifact — markdown with no task behind it.
+        /// Anyone may call this; there is nothing to authorize against,
+        /// because there is no task whose lifecycle this could be mistaken
+        /// for closing.
+        #[pallet::call_index(8)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn publish_standalone_artifact(origin: OriginFor<T>, text: String) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            Self::apply(|t, _auth, now| t.publish_standalone_artifact(&who, &text, now).map(|(_, fx)| fx), &who)
+        }
     }
 
     impl<T: Config> Pallet<T> {
@@ -417,6 +428,19 @@ pub mod pallet {
 
         pub fn artifact(parent: TaskId) -> Option<Artifact<T::AccountId>> {
             Self::table().artifact(parent).cloned()
+        }
+
+        pub fn standalone_artifact(id: u32) -> Option<Artifact<T::AccountId>> {
+            Self::table().standalone_artifact(id).cloned()
+        }
+
+        pub fn standalone_artifacts() -> Vec<(u32, Artifact<T::AccountId>)> {
+            Self::table().standalone_artifacts().to_vec()
+        }
+
+        /// Every closed parent's artifact, for the merged `/artifacts` listing.
+        pub fn artifacts() -> Vec<(TaskId, Artifact<T::AccountId>)> {
+            Self::table().artifacts().to_vec()
         }
 
         /// Fold a previously-emitted effect into storage — the replay path,

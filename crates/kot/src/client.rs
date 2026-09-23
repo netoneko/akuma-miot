@@ -201,6 +201,48 @@ impl Client {
         }
     }
 
+    /// A standalone note's markdown on stdout, no task behind it.
+    pub async fn print_note(&mut self, id: &str) -> bool {
+        match self.get_json(&format!("/note/{id}")).await {
+            Ok(a) if a["found"] == true => {
+                println!("{}", a["body"].as_str().unwrap_or(""));
+                true
+            }
+            Ok(_) => {
+                eprintln!("no note {id}");
+                false
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                false
+            }
+        }
+    }
+
+    /// Every standalone note: id, title, author.
+    pub async fn print_notes(&mut self) -> bool {
+        match self.get_json("/notes").await {
+            Ok(serde_json::Value::Array(rows)) => {
+                for r in &rows {
+                    let id = r["id"].as_u64().unwrap_or(0);
+                    let title = r["title"].as_str().unwrap_or("");
+                    let author = r["author"]
+                        .as_str()
+                        .and_then(|h| miot_keys::from_hex(h).ok())
+                        .map(|a| self.roster.name_of(&a))
+                        .unwrap_or_else(|| "someone".into());
+                    println!("  {id}  {title}  ({author})");
+                }
+                true
+            }
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("{e}");
+                false
+            }
+        }
+    }
+
     /// The litter roster, then the mesh as seen from the connected node:
     /// who's primary, each peer's term, head and how recently it answered.
     pub async fn print_peers(&mut self) {
@@ -675,7 +717,7 @@ impl Input {
             return;
         }
         let candidates: Vec<String> = if let Some(prefix) = word.strip_prefix('/') {
-            ["/task", "/tasks", "/peers", "/artifact", "/clear", "/keys", "/quit", "/exit"].iter().filter(|c| c[1..].starts_with(prefix)).map(|s| s.to_string()).collect()
+            ["/task", "/tasks", "/peers", "/artifact", "/note", "/notes", "/clear", "/keys", "/quit", "/exit"].iter().filter(|c| c[1..].starts_with(prefix)).map(|s| s.to_string()).collect()
         } else if let Some(prefix) = word.strip_prefix('@') {
             let mut v: Vec<String> = roster.names().filter(|n| n.starts_with(prefix)).map(|n| format!("@{n}")).collect();
             for alias in ["all", "litter", "cats"] {
@@ -808,6 +850,30 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
         ("/artifact", id) if !id.is_empty() => match c.get_json(&format!("/artifact/{id}")).await {
             Ok(a) if a["found"] == true => send(a["body"].as_str().unwrap_or("").to_string()),
             _ => send(format!("  {}", ui::alert(&format!("no artifact for {id} (not closed yet, or no such task)")))),
+        },
+        ("/note", id) if !id.is_empty() => match c.get_json(&format!("/note/{id}")).await {
+            Ok(a) if a["found"] == true => send(a["body"].as_str().unwrap_or("").to_string()),
+            _ => send(format!("  {}", ui::alert(&format!("no note {id}")))),
+        },
+        ("/notes", _) => match c.get_json("/notes").await {
+            Ok(serde_json::Value::Array(rows)) => {
+                let t = rows
+                    .iter()
+                    .map(|r| {
+                        let id = r["id"].as_u64().unwrap_or(0);
+                        let title = r["title"].as_str().unwrap_or("");
+                        let author = r["author"]
+                            .as_str()
+                            .and_then(|h| miot_keys::from_hex(h).ok())
+                            .map(|a| c.roster.name_of(&a))
+                            .unwrap_or_else(|| "someone".into());
+                        format!("  {id}  {title}  ({author})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                send(t);
+            }
+            _ => send(format!("  {}", ui::alert("could not fetch notes"))),
         },
         ("/task", text) if !text.is_empty() => match c.try_submit(RuntimeCall::Litter(pallet_litter::Call::open { text: text.to_string() })).await {
             Ok(()) => send(format!("  {}", ui::ok("✓ task opened"))),

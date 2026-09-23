@@ -26,6 +26,8 @@
 //! | `GET /events?since=N` | everything the chain emitted after cursor `N` |
 //! | `GET /head` | height, litter leader, closed |
 //! | `GET /artifact/{id}` | a closed parent's report |
+//! | `GET /note/{id}`, `GET /notes` | a standalone artifact (no task), and the list of them |
+//! | `GET /artifacts` | task-closed and standalone artifacts, merged into one id-addressed list |
 //! | `GET /tasks` | one row per live task |
 //! | `GET /chain/{head,blocks,checkpoint}` | the block log, for replicas |
 //! | `GET /mesh/status`, `POST /mesh/vote` | election (`miot-mesh`) |
@@ -189,6 +191,9 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
         Effect::Failed { task } => json!({"t":"failed","task":task.to_string()}),
         Effect::Rehomed { task, from, to } => {
             json!({"t":"rehomed","task":task.to_string(),"from":from.as_ref().map(to_hex),"to":to_hex(to)})
+        }
+        Effect::StandaloneArtifact { author, id, title, body } => {
+            json!({"t":"standalone_artifact","author":to_hex(author),"id":id,"title":title,"body":body})
         }
     }
 }
@@ -969,6 +974,9 @@ pub fn router(shared: Shared) -> Router {
         .route("/meta", get(meta))
         .route("/account/{id}", get(account))
         .route("/artifact/{id}", get(artifact))
+        .route("/note/{id}", get(standalone_artifact))
+        .route("/notes", get(standalone_artifacts))
+        .route("/artifacts", get(all_artifacts))
         .route("/tasks", get(tasks))
         .route("/chain/head", get(chain_head))
         .route("/chain/blocks", get(chain_blocks))
@@ -1171,12 +1179,12 @@ struct Since {
 
 async fn head(AxState(n): AxState<Shared>) -> Json<serde_json::Value> {
     let mut n = n.lock().await;
-    let (block, seq) = (n.block, n.seq);
+    let (block, seq, last_checkpoint) = (n.block, n.seq, n.store.last_checkpoint());
     let (leader, closed) = n.ext.execute_with(|| {
         let t = Litter::table();
         (t.leader().map(miot_keys::to_hex), Litter::artifact(TaskId::parent(1)).is_some())
     });
-    Json(serde_json::json!({"block":block,"seq":seq,"leader":leader,"closed":closed}))
+    Json(serde_json::json!({"block":block,"seq":seq,"leader":leader,"closed":closed,"last_checkpoint":last_checkpoint}))
 }
 
 async fn events(AxState(n): AxState<Shared>, Query(q): Query<Since>) -> Json<Vec<Entry>> {
@@ -1309,4 +1317,52 @@ async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>) -> Json<s
         Some(a) => serde_json::json!({"found":true,"title":a.title,"body":a.body,"author":miot_keys::to_hex(&a.author)}),
         None => serde_json::json!({"found":false}),
     })
+}
+
+/// A standalone artifact — [`Effect::StandaloneArtifact`], no task behind it.
+/// `id` is its own counter, never a `TaskId`, so this is a separate route
+/// from `/artifact`.
+async fn standalone_artifact(AxState(n): AxState<Shared>, Path(id): Path<String>) -> Json<serde_json::Value> {
+    let mut n = n.lock().await;
+    let a = id.parse::<u32>().ok().and_then(|id| n.ext.execute_with(|| Litter::standalone_artifact(id)));
+    Json(match a {
+        Some(a) => serde_json::json!({"found":true,"title":a.title,"body":a.body,"author":miot_keys::to_hex(&a.author)}),
+        None => serde_json::json!({"found":false}),
+    })
+}
+
+/// Every standalone artifact, oldest first — title and author only; `GET
+/// /note/{id}` has the body.
+async fn standalone_artifacts(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
+    let mut n = n.lock().await;
+    let rows = n.ext.execute_with(|| {
+        Litter::standalone_artifacts()
+            .iter()
+            .map(|(id, a)| serde_json::json!({"id":id,"title":a.title,"author":miot_keys::to_hex(&a.author),"at":a.at}))
+            .collect::<Vec<_>>()
+    });
+    Json(rows)
+}
+
+/// Every artifact reachable by id, task-closed and standalone alike, merged
+/// into one list — asked for live, 2026-09-23: "task artifacts should be
+/// accessible all the same by id since they are on chain in session." Task
+/// ids are rendered `t<parent>` (already how `/artifact/{id}` addresses
+/// them); standalone ids are their own bare counter, so the two spaces never
+/// collide as long as callers keep the `t` prefix on the task ones —
+/// `ArtifactRead` in `agent.rs` relies on exactly that to route a read to
+/// `/artifact/{id}` or `/note/{id}`.
+async fn all_artifacts(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
+    let mut n = n.lock().await;
+    let rows = n.ext.execute_with(|| {
+        let mut rows: Vec<serde_json::Value> = Litter::artifacts()
+            .iter()
+            .map(|(task, a)| serde_json::json!({"id":task.to_string(),"kind":"task","title":a.title,"author":miot_keys::to_hex(&a.author),"at":a.at}))
+            .collect();
+        rows.extend(Litter::standalone_artifacts().iter().map(|(id, a)| {
+            serde_json::json!({"id":id.to_string(),"kind":"standalone","title":a.title,"author":miot_keys::to_hex(&a.author),"at":a.at})
+        }));
+        rows
+    });
+    Json(rows)
 }

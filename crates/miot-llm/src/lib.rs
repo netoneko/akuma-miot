@@ -162,7 +162,45 @@ pub fn chat_tools() -> Vec<Tool> {
             "required": ["body"]
         }))];
     tools.extend(local_tools());
+    tools.extend(note_tools());
     tools
+}
+
+/// Standalone notes: a markdown artifact with no task behind it, and no
+/// clearance ceremony first. The chain-durable equivalent of "leaving a
+/// sticky note for the litter" — publish one, or read what others left.
+/// Offered everywhere ([`chat_tools`] and [`task_tools`]) because unlike
+/// [`task_tools`]'s other verbs, none of these act on task state, so there is
+/// no wake reason that makes them unsafe to offer.
+fn note_tools() -> Vec<Tool> {
+    vec![
+        Tool::new("Artifact")
+            .with_description(
+                "Publish a standalone artifact to the chain, visible to everyone — markdown, no \
+                 task required and no clearance needed first. NOT the same as TaskUpdate's \
+                 status=artifact, which closes a specific task's own report: use THIS one for a \
+                 finding, a hello, or a report that isn't the result of a task you were assigned.",
+            )
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"text": {"type": "string", "description": "markdown; the first '# ' line becomes its title"}},
+                "required": ["text"]
+            })),
+        Tool::new("ArtifactList")
+            .with_description(
+                "List every artifact that exists right now — a closed task's report (id like \
+                 't1') and every standalone one published with the Artifact tool (a bare id like \
+                 '3') alike, one list, id/title/author each.",
+            )
+            .with_schema(serde_json::json!({"type": "object", "properties": {}})),
+        Tool::new("ArtifactRead")
+            .with_description("Read one artifact's full text by id, exactly as ArtifactList showed it — a task's ('t1') or a standalone one ('3').")
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "string", "description": "the artifact's id, from ArtifactList — keep its 't' prefix if it has one"}},
+                "required": ["id"]
+            })),
+    ]
 }
 
 /// Stubs: local to this cat's own host, no sandbox. A turn is one LLM call
@@ -259,5 +297,6 @@ pub fn task_tools() -> Vec<Tool> {
             })),
     ];
     tools.extend(local_tools());
+    tools.extend(note_tools());
     tools
 }

@@ -1,6 +1,13 @@
 # A local agent session, tied to the current epoch — handoff, 2026-09-23
 
-**Status: OPEN, nothing implemented.** Written for the next agent after a
+**Status: IMPLEMENTED, 2026-09-23.** `docs/PROTOCOL.md`'s "Local session,
+tied to the current epoch" section is the write-up of what actually got
+built (`Session` in `crates/kot/src/agent.rs`) and the answers this doc's
+open questions got. Left below verbatim as the trace that led there — still
+useful context for *why* those answers were picked, but read `PROTOCOL.md`
+first for what's actually running.
+
+Written for the next agent after a
 conversation that traced how the agent loop's "memory" actually works today
 and found it has none beyond one in-process `String`. Kirill's ask, verbatim:
 *"we need a local session that is associated with the current epoch."* This

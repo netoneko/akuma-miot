@@ -767,6 +767,31 @@ fn an_artifact_without_a_heading_still_lands() {
     assert_eq!(t.artifact(p).unwrap().title, "untitled");
 }
 
+#[test]
+fn a_standalone_artifact_needs_no_task_or_clearance() {
+    // A bare table — no leader, no parent opened, nothing planned. The usual
+    // artifact lifecycle couldn't fire here at all; this one doesn't need it
+    // to.
+    let mut t = table();
+    let (id, fx) = t
+        .publish_standalone_artifact(&TAMA, "# hello\n\nfound something.", 7)
+        .unwrap();
+    assert!(fx.iter().any(|e| matches!(e, Effect::StandaloneArtifact { .. })));
+    assert!(t.tasks().is_empty(), "publishing one touches no task state");
+
+    let a = t.standalone_artifact(id).unwrap();
+    assert_eq!(a.title, "hello");
+    assert_eq!(a.body, "# hello\n\nfound something.");
+    assert_eq!(a.author, TAMA);
+    assert_eq!(a.at, 7);
+
+    // Ids are their own counter, never a TaskId's — publishing a second one
+    // does not collide with the first, or with a real task id of "1".
+    let (id2, _) = t.publish_standalone_artifact(&KURO, "# again", 8).unwrap();
+    assert_ne!(id, id2);
+    assert_eq!(t.standalone_artifacts().len(), 2);
+}
+
 // ---- limits and refusal ---------------------------------------------------
 
 /// The machine enforces its own bounds, so the pallet's `BoundedVec` limits
@@ -1175,6 +1200,9 @@ fn replaying_the_effect_log_reproduces_live_state_exactly() {
     let fx = live.update(&LEAD, Authority::Leader, parent, Act::Artifact, "# it works\n\nyes.", 34).unwrap();
     log.extend(fx.into_iter().map(|e| (e, 34)));
 
+    let (note_id, fx) = live.publish_standalone_artifact(&TAMA, "# also, hi", 35).unwrap();
+    log.extend(fx.into_iter().map(|e| (e, 35)));
+
     // A fresh table, fed nothing but the effect log above — no calls to
     // `open`/`plan`/`update`/`tick` at all.
     let mut replayed = table();
@@ -1184,4 +1212,9 @@ fn replaying_the_effect_log_reproduces_live_state_exactly() {
 
     assert_eq!(replayed.tasks(), live.tasks(), "replay must reproduce every task row exactly");
     assert_eq!(replayed.artifact(parent), live.artifact(parent), "including the artifact");
+    assert_eq!(
+        replayed.standalone_artifact(note_id),
+        live.standalone_artifact(note_id),
+        "and a standalone artifact, which lives in its own namespace"
+    );
 }

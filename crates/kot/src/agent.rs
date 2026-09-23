@@ -20,11 +20,65 @@ use miot_keys::Identity;
 use miot_llm::{task_tools, Llm};
 use miot_runtime::{client, AccountId, RuntimeCall};
 use polkadot_sdk::*;
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sp_core::H256;
 use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use crate::common::{parse_task, Roster};
+
+/// This cat's local memory across a process restart — `docs/
+/// AGENT_SESSION_EPOCH.md`. A turn is stateless and the chain is the only
+/// channel between agents, but `question`/`cursor` are still plain Rust
+/// locals today: a restart zeroes them and the cat re-derives both from a
+/// full `/events?since=0` replay, which works only because the `opened`
+/// event it needs usually hasn't aged out of the log yet. This makes that
+/// explicit and correct instead of incidental.
+///
+/// Keyed by `epoch` — `last_checkpoint`, the chain's own name for "how far
+/// back a rewind or compaction can reach." Any change to it, whether from a
+/// routine `/clear` compaction or an actual fork rewind, is treated
+/// uniformly as a session boundary (same rule `clear_all`'s own doc comment
+/// already uses: "a new session, same chain") rather than trying to tell the
+/// two apart — simpler, and always safe, since starting fresh is exactly
+/// what happens today regardless. `seen` is deliberately not part of this:
+/// re-waking on an already-resolved event is a cheap no-op turn, not a redo
+/// worth persisting against.
+#[derive(Debug, Serialize, Deserialize)]
+struct Session {
+    epoch: u64,
+    cursor: u64,
+    question: String,
+}
+
+impl Session {
+    fn path(name: &str) -> PathBuf {
+        let home = std::env::var("HOME").unwrap_or_default();
+        std::path::Path::new(&home).join(".akuma/kot").join(format!("{name}.session.json"))
+    }
+
+    /// Load this cat's saved session if it matches `epoch` — a stale one (the
+    /// chain moved on while this cat was down) is exactly the case that
+    /// should start fresh, not resume against events the log may no longer
+    /// hold.
+    fn load(name: &str, epoch: u64) -> Self {
+        std::fs::read_to_string(Self::path(name))
+            .ok()
+            .and_then(|s| serde_json::from_str::<Session>(&s).ok())
+            .filter(|s| s.epoch == epoch)
+            .unwrap_or(Session { epoch, cursor: 0, question: String::new() })
+    }
+
+    fn save(&self, name: &str) {
+        let path = Self::path(name);
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        if let Ok(s) = serde_json::to_string(self) {
+            let _ = std::fs::write(path, s);
+        }
+    }
+}
 
 /// Appended to every persona. Found live, 2026-09-23: GLM's tool calls were
 /// landing as `WrongKind`/`SubtasksOutstanding`/no-call-at-all often enough
@@ -37,8 +91,13 @@ const AGENT_RULES: &str = "\n\nRules:\n\
 it. Use exactly the id you were given for the action you are taking — never \
 shorten a sub-task id to its parent, and never use a parent id where a \
 sub-task id is asked for.\n\
-- Always respond by calling exactly one of the tools offered. Never reply \
-with plain text alone.";
+- Always respond by calling at least one of the tools offered. Never reply \
+with plain text alone.\n\
+- You may call several tools in the same response — for example Bash then \
+SendMessage, or Artifact then TaskUpdate. Each one runs independently and \
+asynchronously: none of them feed their result back to you, so make every \
+call self-contained rather than depending on what an earlier one in the \
+same response will return.";
 
 pub struct AgentConfig {
     pub name: String,
@@ -279,6 +338,50 @@ impl Cat {
                     Err(e) => println!("  [{}] write {path} failed: {e}", self.name),
                 }
             }
+            // Merged: task-closed and standalone artifacts alike — asked for
+            // live, 2026-09-23, "task artifacts should be accessible all the
+            // same by id since they are on chain in session."
+            "ArtifactList" => match self.http.get(format!("{}/artifacts", self.node)).send().await {
+                Ok(r) => match r.json::<Vec<serde_json::Value>>().await {
+                    Ok(rows) if rows.is_empty() => println!("  [{}] no artifacts yet", self.name),
+                    Ok(rows) => {
+                        let lines: Vec<String> = rows
+                            .iter()
+                            .map(|r| {
+                                let id = r.get("id").and_then(|v| v.as_str()).unwrap_or("?");
+                                let title = r.get("title").and_then(|v| v.as_str()).unwrap_or("");
+                                let author = r
+                                    .get("author")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|h| miot_keys::from_hex(h).ok())
+                                    .map(|a| self.roster.name_of(&a))
+                                    .unwrap_or_else(|| "someone".into());
+                                format!("{id}: {title} ({author})")
+                            })
+                            .collect();
+                        println!("  [{}] artifacts:\n{}", self.name, lines.join("\n"));
+                    }
+                    Err(e) => println!("  [{}] ArtifactList: bad response: {e}", self.name),
+                },
+                Err(e) => println!("  [{}] ArtifactList: node unreachable: {e}", self.name),
+            },
+            // A `t`-prefixed id (as `ArtifactList` renders a task's) is a
+            // closed parent's report; anything else is a standalone id — the
+            // two id spaces never collide as long as that prefix is kept.
+            "ArtifactRead" => {
+                let id = c.str("id").unwrap_or_default();
+                let path = if id.trim_start().starts_with(['t', 'T']) { format!("/artifact/{id}") } else { format!("/note/{id}") };
+                match self.http.get(format!("{}{path}", self.node)).send().await {
+                    Ok(r) => match r.json::<serde_json::Value>().await {
+                        Ok(v) if v.get("found").and_then(|f| f.as_bool()) == Some(true) => {
+                            println!("  [{}] artifact {id}:\n{}", self.name, v.get("body").and_then(|b| b.as_str()).unwrap_or(""));
+                        }
+                        Ok(_) => println!("  [{}] no artifact {id}", self.name),
+                        Err(e) => println!("  [{}] ArtifactRead {id}: bad response: {e}", self.name),
+                    },
+                    Err(e) => println!("  [{}] ArtifactRead {id}: node unreachable: {e}", self.name),
+                }
+            }
             _ => return false,
         }
         true
@@ -329,6 +432,7 @@ impl Cat {
                 RuntimeCall::Litter(pallet_litter::Call::reassign { task: id, to })
             }
             "SendMessage" => RuntimeCall::Litter(pallet_litter::Call::say { to: None, body: c.str("body").unwrap_or_default() }),
+            "Artifact" => RuntimeCall::Litter(pallet_litter::Call::publish_standalone_artifact { text: c.str("text").unwrap_or_default() }),
             _ => return,
         };
         self.submit(call).await;
@@ -350,28 +454,48 @@ pub async fn run(cfg: AgentConfig) {
     let name = cat.name.clone();
     println!("[{name}] id={} node={} llm={}", miot_keys::short(&account), cat.node, cat.llm.label());
 
-    while cat.head().await.is_none() {
-        println!("[{name}] waiting for the node...");
-        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-    }
+    let mut head = loop {
+        match cat.head().await {
+            Some(h) => break h,
+            None => {
+                println!("[{name}] waiting for the node...");
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+    };
     println!("[{name}] connected.");
 
-    let mut cursor = 0u64;
-    let mut question = String::new();
+    let epoch = head["last_checkpoint"].as_u64().unwrap_or(0);
+    let mut session = Session::load(&name, epoch);
+    let mut cursor = session.cursor;
+    let mut question = std::mem::take(&mut session.question);
     let mut seen: HashSet<u64> = HashSet::new();
     let my_hex = miot_keys::to_hex(&account);
 
     loop {
+        head = cat.head().await.unwrap_or(head);
+
         // A node that rebuilt its log (demoted, rewound, adopted a
         // checkpoint) restarts `seq`. A cursor past the new end would go
         // deaf until the log grew back past it, so jump to the new end.
         // Skipping what's there is right: those wakes are old news, and the
         // chain re-issues anything still outstanding on its own.
-        if let Some(seq) = cat.head().await.and_then(|h| h["seq"].as_u64()) {
+        if let Some(seq) = head["seq"].as_u64() {
             if seq < cursor {
                 println!("[{name}] node's log restarted (seq {seq} < cursor {cursor}); resuming from its end");
                 cursor = seq;
                 seen.clear();
+            }
+        }
+        // Any change to the checkpoint — a routine compaction or an actual
+        // fork rewind, treated alike (`docs/AGENT_SESSION_EPOCH.md`) — ends
+        // this session: `question` may name a task the chain no longer
+        // remembers opening.
+        if let Some(ep) = head["last_checkpoint"].as_u64() {
+            if ep != session.epoch {
+                println!("[{name}] chain checkpoint moved ({} -> {ep}); starting a new session", session.epoch);
+                session.epoch = ep;
+                question.clear();
             }
         }
 
@@ -422,13 +546,23 @@ pub async fn run(cfg: AgentConfig) {
                     if turn.calls.is_empty() {
                         println!("[{name}]   no tool call ({} tok) — turn wasted", turn.tokens);
                     }
+                    // Several calls in one turn run concurrently, not one
+                    // after another — none of them feeds a result back for
+                    // the next to react to (`AGENT_RULES`), so there is
+                    // nothing sequencing them.
                     for c in &turn.calls {
                         println!("[{name}]   {} ({} tok, {:.0}s)", c.name, turn.tokens, turn.ms as f64 / 1000.0);
-                        cat.act(c).await;
                     }
+                    futures_util::future::join_all(turn.calls.iter().map(|c| cat.act(c))).await;
                 }
                 Err(e) => println!("[{name}]   llm error: {e}"),
             }
+        }
+
+        if cursor != session.cursor || question != session.question {
+            session.cursor = cursor;
+            session.question = question.clone();
+            session.save(&name);
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;

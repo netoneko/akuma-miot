@@ -5,6 +5,7 @@
 //! kot run --as <name> [--peers ...] [--llm URL | --glm]   node + agent loop
 //! kot task open "<text>" | kot task list
 //! kot artifact <id>
+//! kot note <id> | kot notes                               standalone, no task
 //! kot say "<body>" [--to <name>]
 //! kot clear                                               root only
 //! kot peers                                               roster + mesh
@@ -62,6 +63,10 @@ enum Cmd {
     },
     /// A closed parent's report, as markdown on stdout.
     Artifact { id: String },
+    /// A standalone note's markdown on stdout — no task behind it.
+    Note { id: String },
+    /// Every standalone note: id, title, author.
+    Notes,
     /// Say something to the litter, or one cat.
     Say {
         body: String,
@@ -260,6 +265,14 @@ async fn main() {
             if !connect(&cli).await.print_artifact(id).await {
                 std::process::exit(1);
             }
+        }
+        Some(Cmd::Note { id }) => {
+            if !connect(&cli).await.print_note(id).await {
+                std::process::exit(1);
+            }
+        }
+        Some(Cmd::Notes) => {
+            connect(&cli).await.print_notes().await;
         }
         Some(Cmd::Say { body, to }) => {
             let mut c = connect(&cli).await;

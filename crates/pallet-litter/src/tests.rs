@@ -248,6 +248,22 @@ fn a_parent_runs_from_open_to_artifact_on_chain() {
     });
 }
 
+/// A standalone artifact needs no task at all — not even a genesis leader —
+/// and reads back the same way a task's own artifact does.
+#[test]
+fn a_standalone_artifact_needs_no_leader_or_task() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(Litter::publish_standalone_artifact(RuntimeOrigin::signed(TAMA), "# hi".into()));
+        assert!(effects().iter().any(|e| matches!(e, Effect::StandaloneArtifact { .. })));
+        assert_eq!(Litter::table().len(), 0, "touches no task state");
+
+        let (id, a) = Litter::standalone_artifacts().into_iter().next().unwrap();
+        assert_eq!(a.title, "hi");
+        assert_eq!(a.author, TAMA);
+        assert_eq!(Litter::standalone_artifact(id).unwrap(), a);
+    });
+}
+
 /// GC drops a closed parent's bookkeeping and keeps its artifact, because the
 /// artifact is the durable output the whole lifecycle exists to produce.
 #[test]

@@ -249,6 +249,7 @@ subcommands outside it — and they are the same verbs.
 | `/plan` | show the current plan |
 | `/tasks` | one line per live task: id, status, assignee, lease |
 | `/artifact <id>` | print a closed parent's report |
+| `/note <id>`, `/notes` | print one standalone note (no task), or list them all |
 | `/peers` | the roster, with who is leader |
 | `/obs [on\|off\|tasks\|all]` | §3 |
 | `/history [n]` | §4 |

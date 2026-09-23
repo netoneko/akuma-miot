@@ -107,6 +107,7 @@ into four LLM turns — measured, not assumed (`docs/MAPPING_REPORT.md` §1.1).
 | `set_leader(who)` | Root | `Directed{LeaderElected}` to the new leader |
 | `set_root(who)` | governance/sudo (`ensure_root`) | none — silent storage write, "the key to the cat house" |
 | `clear_all()` | Root | `Failed` for every currently `Open`/`Planned` parent, **plus an immediate `gc(now, keep_for: 0)`** (2026-09-22 — see "GC" below) |
+| `publish_standalone_artifact(text)` | anyone signed | `StandaloneArtifact` — 2026-09-23, `docs/AGENT_SESSION_EPOCH.md`'s session work: a markdown artifact with **no task behind it**. The usual artifact needs a parent and every sub-task `Cleared` first; this one has nothing to authorize against, because there's no task lifecycle it could be mistaken for closing. Keyed by its own `u32` counter (`State::next_standalone_artifact`), never a `TaskId` — read back over `GET /note/{id}` / `GET /notes`, or merged with task artifacts over `GET /artifacts` (`{"id":"t1",...}` vs `{"id":"3",...}`, `kind` distinguishes them). Reuses `Artifact<A>` (title/body/author/at) and `title_from_markdown`, so a listing never has to special-case which kind of artifact it's showing. |
 
 ## Timers and limits (`crates/miot-runtime/src/lib.rs`)
 
@@ -161,13 +162,49 @@ fixed persona-wide capability list:
 
 | Woken by | Tools offered | Why |
 |---|---|---|
-| `Said` (chat) | `SendMessage` only (`chat_tools()`) | A reply to chat is not license to act on tasks |
-| `Assigned`, `Directed`, `Nudge` (task work) | `TaskUpdate`, `TaskPlan`, `TaskReassign` (`task_tools()`) | The full task-lifecycle surface |
+| `Said` (chat) | `SendMessage`, `Bash`/`ReadFile`/`WriteFile`, `Artifact`/`ArtifactList`/`ArtifactRead` (`chat_tools()`) | A reply to chat is not license to act on tasks |
+| `Assigned`, `Directed`, `Nudge` (task work) | `TaskUpdate`, `TaskPlan`, `TaskReassign`, `Bash`/`ReadFile`/`WriteFile`, `Artifact`/`ArtifactList`/`ArtifactRead` (`task_tools()`) | The full task-lifecycle surface |
 
 This means an agent asked "what tools do you have?" mid-chat will honestly
-answer "just `SendMessage`" — confirmed live, 2026-09-22 (kuro answered
-exactly this) — and that's correct behavior, not a bug or a lie: it reflects
-the actual `tools` array passed to that specific turn.
+answer "just `SendMessage`" (plus the local/artifact tools) — confirmed live,
+2026-09-22 (kuro answered exactly this, before the artifact tools existed) —
+and that's correct behavior, not a bug or a lie: it reflects the actual
+`tools` array passed to that specific turn.
+
+**`Artifact`/`ArtifactList`/`ArtifactRead` are offered in both tiers**,
+2026-09-23 — unlike `TaskUpdate`/`TaskPlan`/`TaskReassign`, none of them act
+on task state, so there's no wake reason that makes them unsafe to hand out.
+`Artifact` publishes a standalone one (`publish_standalone_artifact`, no task
+required); `ArtifactList`/`ArtifactRead` see both kinds, task-closed and
+standalone, merged by id (`GET /artifacts`). A turn may call several tools at
+once — `agent.rs`'s persona rules say so explicitly, and `Cat::act` runs
+them concurrently, not one after another, since none of them feed a result
+back for a later one in the same turn to react to.
+
+## Local session, tied to the current epoch (`Session`, `crates/kot/src/agent.rs`)
+
+A cat's `question`/`cursor` used to be plain Rust locals in `Cat::run`'s
+loop — zeroed by a process restart, recovered only by luck (replaying
+`/events?since=0` usually still finds the `opened` event that set
+`question`, but nothing guaranteed it). `docs/AGENT_SESSION_EPOCH.md` traced
+this and left the design open; implemented 2026-09-23:
+
+- Persisted at `~/.akuma/kot/<name>.session.json` (JSON: `epoch`, `cursor`,
+  `question`), written whenever either value changes.
+- **`epoch` is `last_checkpoint`** (`GET /head`'s field of the same name,
+  `Store::last_checkpoint`) — the chain's own name for "how far back a
+  rewind or compaction can reach." On load, a saved session is trusted only
+  if its `epoch` still matches the node's current one; a mismatch starts
+  fresh (`cursor: 0, question: ""`), same as today's fallback.
+- **Any change to the checkpoint ends the session** — a routine `/clear`
+  compaction and an actual fork rewind are treated alike, deliberately not
+  told apart: `clear_all`'s own doc comment already calls this "a new
+  session, same chain," and telling the two apart would only complicate the
+  rule without changing what a cat should do (start over; `question` may
+  name a task the chain no longer remembers opening).
+- `seen` (the wake-dedup set) is **not** persisted — re-waking on an
+  already-resolved event is a cheap no-op turn, not a redo worth carrying
+  across a restart.
 
 ## Addressing (`@name`, client-side only)
 

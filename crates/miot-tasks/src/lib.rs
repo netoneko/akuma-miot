@@ -108,8 +108,14 @@ impl<A> Task<A> {
 pub struct State<A> {
     pub tasks: Vec<Task<A>>,
     pub artifacts: Vec<(TaskId, Artifact<A>)>,
+    /// Standalone artifacts — [`Effect::StandaloneArtifact`], keyed by their
+    /// own counter, never a [`TaskId`]. One has no task behind it, so it
+    /// lives in its own namespace rather than borrowing the parent one.
+    pub standalone_artifacts: Vec<(u32, Artifact<A>)>,
     /// Parent ids are never reused, even after GC drops the rows.
     pub next_parent: u32,
+    /// Standalone artifact ids are never reused either, same reason.
+    pub next_standalone_artifact: u32,
     pub leader: Option<A>,
     pub root: Option<A>,
 }
@@ -119,21 +125,26 @@ impl<A> Default for State<A> {
         State {
             tasks: Vec::new(),
             artifacts: Vec::new(),
+            standalone_artifacts: Vec::new(),
             // Ids start at 1 so `TaskId::default()` — all zeroes — is never a
             // real task. `set_leader` uses it as the "no task" address.
             next_parent: 1,
+            next_standalone_artifact: 1,
             leader: None,
             root: None,
         }
     }
 }
 
-/// The table. Owns every task and every committed artifact.
+/// The table. Owns every task, every committed artifact, and every
+/// standalone artifact.
 #[derive(Debug, Clone)]
 pub struct TaskTable<A> {
     tasks: Vec<Task<A>>,
     artifacts: Vec<(TaskId, Artifact<A>)>,
+    standalone_artifacts: Vec<(u32, Artifact<A>)>,
     next_parent: u32,
+    next_standalone_artifact: u32,
     leader: Option<A>,
     /// The operator account. In the roster so it can send, but there is no
     /// agent loop behind it, so it is never assignable.
@@ -146,7 +157,9 @@ impl<A: Clone + Eq> TaskTable<A> {
         TaskTable {
             tasks: Vec::new(),
             artifacts: Vec::new(),
+            standalone_artifacts: Vec::new(),
             next_parent: 1,
+            next_standalone_artifact: 1,
             leader: None,
             root,
             cfg,
@@ -163,7 +176,9 @@ impl<A: Clone + Eq> TaskTable<A> {
         TaskTable {
             tasks: state.tasks,
             artifacts: state.artifacts,
+            standalone_artifacts: state.standalone_artifacts,
             next_parent: state.next_parent,
+            next_standalone_artifact: state.next_standalone_artifact,
             leader: state.leader,
             root: state.root,
             cfg,
@@ -175,7 +190,9 @@ impl<A: Clone + Eq> TaskTable<A> {
         State {
             tasks: self.tasks,
             artifacts: self.artifacts,
+            standalone_artifacts: self.standalone_artifacts,
             next_parent: self.next_parent,
+            next_standalone_artifact: self.next_standalone_artifact,
             leader: self.leader,
             root: self.root,
         }
@@ -233,6 +250,20 @@ impl<A: Clone + Eq> TaskTable<A> {
 
     pub fn tasks(&self) -> &[Task<A>] {
         &self.tasks
+    }
+
+    /// Every closed parent's artifact, oldest first.
+    pub fn artifacts(&self) -> &[(TaskId, Artifact<A>)] {
+        &self.artifacts
+    }
+
+    pub fn standalone_artifact(&self, id: u32) -> Option<&Artifact<A>> {
+        self.standalone_artifacts.iter().find(|(i, _)| *i == id).map(|(_, a)| a)
+    }
+
+    /// Every standalone artifact, oldest first.
+    pub fn standalone_artifacts(&self) -> &[(u32, Artifact<A>)] {
+        &self.standalone_artifacts
     }
 
     /// Fold one effect into state — the **only** place `tasks`, `artifacts`,
@@ -465,6 +496,13 @@ impl<A: Clone + Eq> TaskTable<A> {
             }
             // Chat. Never touches task state.
             Effect::Said { .. } => {}
+            Effect::StandaloneArtifact { author, id, title, body } => {
+                self.next_standalone_artifact = self.next_standalone_artifact.max(*id + 1);
+                self.standalone_artifacts.push((
+                    *id,
+                    Artifact { title: title.clone(), body: body.clone(), author: author.clone(), at: now },
+                ));
+            }
         }
     }
 
@@ -589,6 +627,31 @@ impl<A: Clone + Eq> TaskTable<A> {
         // verb routes through it uniformly so there is exactly one place
         // that ever decides otherwise.
         Ok(effects)
+    }
+
+    /// Publish a standalone artifact: markdown with no task behind it.
+    ///
+    /// The usual artifact lifecycle needs a parent and every sub-task cleared
+    /// before it fires — real ceremony to leave one cat's one-off finding on
+    /// chain for the others to read. Anyone may publish one, same as `say`;
+    /// unlike a task's artifact there is nothing to authorize against,
+    /// because there is no task whose closing this could be mistaken for.
+    pub fn publish_standalone_artifact(&mut self, who: &A, body: &str, now: BlockNumber) -> Result<(u32, Vec<Effect<A>>), Error> {
+        if body.len() > self.cfg.limits.max_artifact {
+            return Err(Error::TooLong);
+        }
+        let id = self.next_standalone_artifact;
+        let title = title_from_markdown(body, self.cfg.limits.max_title);
+        let effects = alloc::vec![Effect::StandaloneArtifact {
+            author: who.clone(),
+            id,
+            title,
+            body: body.to_string(),
+        }];
+        for e in &effects {
+            self.apply(e, now);
+        }
+        Ok((id, effects))
     }
 
     /// Fail every currently open parent (`Open` or `Planned`) at once.
