@@ -390,6 +390,15 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
   is an HTTP client and server at once, which is the one combination that
   has never stayed up on that kernel. Unconfirmed hypothesis, not
   root-caused. `../akuma` territory. See `docs/TOPOLOGY_TARGET.md`.
+  **Did not reproduce, 2026-09-23**: `dumpster-akuma-amd64` (meow) was
+  redeployed and brought back up as a replica — joined the mesh (term
+  25, synced head), stayed reachable, and its agent loop ran multiple real
+  turns (`Bash` → `uname -a`, `SendMessage`, both together in one turn) over
+  several minutes with no wedge. One clean run doesn't root-cause or fix the
+  intermittent kernel-level issue above — it's still not explained — so
+  don't read this as "closed," just as evidence it isn't 100% reproducible
+  every boot. Re-added to `deploy.sh`'s `LIVE` array on the strength of this
+  run; watch for a recurrence before trusting it unattended.
 - **ParityDB on aarch64 Akuma (`akuma-guest`): fixed 2026-09-22, in
   `../akuma`.** Two aarch64-only kernel bugs, found by running `kot` there:
   (a) no `fadvise64` arm in the aarch64 dispatcher, so reopen failed with

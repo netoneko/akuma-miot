@@ -46,9 +46,12 @@ AGENTS=(
   "ryzen-akuma-amd64|fcguest|ryzen|x86_64|sora|http://192.168.1.49:8082|qwen3-4b"
   "mac-akuma-aarch64|fcguest|fc|aarch64|mimi|http://192.168.5.2:8084|qwen3:4b"
 )
-# dumpster-akuma-amd64 is out while its replica wedge is chased (HANDOFF traps);
+# dumpster-akuma-amd64's replica wedge (HANDOFF traps) did not reproduce on a
+# fresh redeploy, 2026-09-23 — stayed up as a replica for several minutes,
+# agent loop ran real turns. Not root-caused, not proven fixed, just back in
+# rotation on the strength of that run; watch for a recurrence.
 # mac-akuma-aarch64 runs the same role on aarch64 Akuma to see if it wedges too.
-LIVE=(ryzen-linux-amd64 mac-linux-aarch64 mac-akuma-aarch64 ryzen-akuma-amd64)
+LIVE=(dumpster-akuma-amd64 ryzen-linux-amd64 mac-linux-aarch64 mac-akuma-aarch64 ryzen-akuma-amd64)
 
 # llama-server per agent, never ollama: its own process, its own port, its
 # thread count pinned, so an agent's turns get a known slice of the box and
