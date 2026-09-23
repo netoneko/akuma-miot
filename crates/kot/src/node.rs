@@ -29,6 +29,7 @@
 //! | `GET /note/{id}`, `GET /notes` | a standalone artifact (no task), and the list of them |
 //! | `GET /artifacts` | task-closed and standalone artifacts, merged into one id-addressed list |
 //! | `GET /tasks` | one row per live task |
+//! | `GET /stats` | every cat's latest self-reported work stats (`report_stats`) |
 //! | `GET /chain/{head,blocks,checkpoint}` | the block log, for replicas |
 //! | `GET /mesh/status`, `POST /mesh/vote` | election (`miot-mesh`) |
 //! | `GET /mesh/peers` | what this node sees of the mesh — `kot peers` |
@@ -164,8 +165,8 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
     use miot_keys::to_hex;
     use serde_json::json;
     match e {
-        Effect::Said { from, to, body, from_root } => {
-            json!({"t":"said","from":to_hex(from),"to":to.as_ref().map(to_hex),"body":body,"root":from_root})
+        Effect::Said { from, to, body, from_root, no_ack, off_record } => {
+            json!({"t":"said","from":to_hex(from),"to":to.as_ref().map(to_hex),"body":body,"root":from_root,"no_ack":no_ack,"off_record":off_record})
         }
         Effect::Opened { who, task, text } => json!({"t":"opened","who":to_hex(who),"task":task.to_string(),"text":text}),
         Effect::Planned { who, task, count } => json!({"t":"planned","who":to_hex(who),"task":task.to_string(),"count":count}),
@@ -194,6 +195,9 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
         }
         Effect::StandaloneArtifact { author, id, title, body } => {
             json!({"t":"standalone_artifact","author":to_hex(author),"id":id,"title":title,"body":body})
+        }
+        Effect::StatsReported { who, turns, tool_calls, tokens, ms } => {
+            json!({"t":"stats_reported","who":to_hex(who),"turns":turns,"tool_calls":tool_calls,"tokens":tokens,"ms":ms})
         }
     }
 }
@@ -355,7 +359,14 @@ impl Node {
                 self.log.pop_front();
             }
             self.log.push_back(entry);
-            self.pending.push(e);
+            // An off-the-record `Said` still fans out live (the entry
+            // above) but never joins `self.pending` — the Vec `persist()`
+            // encodes as the block body — so it never reaches
+            // `Store::append` and cannot come back on replay, rewind, or a
+            // peer that pulls the block later instead of tailing it live.
+            if !matches!(&e, Effect::Said { off_record: true, .. }) {
+                self.pending.push(e);
+            }
         }
     }
 
@@ -989,6 +1000,7 @@ pub fn router(shared: Shared) -> Router {
         .route("/note/{id}", get(standalone_artifact))
         .route("/notes", get(standalone_artifacts))
         .route("/artifacts", get(all_artifacts))
+        .route("/stats", get(all_stats))
         .route("/tasks", get(tasks))
         .route("/chain/head", get(chain_head))
         .route("/chain/blocks", get(chain_blocks))
@@ -1375,6 +1387,21 @@ async fn all_artifacts(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Valu
             serde_json::json!({"id":id.to_string(),"kind":"standalone","title":a.title,"author":miot_keys::to_hex(&a.author),"at":a.at})
         }));
         rows
+    });
+    Json(rows)
+}
+
+/// Every cat's latest self-reported work stats — `report_stats`, no
+/// authority check beyond `ensure_signed` (a cat can only overwrite its
+/// own row), so this is a straight dump of whatever every account most
+/// recently reported about itself.
+async fn all_stats(AxState(n): AxState<Shared>) -> Json<Vec<serde_json::Value>> {
+    let mut n = n.lock().await;
+    let rows = n.ext.execute_with(|| {
+        Litter::all_stats()
+            .iter()
+            .map(|(who, s)| serde_json::json!({"account":miot_keys::to_hex(who),"turns":s.turns,"tool_calls":s.tool_calls,"tokens":s.tokens,"ms":s.ms}))
+            .collect::<Vec<_>>()
     });
     Json(rows)
 }

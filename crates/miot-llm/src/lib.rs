@@ -239,7 +239,20 @@ pub fn send_message_tool() -> Tool {
             "properties": {
                 "to": {"type": "string",
                        "description": "a cat's name, or 'litter' for everyone"},
-                "body": {"type": "string"}
+                "body": {"type": "string"},
+                "no_ack": {"type": "boolean",
+                           "description": "true if this is a closing remark or acknowledgment \
+                                            that doesn't itself need a reply — set it on your \
+                                            own closing messages to stop a back-and-forth from \
+                                            looping forever. Defaults to false."},
+                "off_record": {"type": "boolean",
+                                "description": "true to keep this message out of the chain's \
+                                                 block log entirely — it still reaches whoever \
+                                                 it's addressed to live, it just never gets \
+                                                 committed. If you were woken by a message marked \
+                                                 off_record, set this to true on your reply too, \
+                                                 or your reply commits even though the message you're \
+                                                 answering never did. Defaults to false."}
             },
             "required": ["body"]
         }))
@@ -303,6 +316,13 @@ fn note_tools() -> Vec<Tool> {
                 "Who else is in this litter, by name, and which of them is the mesh's current \
                  primary (the node that actually seals blocks — separate from the litter's \
                  planning leader).",
+            )
+            .with_schema(serde_json::json!({"type": "object", "properties": {}})),
+        Tool::new("Stats")
+            .with_description(
+                "Everyone's latest self-reported work stats this session — turns taken, tool \
+                 calls made, tokens spent, milliseconds spent thinking — by name, yours \
+                 included.",
             )
             .with_schema(serde_json::json!({"type": "object", "properties": {}})),
     ]

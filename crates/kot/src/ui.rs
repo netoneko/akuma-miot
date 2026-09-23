@@ -570,11 +570,14 @@ pub fn mesh(text: String) -> String {
 
 /// A cat speaking: the small Akuma shaded from the sender's colour down
 /// into haze, header on its first row, the message flowing beside it.
-pub fn said(time: &str, block: u64, from: &str, to: &str, body: &str, roster: &Roster) -> String {
+/// `off_record`: this one was never written to the block log — see
+/// `Effect::Said`'s doc comment.
+pub fn said(time: &str, block: u64, from: &str, to: &str, body: &str, roster: &Roster, off_record: bool) -> String {
     let art: Vec<&str> = AVATAR.lines().collect();
     let c = cat(from);
     let arrow = if to == "litter" { dim("· to the litter") } else { format!("{} {}", dim("→"), who(to)) };
-    let head = format!("{} {arrow}   {}", sealed(from), stamp(time, block).trim_start());
+    let otr = if off_record { format!("  {}", dim("· off the record")) } else { String::new() };
+    let head = format!("{} {arrow}{otr}   {}", sealed(from), stamp(time, block).trim_start());
     let mut rows: Vec<String> = vec![head];
     let width = term_width().saturating_sub(2 + 20 + 2 + 1).max(20);
     rows.extend(wrap(body, width).into_iter().map(|l| tags(&l, roster)));
@@ -616,9 +619,11 @@ pub fn typed(me: &str, target: Option<&str>, line: &str, roster: &Roster) -> Str
         .join("\n")
 }
 
-/// Your own line: the echo, then the chain's word that it was sealed.
-pub fn me(time: &str, block: u64, me: &str, to: &str, body: &str, roster: &Roster) -> String {
-    format!("{}\n{}", typed(me, Some(to), body, roster), obs(time, block, paint(theme().progress, "✓ sealed")))
+/// Your own line: the echo, then the chain's word that it was sealed — or,
+/// for `off_record`, the word that it deliberately wasn't.
+pub fn me(time: &str, block: u64, me: &str, to: &str, body: &str, roster: &Roster, off_record: bool) -> String {
+    let note = if off_record { "↝ off the record — not sealed" } else { "✓ sealed" };
+    format!("{}\n{}", typed(me, Some(to), body, roster), obs(time, block, paint(theme().progress, note)))
 }
 
 // ── keys ────────────────────────────────────────────────────────────────
@@ -756,10 +761,11 @@ pub fn render(time: &str, block: u64, eff: &serde_json::Value, roster: &Roster, 
         "said" => {
             let from = name_of(eff, "from", roster);
             let to = if eff["to"].is_null() { "litter".to_string() } else { name_of(eff, "to", roster) };
+            let off_record = eff["off_record"].as_bool().unwrap_or(false);
             if from == me_name {
-                me(time, block, me_name, &to, &text("body"), roster)
+                me(time, block, me_name, &to, &text("body"), roster, off_record)
             } else {
-                said(time, block, &from, &to, &text("body"), roster)
+                said(time, block, &from, &to, &text("body"), roster, off_record)
             }
         }
         "opened" => obs(time, block, format!("{} opened {}: {}", who(&name_of(eff, "who", roster)), task_id(), plain(&text("text")))),

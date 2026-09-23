@@ -244,6 +244,7 @@ fn demo() {
             "Yes. rewind_for_fork truncates back to the last compaction and re-pulls from the new primary; \
              a block only the dead primary held is gone. Records, not work — the cat re-submits. There is no commit index.",
             r,
+            false,
         )
     );
     println!(
@@ -262,7 +263,7 @@ fn demo() {
 
     println!();
     println!("{}", ui::mesh(format!("leader {} · term {} · {} alive", ui::who("meow"), ui::plain("12"), ui::plain("5/5"))));
-    println!("{}", ui::me("21:47 (+1m09s)", 1185, "root", "litter", "nice. @kuro what was the unhandled case?", r));
+    println!("{}", ui::me("21:47 (+1m09s)", 1185, "root", "litter", "nice. @kuro what was the unhandled case?", r, false));
     println!("{}", ui::obs("21:47 (+2s)", 1186, format!("{} directed on {}: {}", ui::who("kuro"), ui::task("t7.2"), ui::directed("ArtifactNeeded"))));
     println!(
         "{}",
@@ -274,6 +275,7 @@ fn demo() {
             "A node that rebuilt its log after an adopted checkpoint hands out seq starting at 0 again — the agent loop \
              handles the plain rewind but not that one. Writing it up as the artifact now, @tama you may want to read it.",
             r,
+            true,
         )
     );
     println!("{}", ui::obs("21:48 (+41s)", 1188, format!("{} {} {} {}", ui::who("sora"), ui::nudged(), ui::task("t7.2"), ui::dim("(2 left)"))));

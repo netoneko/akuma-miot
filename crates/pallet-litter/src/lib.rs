@@ -349,15 +349,21 @@ pub mod pallet {
         ///
         /// The operator's way in. A litter that can only exchange task
         /// transitions cannot be asked anything.
+        ///
+        /// `off_record`: the sender's own signal that this one must never be
+        /// written into the block log — see `Effect::Said`'s doc comment for
+        /// exactly what that does and doesn't buy.
         #[pallet::call_index(6)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn say(
             origin: OriginFor<T>,
             to: Option<T::AccountId>,
             body: String,
+            no_ack: bool,
+            off_record: bool,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            Self::apply(|t, auth, _now| t.say(&who, auth, to.clone(), &body), &who)
+            Self::apply(|t, auth, _now| t.say(&who, auth, to.clone(), &body, no_ack, off_record), &who)
         }
 
         /// Fail every open parent at once. Operator only — a session
@@ -442,11 +448,21 @@ pub mod pallet {
         /// `ensure_signed`, same as everywhere else here: a cat can only
         /// ever overwrite its *own* record, never claim to be reporting
         /// for another account.
+        ///
+        /// Deposits an `Effect` for the same reason every other write here
+        /// does — the primary applies this write directly (below), but a
+        /// replica only ever learns about a state change by replaying the
+        /// effect log (`Node::apply_block` → `Self::replay_effect`), never
+        /// by re-running the original extrinsic. Found live 2026-09-23: an
+        /// earlier version wrote straight to storage with no effect, and
+        /// `GET /stats` came back correct on the primary, permanently
+        /// empty on every replica.
         #[pallet::call_index(10)]
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn report_stats(origin: OriginFor<T>, turns: u32, tool_calls: u32, tokens: u64, ms: u64) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            Stats::<T>::insert(who, CatStats { turns, tool_calls, tokens, ms });
+            Stats::<T>::insert(who.clone(), CatStats { turns, tool_calls, tokens, ms });
+            Self::deposit_event(Event::Happened(Effect::StatsReported { who, turns, tool_calls, tokens, ms }));
             Ok(())
         }
     }
@@ -502,6 +518,14 @@ pub mod pallet {
             Self::table().artifacts().to_vec()
         }
 
+        /// Every account that has ever called `report_stats`, and its
+        /// latest report — for `GET /stats`. `StorageMap` has no built-in
+        /// "list everything," hence the iteration here rather than a
+        /// single storage read.
+        pub fn all_stats() -> Vec<(T::AccountId, CatStats)> {
+            Stats::<T>::iter().collect()
+        }
+
         /// Fold a previously-emitted effect into storage — the replay path,
         /// not a new occurrence. Deliberately bypasses `deposit_event`: this
         /// effect already happened and was already told to the litter once,
@@ -510,6 +534,13 @@ pub mod pallet {
         /// telling clients about replayed history via its own `/events` log
         /// instead — see `docs/PROTOCOL.md` and `HANDOFF.md` item 2.
         pub fn replay_effect(effect: &Effect<T::AccountId>, now: BlockNumber) {
+            // `Stats` lives outside `Litter`/`TaskTable` entirely — fold it
+            // directly rather than through `table.apply`, which only knows
+            // about `miot_tasks::State`.
+            if let Effect::StatsReported { who, turns, tool_calls, tokens, ms } = effect {
+                Stats::<T>::insert(who.clone(), CatStats { turns: *turns, tool_calls: *tool_calls, tokens: *tokens, ms: *ms });
+                return;
+            }
             let mut table = Self::table();
             table.apply(effect, now);
             Litter::<T>::put(table.into_state());

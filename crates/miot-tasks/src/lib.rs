@@ -503,6 +503,11 @@ impl<A: Clone + Eq> TaskTable<A> {
                     Artifact { title: title.clone(), body: body.clone(), author: author.clone(), at: now },
                 ));
             }
+            // Lives in `pallet-litter`'s own `Stats` storage, not here —
+            // `Pallet::replay_effect` special-cases this variant before it
+            // ever reaches `TaskTable::apply`, so this arm never actually
+            // runs; it exists only because the match must be exhaustive.
+            Effect::StatsReported { .. } => {}
         }
     }
 
@@ -613,6 +618,8 @@ impl<A: Clone + Eq> TaskTable<A> {
         auth: Authority,
         to: Option<A>,
         body: &str,
+        no_ack: bool,
+        off_record: bool,
     ) -> Result<Vec<Effect<A>>, Error> {
         if body.len() > self.cfg.limits.max_message {
             return Err(Error::TooLong);
@@ -622,6 +629,8 @@ impl<A: Clone + Eq> TaskTable<A> {
             to,
             body: body.to_string(),
             from_root: auth == Authority::Root,
+            no_ack,
+            off_record,
         }];
         // `apply(Said)` is a no-op — chat touches no task state — but every
         // verb routes through it uniformly so there is exactly one place

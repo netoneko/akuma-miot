@@ -92,7 +92,10 @@ it. Use exactly the id you were given for the action you are taking — never \
 shorten a sub-task id to its parent, and never use a parent id where a \
 sub-task id is asked for.\n\
 - Always respond by calling at least one of the tools offered. Never reply \
-with plain text alone.\n\
+with plain text alone. The one exception: a message that tells you it \
+doesn't need a reply (no_ack) — there, calling nothing is the correct \
+response, not a rule violation. Don't manufacture a reply just to have said \
+something.\n\
 - You may call several tools in the same response — for example Bash then \
 SendMessage, or Artifact then TaskUpdate. Each one runs independently and \
 asynchronously: none of them feed their result back to you, so make every \
@@ -137,9 +140,34 @@ struct Cat {
     // duplicate nonce, only a distinct one that arrived out of order).
     meta: tokio::sync::OnceCell<client::Meta>,
     nonce: tokio::sync::Mutex<Option<u32>>,
+    /// This cat's own cumulative work stats — updated after every turn,
+    /// reported on chain (`report_stats`) the same way, so any cat's
+    /// `Stats` tool call and the operator's `GET /stats` both see it.
+    stats: tokio::sync::Mutex<CatStats>,
 }
 
+#[derive(Default, Clone, Copy)]
+struct CatStats {
+    turns: u32,
+    tool_calls: u32,
+    tokens: u64,
+    ms: u64,
+}
+
+/// A one-shot read worth retrying: unlike `head`/`events` (below), nothing
+/// else re-issues these before the turn that needed them uses whatever
+/// they returned, so a transient blip here isn't self-healing the way the
+/// main poll loop's next tick is.
+const READ_ATTEMPTS: u32 = 3;
+const READ_RETRY_MS: u64 = 500;
+
 impl Cat {
+    // `head`/`events` are polled every ~700ms by `run`'s own loop
+    // regardless of outcome — that loop *is* their retry, on a shorter
+    // cadence than anything added here would be, so failing fast and
+    // letting the next tick paper over a blip is correct, not an
+    // oversight. Retrying inside these would only add latency nothing
+    // downstream is waiting on.
     async fn head(&self) -> Option<serde_json::Value> {
         self.http.get(format!("{}/head", self.node)).send().await.ok()?.json().await.ok()
     }
@@ -153,11 +181,25 @@ impl Cat {
         }
     }
 
+    /// Used once per turn to build a `ClearanceNeeded` prompt — no outer
+    /// loop re-issues this before that prompt goes out, so a blip here
+    /// silently produces "(none outstanding)" instead of the real list.
     async fn tasks(&self) -> Vec<serde_json::Value> {
-        match self.http.get(format!("{}/tasks", self.node)).send().await {
-            Ok(r) => r.json().await.unwrap_or_default(),
-            Err(_) => Vec::new(),
+        for attempt in 0..READ_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(READ_RETRY_MS)).await;
+            }
+            match self.http.get(format!("{}/tasks", self.node)).send().await {
+                Ok(r) => match r.json().await {
+                    Ok(v) => return v,
+                    Err(_) if attempt + 1 < READ_ATTEMPTS => continue,
+                    Err(_) => return Vec::new(),
+                },
+                Err(_) if attempt + 1 < READ_ATTEMPTS => continue,
+                Err(_) => return Vec::new(),
+            }
         }
+        Vec::new()
     }
 
     async fn fetch_meta(&self) -> Option<client::Meta> {
@@ -178,56 +220,80 @@ impl Cat {
         }
     }
 
-    /// Sign `call` and submit it.
+    /// Sign `call` and submit it, retrying a transient failure instead of
+    /// dropping it — found live 2026-09-23 (`docs/LOCAL_SIM.md`): the old
+    /// version made exactly one attempt, and the wake that produced `call`
+    /// was already marked seen before that attempt happened, so a single
+    /// dropped connection meant the action was gone for good, silently.
     ///
     /// `meta` is fetched once, ever, and cached — nothing on this chain
     /// ever changes it. `nonce` is read from the node once, then tracked
     /// locally and incremented under a lock before the next call can read
     /// it: this cat is the only signer for its own account, so it is
-    /// already the authority on what its next nonce is, and asking the
-    /// node again every time was the actual bug, not just an extra round
-    /// trip — two calls in the same turn (`agent::run`'s `join_all`) used
-    /// to both read the current nonce before either had applied, both sign
-    /// it, and the second lose to `Invalid(Stale)` no matter what order it
-    /// reached the node in. On any failure the cached nonce is dropped so
-    /// the next attempt resyncs from the chain — cheap, and correct after
-    /// a rewind or a restart this cat didn't cause.
+    /// already the authority on what its next nonce is. On any failure the
+    /// cached nonce is dropped so the *next* attempt (retry or otherwise)
+    /// resyncs from the chain — cheap, and correct after a rewind, a
+    /// restart, or a nonce race this cat didn't cause.
+    ///
+    /// Not every failure is worth retrying: a node-unreachable error or a
+    /// `Stale`/`Future` nonce might succeed next time (the node came back,
+    /// or the nonce cache just resynced), but a business-logic refusal
+    /// (`NotAuthorized`, `WrongKind`, `NoSuchTask`, ...) will fail
+    /// identically every time — retrying it would just spend wall clock
+    /// confirming what the first attempt already proved.
     async fn submit(&self, call: RuntimeCall) -> bool {
-        let meta = match self.meta.get() {
-            Some(m) => *m,
-            None => {
-                let Some(m) = self.fetch_meta().await else {
-                    println!("  [{}] node unreachable (meta)", self.name);
-                    return false;
-                };
-                // A concurrent call may have already set it — same chain,
-                // same value either way, so losing the race here is fine.
-                let _ = self.meta.set(m);
-                m
+        const ATTEMPTS: u32 = 4;
+        const BACKOFF_MS: [u64; 3] = [1000, 2000, 4000];
+
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt as usize - 1])).await;
+                println!("  [{}] retrying submit (attempt {}/{ATTEMPTS})", self.name, attempt + 1);
             }
-        };
-        let mut guard = self.nonce.lock().await;
-        let nonce = match *guard {
-            Some(n) => n,
-            None => self.fetch_nonce().await,
-        };
-        *guard = Some(nonce + 1);
-        drop(guard);
-        let uxt = client::sign(&self.identity, call, nonce, &meta);
-        match self.http.post(format!("{}/submit", self.node)).body(uxt.encode()).send().await {
-            Ok(r) if r.status().is_success() => true,
-            Ok(r) => {
-                *self.nonce.lock().await = None;
-                let e: serde_json::Value = r.json().await.unwrap_or_default();
-                println!("  [{}] refused: {}", self.name, e.get("error").unwrap_or(&e));
-                false
-            }
-            Err(e) => {
-                *self.nonce.lock().await = None;
-                println!("  [{}] node unreachable: {e}", self.name);
-                false
+
+            let meta = match self.meta.get() {
+                Some(m) => *m,
+                None => match self.fetch_meta().await {
+                    Some(m) => {
+                        // A concurrent call may have already set it — same
+                        // chain, same value either way, so losing the race
+                        // here is fine.
+                        let _ = self.meta.set(m);
+                        m
+                    }
+                    None => {
+                        println!("  [{}] node unreachable (meta)", self.name);
+                        continue;
+                    }
+                },
+            };
+            let mut guard = self.nonce.lock().await;
+            let nonce = match *guard {
+                Some(n) => n,
+                None => self.fetch_nonce().await,
+            };
+            *guard = Some(nonce + 1);
+            drop(guard);
+            let uxt = client::sign(&self.identity, call.clone(), nonce, &meta);
+            match self.http.post(format!("{}/submit", self.node)).body(uxt.encode()).send().await {
+                Ok(r) if r.status().is_success() => return true,
+                Ok(r) => {
+                    *self.nonce.lock().await = None;
+                    let e: serde_json::Value = r.json().await.unwrap_or_default();
+                    let msg = e.get("error").unwrap_or(&e).to_string();
+                    println!("  [{}] refused: {msg}", self.name);
+                    if !(msg.contains("Stale") || msg.contains("Future")) {
+                        return false;
+                    }
+                }
+                Err(e) => {
+                    *self.nonce.lock().await = None;
+                    println!("  [{}] node unreachable: {e}", self.name);
+                }
             }
         }
+        println!("  [{}] submit gave up after {ATTEMPTS} attempts", self.name);
+        false
     }
 
     /// Build the prompt for one woken event. The parent question is carried
@@ -341,10 +407,55 @@ impl Cat {
                 // already loaded locally; there was never a reason to make
                 // the model guess it.
                 let others: Vec<&str> = self.roster.names().filter(|n| *n != self.name.as_str()).collect();
+                // A broadcast (no `to`) now wakes every live cat, not just
+                // the one addressed (`Effect::wakes`, `Node::absorb`'s `"*"`
+                // sentinel) — say so, so a cat woken by something meant for
+                // the group doesn't feel obliged to manufacture a full
+                // reply. Two sentences was always a ceiling, not a quota;
+                // this makes the floor explicit too.
+                let addressed = e.effect.get("to").map(|v| !v.is_null()).unwrap_or(false);
+                let framing = if addressed {
+                    "This was sent to you directly."
+                } else {
+                    "This was sent to the whole litter, not just you — reply if you have \
+                     something to add, or a short acknowledgment is a complete answer too."
+                };
+                // Found live 2026-09-23: two cats, told a broadcast reply
+                // was fine to just acknowledge, still ping-ponged
+                // "thanks!"/"sounds good!" for a dozen turns — every
+                // acknowledgment was itself something the *other* one felt
+                // obliged to acknowledge. `no_ack` (`Effect::Said`) is the
+                // sender's own signal that a message is a closing remark,
+                // not something needing a reply at all; SendMessage now
+                // takes it too, so the fix is symmetric instead of only
+                // ever telling the *reader* not to bother.
+                let ack_note = if e.effect.get("no_ack").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    "This is a closing remark, not a question — it does not need a reply. Doing \
+                     nothing is the correct response unless you actually have something new."
+                } else {
+                    "Reply with SendMessage. Two sentences at most. If your reply is itself just \
+                     a closing remark or acknowledgment rather than something that needs an \
+                     answer, set SendMessage's no_ack to true so it doesn't bounce back to you."
+                };
+                // A message flagged `off_record` was never written into the
+                // block log (`Effect::Said`'s doc comment; `Node::absorb`
+                // leaves it out of the block body) — it only reached this
+                // cat because it's live right now. A reply sent the normal
+                // way *does* get committed, which would leak the substance
+                // of an off-the-record exchange onto the chain even though
+                // the original message never landed there — so the reply
+                // has to carry the same flag for the "off the record" to
+                // mean anything.
+                let otr_note = if e.effect.get("off_record").and_then(|v| v.as_bool()).unwrap_or(false) {
+                    " This was sent off the record — it was never written to the chain. If you \
+                      reply, set SendMessage's off_record to true as well, or your reply will be \
+                      committed even though this message wasn't."
+                } else {
+                    ""
+                };
                 format!(
-                    "{who} said to the litter:\n\"{body}\"\n\nThe litter's other members, by \
-                     name (use Peers for who's actually live right now): {}.\n\nReply with \
-                     SendMessage. Two sentences at most.",
+                    "{who} said to the litter:\n\"{body}\"\n\n{framing} The litter's other \
+                     members, by name (use Peers for who's actually live right now): {}.\n\n{ack_note}{otr_note}",
                     others.join(", ")
                 )
             }
@@ -463,6 +574,32 @@ impl Cat {
                 },
                 Err(e) => println!("  [{}] Peers: node unreachable: {e}", self.name),
             },
+            "Stats" => match self.http.get(format!("{}/stats", self.node)).send().await {
+                Ok(r) => match r.json::<Vec<serde_json::Value>>().await {
+                    Ok(rows) if rows.is_empty() => println!("  [{}] no stats reported yet", self.name),
+                    Ok(rows) => {
+                        let lines: Vec<String> = rows
+                            .iter()
+                            .map(|r| {
+                                let name = r
+                                    .get("account")
+                                    .and_then(|v| v.as_str())
+                                    .and_then(|h| miot_keys::from_hex(h).ok())
+                                    .map(|a| self.roster.name_of(&a))
+                                    .unwrap_or_else(|| "someone".into());
+                                let turns = r.get("turns").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let tool_calls = r.get("tool_calls").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let tokens = r.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+                                let ms = r.get("ms").and_then(|v| v.as_u64()).unwrap_or(0);
+                                format!("{name} — {turns} turns, {tool_calls} tool calls, {tokens} tok, {:.1}s thinking", ms as f64 / 1000.0)
+                            })
+                            .collect();
+                        println!("  [{}] stats:\n  {}", self.name, lines.join("\n  "));
+                    }
+                    Err(e) => println!("  [{}] Stats: bad response: {e}", self.name),
+                },
+                Err(e) => println!("  [{}] Stats: node unreachable: {e}", self.name),
+            },
             _ => return false,
         }
         true
@@ -534,7 +671,9 @@ impl Cat {
                         }
                     },
                 };
-                RuntimeCall::Litter(pallet_litter::Call::say { to, body: c.str("body").unwrap_or_default() })
+                let no_ack = c.args.get("no_ack").and_then(|v| v.as_bool()).unwrap_or(false);
+                let off_record = c.args.get("off_record").and_then(|v| v.as_bool()).unwrap_or(false);
+                RuntimeCall::Litter(pallet_litter::Call::say { to, body: c.str("body").unwrap_or_default(), no_ack, off_record })
             }
             "Artifact" => RuntimeCall::Litter(pallet_litter::Call::publish_standalone_artifact { text: c.str("text").unwrap_or_default() }),
             "RequestCompaction" => RuntimeCall::Litter(pallet_litter::Call::request_compaction {}),
@@ -557,6 +696,7 @@ pub async fn run(cfg: AgentConfig) {
         roster: cfg.roster,
         meta: tokio::sync::OnceCell::new(),
         nonce: tokio::sync::Mutex::new(None),
+        stats: tokio::sync::Mutex::new(CatStats::default()),
     };
     let name = cat.name.clone();
     println!("[{name}] id={} node={} llm={}", miot_keys::short(&account), cat.node, cat.llm.label());
@@ -680,7 +820,15 @@ pub async fn run(cfg: AgentConfig) {
                     // testing `kot chat`'s tool calls, then confirmed here:
                     // same gap, same fix — don't require the model to pick
                     // SendMessage on purpose.
-                    if t == "said" && !turn.calls.iter().any(|c| c.name == "SendMessage") {
+                    //
+                    // Except when the wake itself was `no_ack`: there, a
+                    // turn that produced neither a reply nor a tool call is
+                    // the *correct* outcome (silence, as asked), not the
+                    // dropped-reply bug this fallback exists to paper over
+                    // — auto-replying anyway would just resurrect the
+                    // ping-pong loop `no_ack` exists to stop.
+                    let was_no_ack = e.effect.get("no_ack").and_then(|v| v.as_bool()).unwrap_or(false);
+                    if t == "said" && !was_no_ack && !turn.calls.iter().any(|c| c.name == "SendMessage") {
                         let body = if !turn.text.trim().is_empty() {
                             turn.text.trim().to_string()
                         } else if !turn.calls.is_empty() {
@@ -690,17 +838,55 @@ pub async fn run(cfg: AgentConfig) {
                         };
                         if !body.is_empty() {
                             // Back to whoever actually spoke, not a
-                            // broadcast: `Effect::Said`'s `wakes()` is
-                            // `to.is_some() || from_root`, so a non-root
-                            // `to: None` reply wakes nobody at all — it
-                            // would sit in the log unseen by anyone's agent
-                            // loop, same silent drop this fix exists to
-                            // close.
+                            // broadcast further — a fallback reply is
+                            // naturally a reply *to* someone, addressed
+                            // the same way the direct-reply path already
+                            // is. (Before 2026-09-23 this also mattered
+                            // because a non-root broadcast woke nobody at
+                            // all; broadcasts wake everyone now, but
+                            // targeting the original speaker is still the
+                            // right shape for "here's what I did.")
                             let to = e.effect.get("from").and_then(|v| v.as_str()).and_then(|h| miot_keys::from_hex(h).ok());
                             println!("[{name}]   (auto) SendMessage: {body}");
-                            cat.submit(RuntimeCall::Litter(pallet_litter::Call::say { to, body })).await;
+                            // The model never chose to say this — it's a
+                            // synthesized status note standing in for a
+                            // reply it skipped, not a question. Marking it
+                            // `no_ack` keeps a fallback from starting (or
+                            // extending) a ping-pong nobody actually meant.
+                            // Mirrors the wake's own `off_record`: a
+                            // fallback for a message that was never
+                            // committed must not itself commit one — see
+                            // `otr_note` above for why that matters.
+                            let off_record = e.effect.get("off_record").and_then(|v| v.as_bool()).unwrap_or(false);
+                            cat.submit(RuntimeCall::Litter(pallet_litter::Call::say { to, body, no_ack: true, off_record })).await;
                         }
                     }
+
+                    // Periodic, one report per turn rather than a timer:
+                    // turns here are already minutes apart, so "after every
+                    // turn" is a finer cadence than a wall-clock interval
+                    // would need to be, with no extra bookkeeping. Whole
+                    // cumulative totals each time, not a delta, so a
+                    // dropped report (same no-retry-queue gap `submit`
+                    // itself now retries around, but a report is fire-and-
+                    // forget by design — worth knowing, not worth an
+                    // agent's own turn budget defending) just gets
+                    // corrected by the next one instead of drifting.
+                    let snapshot = {
+                        let mut s = cat.stats.lock().await;
+                        s.turns += 1;
+                        s.tool_calls += turn.calls.len() as u32;
+                        s.tokens += turn.total_tokens as u64;
+                        s.ms += turn.ms;
+                        *s
+                    };
+                    cat.submit(RuntimeCall::Litter(pallet_litter::Call::report_stats {
+                        turns: snapshot.turns,
+                        tool_calls: snapshot.tool_calls,
+                        tokens: snapshot.tokens,
+                        ms: snapshot.ms,
+                    }))
+                    .await;
                 }
                 Err(e) => println!("[{name}]   llm error: {e}"),
             }

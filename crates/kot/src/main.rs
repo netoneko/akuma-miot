@@ -70,6 +70,9 @@ enum Cmd {
     Note { id: String },
     /// Every standalone note: id, title, author.
     Notes,
+    /// Every artifact, task-closed and standalone merged: id, title,
+    /// author. `Notes` only ever shows the standalone half of this.
+    Artifacts,
     /// Publish a file's contents as a standalone artifact — anyone may
     /// (`pallet_litter::Call::publish_standalone_artifact` has no
     /// authority check), same as a cat's own `Artifact` tool call.
@@ -79,6 +82,10 @@ enum Cmd {
         body: String,
         #[arg(long)]
         to: Option<String>,
+        /// Never write this one into the block log — it still wakes its
+        /// recipient live, it just doesn't survive a replay or a rewind.
+        #[arg(long)]
+        off_record: bool,
     },
     /// Fail every open task: a new session, same chain. Root only.
     Clear,
@@ -318,6 +325,9 @@ async fn main() {
         Some(Cmd::Notes) => {
             connect(&cli).await.print_notes().await;
         }
+        Some(Cmd::Artifacts) => {
+            connect(&cli).await.print_artifacts().await;
+        }
         Some(Cmd::Publish { file }) => {
             let text = std::fs::read_to_string(expand_home(file)).unwrap_or_else(|e| die(format!("{file}: {e}")));
             let mut c = connect(&cli).await;
@@ -326,11 +336,11 @@ async fn main() {
                 c.log(since, None, true, Some(8)).await;
             }
         }
-        Some(Cmd::Say { body, to }) => {
+        Some(Cmd::Say { body, to, off_record }) => {
             let mut c = connect(&cli).await;
             let to = to.as_ref().map(|n| c.roster.account(n).unwrap_or_else(|| die(format!("no such cat: {n}"))));
             let since = c.head_seq().await;
-            if c.submit(client::say_call(to, body)).await {
+            if c.submit(client::say_call(to, body, *off_record)).await {
                 c.log(since, None, true, Some(8)).await;
             }
         }

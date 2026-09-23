@@ -41,13 +41,18 @@ pub struct Client {
     pub node: String,
     pub identity: Identity,
     pub roster: Roster,
+    /// The REPL's sticky `/dm` target: once set, a bare line goes only to
+    /// this account (no `@name` needed) until `/dm` turns it off again.
+    /// Lives here rather than as a local in `repl()` so `run_command`
+    /// (which only ever sees `&mut Client`) can set and clear it.
+    pub dm_target: Option<AccountId>,
 }
 
 impl Client {
     /// Pick the first node in `candidates` that answers `/head`.
     pub async fn connect(candidates: Vec<String>, identity: Identity, roster: Roster) -> Result<Self, String> {
         let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(30)).build().unwrap();
-        let mut c = Client { http, candidates, node: String::new(), identity, roster };
+        let mut c = Client { http, candidates, node: String::new(), identity, roster, dm_target: None };
         c.reconnect().await?;
         Ok(c)
     }
@@ -184,14 +189,23 @@ impl Client {
     }
 
     /// Markdown on stdout, nothing else — so it pipes (`docs/CLI.md` §5).
+    ///
+    /// Routes by id shape, same convention `ArtifactRead` (the LLM tool,
+    /// `agent.rs`/`chat.rs`) already uses: a `t`-prefixed id (as
+    /// `/artifacts`' merged listing renders a closed task's) hits
+    /// `/artifact/{id}`, anything else hits `/note/{id}`. Before this, a
+    /// human at the REPL had to already know which of `/artifact <id>` or
+    /// `/note <id>` an id from that merged list needed — the exact
+    /// distinction the tool-calling side never had to make.
     pub async fn print_artifact(&mut self, id: &str) -> bool {
-        match self.get_json(&format!("/artifact/{id}")).await {
+        let path = if id.trim_start().starts_with(['t', 'T']) { format!("/artifact/{id}") } else { format!("/note/{id}") };
+        match self.get_json(&path).await {
             Ok(a) if a["found"] == true => {
                 println!("{}", a["body"].as_str().unwrap_or(""));
                 true
             }
             Ok(_) => {
-                eprintln!("no artifact for {id} (not closed yet, or no such task)");
+                eprintln!("no artifact for {id}");
                 false
             }
             Err(e) => {
@@ -225,6 +239,35 @@ impl Client {
             Ok(serde_json::Value::Array(rows)) => {
                 for r in &rows {
                     let id = r["id"].as_u64().unwrap_or(0);
+                    let title = r["title"].as_str().unwrap_or("");
+                    let author = r["author"]
+                        .as_str()
+                        .and_then(|h| miot_keys::from_hex(h).ok())
+                        .map(|a| self.roster.name_of(&a))
+                        .unwrap_or_else(|| "someone".into());
+                    println!("  {id}  {title}  ({author})");
+                }
+                true
+            }
+            Ok(_) => true,
+            Err(e) => {
+                eprintln!("{e}");
+                false
+            }
+        }
+    }
+
+    /// Every artifact — a closed task's report and a standalone one alike,
+    /// one merged id-addressed list — unlike `print_notes`, which is only
+    /// ever the standalone half of that (`/notes`, not `/artifacts`). Read
+    /// one back with `kot artifact <id>` (task) or `kot note <id>`
+    /// (standalone) — same split the ids themselves already carry (a `t`
+    /// prefix means the first).
+    pub async fn print_artifacts(&mut self) -> bool {
+        match self.get_json("/artifacts").await {
+            Ok(serde_json::Value::Array(rows)) => {
+                for r in &rows {
+                    let id = r["id"].as_str().unwrap_or("?");
                     let title = r["title"].as_str().unwrap_or("");
                     let author = r["author"]
                         .as_str()
@@ -342,7 +385,10 @@ impl Client {
         let task = || eff["task"].as_str().unwrap_or("?").to_string();
         let text = |field: &str| eff[field].as_str().unwrap_or("");
         match eff["t"].as_str().unwrap_or("") {
-            "said" => format!("{}: {}", self.name(eff, "from"), text("body")),
+            "said" => {
+                let otr = if eff["off_record"].as_bool().unwrap_or(false) { " (off the record)" } else { "" };
+                format!("{}: {}{otr}", self.name(eff, "from"), text("body"))
+            }
             "opened" => format!("{} opened {}: {}", self.name(eff, "who"), task(), text("text")),
             "planned" => format!("{} planned {} into {} subtask(s)", self.name(eff, "who"), task(), eff["count"]),
             "assigned" => format!("{} assigned to {}: {}", task(), self.name(eff, "to"), text("what")),
@@ -429,8 +475,11 @@ fn parse_targets(roster: &Roster, line: &str) -> (Vec<AccountId>, Vec<String>) {
     (targets, unknown)
 }
 
-pub fn say_call(to: Option<AccountId>, body: &str) -> RuntimeCall {
-    RuntimeCall::Litter(pallet_litter::Call::say { to, body: body.to_string() })
+pub fn say_call(to: Option<AccountId>, body: &str, off_record: bool) -> RuntimeCall {
+    // An operator's own message always wants an answer — `no_ack` is a
+    // sender's own signal that it doesn't, and a human at the keyboard is
+    // never the one that needs it.
+    RuntimeCall::Litter(pallet_litter::Call::say { to, body: body.to_string(), no_ack: false, off_record })
 }
 
 /// `Status.name` (a mesh/routing label, e.g. `ryzen-fc`) → cat name,
@@ -717,7 +766,7 @@ impl Input {
             return;
         }
         let candidates: Vec<String> = if let Some(prefix) = word.strip_prefix('/') {
-            ["/task", "/tasks", "/peers", "/artifact", "/note", "/notes", "/clear", "/keys", "/quit", "/exit"].iter().filter(|c| c[1..].starts_with(prefix)).map(|s| s.to_string()).collect()
+            ["/task", "/tasks", "/peers", "/artifact", "/artifacts", "/note", "/notes", "/clear", "/keys", "/quit", "/exit"].iter().filter(|c| c[1..].starts_with(prefix)).map(|s| s.to_string()).collect()
         } else if let Some(prefix) = word.strip_prefix('@') {
             let mut v: Vec<String> = roster.names().filter(|n| n.starts_with(prefix)).map(|n| format!("@{n}")).collect();
             for alias in ["all", "litter", "cats"] {
@@ -847,15 +896,21 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
             let t = c.peers_text().await;
             send(t);
         }
-        ("/artifact", id) if !id.is_empty() => match c.get_json(&format!("/artifact/{id}")).await {
-            Ok(a) if a["found"] == true => send(a["body"].as_str().unwrap_or("").to_string()),
-            _ => send(format!("  {}", ui::alert(&format!("no artifact for {id} (not closed yet, or no such task)")))),
-        },
+        // Same id-shape routing as `Client::print_artifact`/`ArtifactRead`:
+        // a `t`-prefixed id is a closed task's, anything else standalone.
+        ("/artifact", id) if !id.is_empty() => {
+            let path = if id.trim_start().starts_with(['t', 'T']) { format!("/artifact/{id}") } else { format!("/note/{id}") };
+            match c.get_json(&path).await {
+                Ok(a) if a["found"] == true => send(a["body"].as_str().unwrap_or("").to_string()),
+                _ => send(format!("  {}", ui::alert(&format!("no artifact for {id}")))),
+            }
+        }
         ("/note", id) if !id.is_empty() => match c.get_json(&format!("/note/{id}")).await {
             Ok(a) if a["found"] == true => send(a["body"].as_str().unwrap_or("").to_string()),
             _ => send(format!("  {}", ui::alert(&format!("no note {id}")))),
         },
         ("/notes", _) => match c.get_json("/notes").await {
+            Ok(serde_json::Value::Array(rows)) if rows.is_empty() => send(format!("  {}", ui::dim("no notes yet"))),
             Ok(serde_json::Value::Array(rows)) => {
                 let t = rows
                     .iter()
@@ -875,10 +930,89 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
             }
             _ => send(format!("  {}", ui::alert("could not fetch notes"))),
         },
+        ("/artifacts", _) => match c.get_json("/artifacts").await {
+            Ok(serde_json::Value::Array(rows)) if rows.is_empty() => send(format!("  {}", ui::dim("no artifacts yet"))),
+            Ok(serde_json::Value::Array(rows)) => {
+                let t = rows
+                    .iter()
+                    .map(|r| {
+                        let id = r["id"].as_str().unwrap_or("?");
+                        let title = r["title"].as_str().unwrap_or("");
+                        let author = r["author"]
+                            .as_str()
+                            .and_then(|h| miot_keys::from_hex(h).ok())
+                            .map(|a| c.roster.name_of(&a))
+                            .unwrap_or_else(|| "someone".into());
+                        format!("  {id}  {title}  ({author})")
+                    })
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                send(t);
+            }
+            _ => send(format!("  {}", ui::alert("could not fetch artifacts"))),
+        },
         ("/task", text) if !text.is_empty() => match c.try_submit(RuntimeCall::Litter(pallet_litter::Call::open { text: text.to_string() })).await {
             Ok(()) => send(format!("  {}", ui::ok("✓ task opened"))),
             Err(e) => send(format!("  {}", ui::alert(&format!("refused: {e}")))),
         },
+        // `/dm <name>` — sticky, not one-shot: every bare line after this
+        // (no `@name` needed) goes only to `<name>` until a bare `/dm`
+        // turns it back off. `<name>` may carry a first message right on
+        // the same line. State lives on `Client::dm_target` (not a local
+        // here) so it survives across calls to `run_command` and the
+        // composer's prompt (`repl()`) can read it back for the `→ name`
+        // hairline.
+        ("/dm", rest) if rest.is_empty() => match c.dm_target.take() {
+            Some(a) => send(format!("  {}", ui::dim(&format!("dm off — {} was the target", c.roster.name_of(&a))))),
+            None => send(format!("  {}", ui::alert("usage: /dm <name> [message] (no target set to turn off)"))),
+        },
+        ("/dm", rest) => {
+            let (name, body) = rest.split_once(' ').map(|(a, b)| (a, b.trim())).unwrap_or((rest, ""));
+            match c.roster.account(name) {
+                Some(a) => {
+                    c.dm_target = Some(a.clone());
+                    send(format!("  {}", ui::dim(&format!("dm → {} (stays until /dm turns it off)", c.roster.name_of(&a)))));
+                    if !body.is_empty() {
+                        if let Err(e) = c.try_submit(say_call(Some(a), body, false)).await {
+                            send(format!("  {}", ui::alert(&format!("refused: {e}"))));
+                        }
+                    }
+                }
+                None => send(format!("  {}", ui::warn(&format!("no such cat: @{}", name.trim_start_matches('@'))))),
+            }
+        }
+        // `/all` — the other direction from `/dm`: turns any sticky DM
+        // target back off (same as a bare `/dm`) and, unlike a bare line,
+        // never needs `@all`/`@cats`/`@litter` tagged in to broadcast —
+        // it always goes to the whole litter, tags or not.
+        ("/all", rest) if rest.is_empty() => match c.dm_target.take() {
+            Some(a) => send(format!("  {}", ui::dim(&format!("back to the litter — {} is no longer the target", c.roster.name_of(&a))))),
+            None => send(format!("  {}", ui::dim("already talking to the whole litter"))),
+        },
+        ("/all", text) => {
+            c.dm_target = None;
+            if let Err(e) = c.try_submit(say_call(None, text, false)).await {
+                send(format!("  {}", ui::alert(&format!("refused: {e}"))));
+            }
+        }
+        // Same `@name` targeting as a bare line, but the resulting `Said`
+        // never joins the block body (`node.rs::absorb`) — it still wakes
+        // whoever it's addressed to live, it just isn't there on replay, a
+        // rewind, or for a peer that pulls the block later instead of
+        // tailing it live.
+        ("/otr", text) if !text.is_empty() => {
+            let (targets, unknown) = parse_targets(&c.roster, text);
+            for bad in &unknown {
+                send(format!("  {}", ui::warn(&format!("no such cat: @{bad}"))));
+            }
+            let calls: Vec<Option<AccountId>> =
+                if !targets.is_empty() { targets.into_iter().map(Some).collect() } else { vec![c.dm_target.clone()] };
+            for t in calls {
+                if let Err(e) = c.try_submit(say_call(t, text, true)).await {
+                    send(format!("  {}", ui::alert(&format!("refused: {e}"))));
+                }
+            }
+        }
         (cmd, _) if cmd.starts_with('/') => send(format!("  {}", ui::dim(&format!("unknown command {cmd}")))),
         _ => {
             let (targets, unknown) = parse_targets(&c.roster, line);
@@ -889,9 +1023,12 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
             // the committed `said` effect through `ui::render`'s `me()`
             // path once it comes back — that's the only echo (raw mode
             // means the terminal isn't echoing what was typed).
-            let calls: Vec<Option<AccountId>> = if targets.is_empty() { vec![None] } else { targets.into_iter().map(Some).collect() };
+            // No `@name` tag falls back to the sticky `/dm` target when one
+            // is set, and only broadcasts to the whole litter when it isn't.
+            let calls: Vec<Option<AccountId>> =
+                if !targets.is_empty() { targets.into_iter().map(Some).collect() } else { vec![c.dm_target.clone()] };
             for t in calls {
-                if let Err(e) = c.try_submit(say_call(t, line)).await {
+                if let Err(e) = c.try_submit(say_call(t, line, false)).await {
                     send(format!("  {}", ui::alert(&format!("refused: {e}"))));
                 }
             }
@@ -987,7 +1124,6 @@ pub async fn repl(mut c: Client) {
 
     let mut input = Input::new();
     let mut events = EventStream::new();
-    let target = "litter".to_string();
 
     loop {
         let quit = tokio::select! {
@@ -1012,6 +1148,9 @@ pub async fn repl(mut c: Client) {
             (s.node.clone(), s.primary.clone(), s.head)
         };
         let status = ui::composer_status(&node, &primary, head);
+        // Reflects `/dm`'s sticky target fresh every redraw, since
+        // `run_command` mutates `c.dm_target` rather than a local here.
+        let target = c.dm_target.as_ref().map(|a| c.roster.name_of(a)).unwrap_or_else(|| "litter".to_string());
         let prompt = ui::prompt(&me_name, Some(&target));
         let prompt_w = ui::vcells(&prompt) as u16;
         let _ = terminal.draw(|f| {

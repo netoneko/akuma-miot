@@ -274,7 +274,24 @@ pub enum Effect<A> {
     /// chatter. A peer talking to the litter at large is **not** waking, for
     /// the same reason a record is not: waking four cats per broadcast turns
     /// one remark into four LLM turns.
-    Said { from: A, to: Option<A>, body: String, from_root: bool },
+    /// `no_ack`: the sender's own signal that this doesn't need a reply —
+    /// a closing remark, a pure acknowledgment — so the recipient's prompt
+    /// (`agent.rs`'s `Cat::prompt`) can say so instead of demanding
+    /// `SendMessage` every time regardless of content. Added 2026-09-23
+    /// after two cats ping-ponged "thanks!"/"sounds good!" for a dozen
+    /// turns straight: the old prompt's "Reply with SendMessage" applied
+    /// uniformly whether the message asked something or just closed one
+    /// out, so every closing remark generated another one.
+    ///
+    /// `off_record`: the sender's own signal that this message must never
+    /// land in the block log — the host (`kot::node::Node::absorb`) still
+    /// fans it out live (wakes, `/events`) but leaves it out of the block
+    /// body it hands `Store::append`, so it never survives a replay,
+    /// rewind, or a peer that wasn't already tailing live. Safe to do
+    /// unconditionally because `TaskTable::apply(Said)` is already a
+    /// no-op — chat touches no task state, so skipping persistence can
+    /// never desync a replica from the primary.
+    Said { from: A, to: Option<A>, body: String, from_root: bool, no_ack: bool, off_record: bool },
     /// Broadcast, non-waking: a parent task was opened.
     ///
     /// Carries `text` — the task's own description — because this effect is
@@ -328,6 +345,18 @@ pub enum Effect<A> {
     /// counter, its own namespace, never a [`TaskId`] — this was never part
     /// of a plan.
     StandaloneArtifact { author: A, id: u32, title: String, body: String },
+    /// Broadcast, non-waking: a cat's own cumulative work stats, self-
+    /// reported (`pallet_litter::Call::report_stats`). Not part of
+    /// `miot_tasks::State` — `who`'s `Stats` storage row lives in
+    /// `pallet-litter` alone — but it still has to ride as an `Effect`
+    /// like everything else here: a replica only ever folds state by
+    /// replaying the effect log (`Node::apply_block`), never by
+    /// re-executing the original extrinsic, so a state change with no
+    /// effect is invisible to every replica forever. Found live
+    /// 2026-09-23: the first version of this call wrote straight to
+    /// storage with no effect at all, and `GET /stats` came back correct
+    /// on the primary and permanently empty on every replica.
+    StatsReported { who: A, turns: u32, tool_calls: u32, tokens: u64, ms: u64 },
 }
 
 impl<A> Effect<A> {
