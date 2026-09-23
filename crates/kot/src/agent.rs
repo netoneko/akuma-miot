@@ -888,6 +888,15 @@ async fn watch_chain(cat: Arc<Cat>, mut head: serde_json::Value, tx: tokio::sync
         // still queued when its current turn ends into the next one.
         let mut latest: HashMap<(String, String), Entry> = HashMap::new();
         for e in batch.into_iter().filter(|e| {
+            // `no_ack` is the sender saying "this needs no reply" — a
+            // closing remark. It used to wake everyone anyway, with only a
+            // prompt line asking the model to stay quiet; found live
+            // 2026-09-24, the GLM/OpenRouter cats answered it every time
+            // and "Understood" / "Acknowledged" ran on for rounds. Now it
+            // simply wakes no one.
+            if e.effect.get("t").and_then(|v| v.as_str()) == Some("said") && e.effect.get("no_ack").and_then(|v| v.as_bool()) == Some(true) {
+                return false;
+            }
             match e.wakes.as_deref() {
                 Some(w) if w == my_hex => true,
                 // The broadcast sentinel (`Node::absorb`) wakes every live

@@ -494,7 +494,12 @@ def cmd_up(name: str) -> None:
             # conf needs nothing else.
             # Akuma's ps lists every thread: after the first kill ends the
             # process, the rest are gone. `|| true` so that isn't a failure.
-            on(a, "for p in $(ps | grep '/root/kot/bin/kot run' | grep -v grep | awk '{print $1}'); do kill $p 2>/dev/null || true; done")
+            # And after `exec`, Akuma's ps keeps showing the *wrapper's*
+            # command line — the running kot is listed as
+            # `/bin/sh /root/kot/start.sh`. Matching only `kot run` missed it
+            # entirely (found 2026-09-24): nothing was killed, and the old
+            # kot kept running next to the new binary on disk.
+            on(a, "for p in $(ps | grep -E '/root/kot/bin/kot run|/root/kot/start.sh' | grep -v grep | awk '{print $1}'); do kill $p 2>/dev/null || true; done")
         else:
             say(f"{a.name}: NO_ENABLE set — staged, not enabled/restarted")
 
