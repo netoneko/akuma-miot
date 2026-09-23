@@ -28,6 +28,27 @@ run `uname -a` locally and via `limactl shell fc -- uname -a` (the Lima VM
 
 ## A local two-cat mesh (no `fc`, no fleet, no z.ai)
 
+**`DEV_ROSTER` no longer shares names with the deployed fleet's roster**
+(`main.rs`, changed 2026-09-24): it used to be `root=1,mimi=2,tama=3,kuro=4,
+sora=5` — the exact same cat names `overlays/deploy/deploy.py` gives the
+real fleet, just backed by dev seeds instead of the fleet's real pubkeys.
+That let a stale `MIOT_ROSTER` in an operator's shell (left over from
+sourcing a real `kot.env`, or vice versa) silently resolve `@tama` to
+whichever account happened to be in scope, with no error — the fleet's
+`docs/FLEET.md` cat and a local sim node just answer to the same name. Now
+`DEV_ROSTER` is `root=1,simlead=2,sima=3,simb=4,simc=5`: none of
+`simlead`/`sima`/`simb`/`simc` collide with a real fleet name, so a wrong-
+roster mix-up fails loud (`no such cat: @tama`) instead of quietly
+addressing the wrong key. `root` stays `root` in both — it's a role
+(`Authority::Root`), not a fleet persona, and item 0 in `HANDOFF.md`'s
+"Next, in order" is the separate, not-yet-started proposal to rename that
+one specifically.
+>
+> The walkthrough below was run live 2026-09-23, under the *old* names
+> (`tama`/`kuro`) — kept as-is since it's an accurate transcript of what
+> actually happened, not a template. Use `sima`/`simb` (below) for a fresh
+> run today.
+
 Two `llama-server` instances were already running on this mac for dev
 (`127.0.0.1:8083`/`8084`, both Qwen3-4B-Instruct-2507 Q4_K_M — the same
 weights `docs/FLEET.md` assigns Kuro/Sora). Each got its own `kot run`
@@ -38,23 +59,23 @@ of five and nobody paying for tokens:
 ```bash
 MODEL="/Users/netoneko/.ollama/models/blobs/sha256-3e4cb14174460404e7a233e531675303b2fbf7749c02f91864fe311ab6344e4f"
 
-cargo run -p kot --bin kot -- run --as tama --seed 3 --port 20001 \
-  --peers http://127.0.0.1:20002 --db /tmp/tama.db --llm http://127.0.0.1:8083 --model "$MODEL"
-cargo run -p kot --bin kot -- run --as kuro --seed 4 --port 20002 \
-  --peers http://127.0.0.1:20001 --db /tmp/kuro.db --llm http://127.0.0.1:8084 --model "$MODEL"
+cargo run -p kot --bin kot -- run --as sima --seed 3 --port 20001 \
+  --peers http://127.0.0.1:20002 --db /tmp/sima.db --llm http://127.0.0.1:8083 --model "$MODEL"
+cargo run -p kot --bin kot -- run --as simb --seed 4 --port 20002 \
+  --peers http://127.0.0.1:20001 --db /tmp/simb.db --llm http://127.0.0.1:8084 --model "$MODEL"
 ```
 
-`--seed 3`/`--seed 4` land on `tama`/`kuro` in `DEV_ROSTER` for free
-(`root=1,mimi=2,tama=3,kuro=4,sora=5`) — no custom `--roster` needed. Wait
-~10-15s for election (`curl .../mesh/peers`, look for `"role":"leader"`),
-then drive it as root:
+`--seed 3`/`--seed 4` land on `sima`/`simb` in `DEV_ROSTER` for free
+(`root=1,simlead=2,sima=3,simb=4,simc=5`) — no custom `--roster` needed.
+Wait ~10-15s for election (`curl .../mesh/peers`, look for
+`"role":"leader"`), then drive it as root:
 
 ```bash
 kot --node http://127.0.0.1:20001 --seed 1 say "<akuma description>. \
-Discuss this with kuro, your littermate — that is their exact name, use \
-it. ... Use SendMessage with to=kuro so they can respond, and go back and \
-forth citing something specific each time." --to tama
-# same message, --to kuro, "... to=tama ..."
+Discuss this with simb, your littermate — that is their exact name, use \
+it. ... Use SendMessage with to=simb so they can respond, and go back and \
+forth citing something specific each time." --to sima
+# same message, --to simb, "... to=sima ..."
 ```
 
 **Name the other cat explicitly in the seed message.** The `"said"` prompt

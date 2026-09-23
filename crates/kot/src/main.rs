@@ -25,7 +25,17 @@ use kot::{agent, chat, client, node};
 use miot_keys::Identity;
 use miot_runtime::RuntimeCall;
 
-const DEV_ROSTER: &str = "root=1,mimi=2,tama=3,kuro=4,sora=5";
+// Deliberately *not* the deployed fleet's cat names (`mimi`/`tama`/`kuro`/
+// `sora` — `overlays/deploy/deploy.py`'s `MIOT_ROSTER`). Those used to be
+// mirrored here too, backed by small dev seeds instead of the fleet's real
+// pubkeys — so a stale `MIOT_ROSTER` left in an operator's shell (from
+// sourcing a real `kot.env`, or vice versa) silently resolved `@tama` to
+// whichever account happened to be in scope, no error either way. Disjoint
+// names turn that into a loud `no such cat` instead. `root` stays `root` in
+// both: it's a role (`Authority::Root`), not a fleet persona — see
+// `HANDOFF.md`'s "Next, in order" item 0 for the separate, not-yet-started
+// proposal to rename that one too. `docs/LOCAL_SIM.md` has the walkthrough.
+const DEV_ROSTER: &str = "root=1,simlead=2,sima=3,simb=4,simc=5";
 
 #[derive(Parser)]
 #[command(name = "kot", version = kot::version::VERSION, about = "The litter's binary: a mesh node + agent loop (`kot run`), or a client of any node")]
