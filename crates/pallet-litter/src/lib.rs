@@ -390,6 +390,27 @@ pub mod pallet {
             let who = ensure_signed(origin)?;
             Self::apply(|t, _auth, now| t.publish_standalone_artifact(&who, &text, now).map(|(_, fx)| fx), &who)
         }
+
+        /// Ask the node to snapshot state and shrink the block log at the
+        /// next block close — the same mechanism `clear_all` triggers as a
+        /// side effect, but standalone: no task is failed, and
+        /// `miot_tasks::TaskTable` never sees this call at all, since there
+        /// is nothing in it for the lifecycle machine to apply. `kot`'s
+        /// node reacts to it the same way it reacts to `clear_all` — by
+        /// matching the extrinsic's own call, in `Node::submit`, not by an
+        /// `Effect` (there is nothing to emit: no state changed here for a
+        /// replica to replay). Operator only, same reasoning as
+        /// `clear_all` — deciding when to shrink the log is the operator's
+        /// call, not any cat's, even though `RequestCompaction` is offered
+        /// as a tool like any other.
+        #[pallet::call_index(9)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn request_compaction(origin: OriginFor<T>) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            let state = Litter::<T>::get();
+            ensure!(Self::authority_of(&who, &state) == miot_primitives::Authority::Root, Error::<T>::NotAuthorized);
+            Ok(())
+        }
     }
 
     impl<T: Config> Pallet<T> {

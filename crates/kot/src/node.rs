@@ -505,13 +505,17 @@ impl Node {
 
     /// Check and dispatch one signed extrinsic into the open block.
     fn submit(&mut self, uxt: UncheckedExtrinsic) -> Result<(), String> {
-        let is_clear = matches!(uxt.function, miot_runtime::RuntimeCall::Litter(pallet_litter::Call::clear_all {}));
+        let wants_compaction = matches!(
+            uxt.function,
+            miot_runtime::RuntimeCall::Litter(pallet_litter::Call::clear_all {})
+                | miot_runtime::RuntimeCall::Litter(pallet_litter::Call::request_compaction {})
+        );
         let r = self.ext.execute_with(|| Executive::apply_extrinsic(uxt));
         let fx = self.drain();
         self.absorb(fx);
         match r {
             Ok(Ok(())) => {
-                if is_clear {
+                if wants_compaction {
                     self.pending_compaction = true;
                 }
                 Ok(())

@@ -3,6 +3,7 @@
 //!
 //! ```text
 //! kot run --as <name> [--peers ...] [--llm URL | --glm]   node + agent loop
+//! kot chat [--llm URL | --glm]                            model only, no node
 //! kot task open "<text>" | kot task list
 //! kot artifact <id>
 //! kot note <id> | kot notes                               standalone, no task
@@ -20,7 +21,7 @@
 
 use clap::{Args, Parser, Subcommand};
 use kot::common::{self, expand_home, parse_account, Roster, DIM, OFF};
-use kot::{agent, client, node};
+use kot::{agent, chat, client, node};
 use miot_keys::Identity;
 use miot_runtime::RuntimeCall;
 
@@ -56,6 +57,8 @@ struct Cli {
 enum Cmd {
     /// A mesh node, plus this cat's agent loop if given a model.
     Run(RunArgs),
+    /// Talk to a model directly in this process — no node, no chain.
+    Chat(ChatArgs),
     /// Open or list tasks.
     Task {
         #[command(subcommand)]
@@ -75,6 +78,8 @@ enum Cmd {
     },
     /// Fail every open task: a new session, same chain. Root only.
     Clear,
+    /// Ask the node to snapshot and shrink the block log now. Root only.
+    Compact,
     /// The litter roster, and the mesh as the connected node sees it.
     Peers,
     /// The event log.
@@ -148,6 +153,38 @@ struct RunArgs {
     election_max_ms: u64,
 }
 
+#[derive(Args)]
+struct ChatArgs {
+    /// A llama-server (or any OpenAI-compatible) base URL.
+    #[arg(long, env = "MIOT_LLM", conflicts_with = "glm")]
+    llm: Option<String>,
+    /// GLM on z.ai, key read from --glm-token-file.
+    #[arg(long, env = "MIOT_GLM")]
+    glm: bool,
+    #[arg(long, env = "MIOT_GLM_TOKEN_FILE", default_value = "~/.akuma/z.ai/token")]
+    glm_token_file: String,
+    /// Default: qwen3:4b, or glm-5.3 (z.ai coding plan) with --glm.
+    #[arg(long, env = "MIOT_MODEL")]
+    model: Option<String>,
+    #[arg(long, env = "MIOT_PERSONA")]
+    persona: Option<String>,
+}
+
+/// Shared with `run`: `--llm` and `--glm` build the same [`miot_llm::Llm`]
+/// either way, and a service unit or a one-off `chat` session both take it
+/// from the same token file rather than `ZAI_API_KEY` in the environment.
+fn build_llm(llm: &Option<String>, glm: bool, glm_token_file: &str, model: &Option<String>) -> Option<miot_llm::Llm> {
+    match (llm, glm) {
+        (Some(url), _) => Some(miot_llm::Llm::local(url, model.as_deref().unwrap_or("qwen3:4b"))),
+        (None, true) => {
+            let path = expand_home(glm_token_file);
+            let token = std::fs::read_to_string(&path).unwrap_or_else(|e| die(format!("--glm: {}: {e}", path.display())));
+            Some(miot_llm::Llm::glm(&token, model.as_deref().unwrap_or("glm-5.3")))
+        }
+        (None, false) => None,
+    }
+}
+
 fn die(msg: impl std::fmt::Display) -> ! {
     eprintln!("kot: {msg}");
     std::process::exit(2)
@@ -210,15 +247,7 @@ async fn run(cli: &Cli, a: &RunArgs) {
     };
     let running = node::start(cfg).await.unwrap_or_else(|e| die(e));
 
-    let llm = match (&a.llm, a.glm) {
-        (Some(url), _) => Some(miot_llm::Llm::local(url, a.model.as_deref().unwrap_or("qwen3:4b"))),
-        (None, true) => {
-            let path = expand_home(&a.glm_token_file);
-            let token = std::fs::read_to_string(&path).unwrap_or_else(|e| die(format!("--glm: {}: {e}", path.display())));
-            Some(miot_llm::Llm::glm(&token, a.model.as_deref().unwrap_or("glm-5.3")))
-        }
-        (None, false) => None,
-    };
+    let llm = build_llm(&a.llm, a.glm, &a.glm_token_file, &a.model);
     match llm {
         None => println!("[{name}] no --llm/--glm: node only, no agent loop"),
         Some(llm) => {
@@ -247,6 +276,17 @@ async fn main() {
     let cli = Cli::parse();
     match &cli.cmd {
         Some(Cmd::Run(a)) => run(&cli, a).await,
+        Some(Cmd::Chat(a)) => {
+            let llm = build_llm(&a.llm, a.glm, &a.glm_token_file, &a.model)
+                .unwrap_or_else(|| die("chat needs --llm <url> or --glm"));
+            let name = cli.as_.clone().unwrap_or_else(|| "cat".to_string());
+            let persona = a
+                .persona
+                .as_deref()
+                .and_then(|p| std::fs::read_to_string(expand_home(p)).ok())
+                .unwrap_or_else(|| format!("You are {name}, a cat, talking directly to your operator — no task, no chain, just conversation."));
+            chat::run(chat::ChatConfig { llm, persona }).await;
+        }
         Some(Cmd::Id { comment }) => {
             let path = expand_home(cli.seed_file.as_deref().unwrap_or_else(|| die("id needs --seed-file <path>")));
             let id = common::load_or_create_identity(&path, comment);
@@ -285,6 +325,10 @@ async fn main() {
         Some(Cmd::Clear) => {
             let mut c = connect(&cli).await;
             c.submit(RuntimeCall::Litter(pallet_litter::Call::clear_all {})).await;
+        }
+        Some(Cmd::Compact) => {
+            let mut c = connect(&cli).await;
+            c.submit(RuntimeCall::Litter(pallet_litter::Call::request_compaction {})).await;
         }
         Some(Cmd::Peers) => connect(&cli).await.print_peers().await,
         Some(Cmd::Log { task, follow }) => connect(&cli).await.log(0, task.as_deref(), *follow, None).await,

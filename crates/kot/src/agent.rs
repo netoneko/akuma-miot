@@ -431,8 +431,32 @@ impl Cat {
                 let Some(id) = parse_task(&task) else { return };
                 RuntimeCall::Litter(pallet_litter::Call::reassign { task: id, to })
             }
-            "SendMessage" => RuntimeCall::Litter(pallet_litter::Call::say { to: None, body: c.str("body").unwrap_or_default() }),
+            // `to` was silently dropped here until found live running a
+            // two-cat debate: every reply went out as a broadcast
+            // (`to: None`) no matter what the model asked for, so a cat
+            // could never actually address another cat by name — only the
+            // operator's own `kot say --to` (a different code path,
+            // `client.rs`) ever worked. `@all`/`@cats`/`@litter` stay a
+            // broadcast (`docs/CLI.md`'s synonyms); anything else must
+            // resolve in the roster, or the message doesn't go out at all —
+            // silently broadcasting a misspelled name would put words in
+            // front of the wrong audience.
+            "SendMessage" => {
+                let to = match c.str("to").as_deref().map(str::trim) {
+                    None | Some("") => None,
+                    Some(n) if matches!(n.trim_start_matches('@').to_ascii_lowercase().as_str(), "all" | "cats" | "litter") => None,
+                    Some(n) => match self.roster.account(n) {
+                        Some(a) => Some(a),
+                        None => {
+                            println!("  [{}] SendMessage: no such cat {n:?} in the roster — not sent", self.name);
+                            return;
+                        }
+                    },
+                };
+                RuntimeCall::Litter(pallet_litter::Call::say { to, body: c.str("body").unwrap_or_default() })
+            }
             "Artifact" => RuntimeCall::Litter(pallet_litter::Call::publish_standalone_artifact { text: c.str("text").unwrap_or_default() }),
+            "RequestCompaction" => RuntimeCall::Litter(pallet_litter::Call::request_compaction {}),
             _ => return,
         };
         self.submit(call).await;
@@ -554,6 +578,36 @@ pub async fn run(cfg: AgentConfig) {
                         println!("[{name}]   {} ({} tok, {:.0}s)", c.name, turn.tokens, turn.ms as f64 / 1000.0);
                     }
                     futures_util::future::join_all(turn.calls.iter().map(|c| cat.act(c))).await;
+
+                    // Spoken to, a cat must always answer — `AGENT_RULES`
+                    // tells it to call SendMessage every time, but a small
+                    // model reaching for Bash/ReadFile instead (or a plain-
+                    // text reply the tool-only path above has no way to
+                    // send) left the asker hearing nothing back. Found live
+                    // testing `kot chat`'s tool calls, then confirmed here:
+                    // same gap, same fix — don't require the model to pick
+                    // SendMessage on purpose.
+                    if t == "said" && !turn.calls.iter().any(|c| c.name == "SendMessage") {
+                        let body = if !turn.text.trim().is_empty() {
+                            turn.text.trim().to_string()
+                        } else if !turn.calls.is_empty() {
+                            format!("(ran {} — no further reply)", turn.calls.iter().map(|c| c.name.as_str()).collect::<Vec<_>>().join(", "))
+                        } else {
+                            String::new()
+                        };
+                        if !body.is_empty() {
+                            // Back to whoever actually spoke, not a
+                            // broadcast: `Effect::Said`'s `wakes()` is
+                            // `to.is_some() || from_root`, so a non-root
+                            // `to: None` reply wakes nobody at all — it
+                            // would sit in the log unseen by anyone's agent
+                            // loop, same silent drop this fix exists to
+                            // close.
+                            let to = e.effect.get("from").and_then(|v| v.as_str()).and_then(|h| miot_keys::from_hex(h).ok());
+                            println!("[{name}]   (auto) SendMessage: {body}");
+                            cat.submit(RuntimeCall::Litter(pallet_litter::Call::say { to, body })).await;
+                        }
+                    }
                 }
                 Err(e) => println!("[{name}]   llm error: {e}"),
             }

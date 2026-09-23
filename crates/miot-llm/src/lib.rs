@@ -122,9 +122,21 @@ impl Llm {
     }
 
     pub async fn turn(&self, system: &str, user: &str, tools: Vec<Tool>) -> Result<Turn, String> {
+        self.converse(system, &[(Speaker::User, user.to_string())], tools).await
+    }
+
+    /// Like [`Llm::turn`], but with prior turns folded in as real
+    /// assistant/user messages instead of flattened into one `user` string —
+    /// for a plain back-and-forth (`kot chat`) where there is no chain to
+    /// carry the question between turns the way the agent loop does.
+    pub async fn converse(&self, system: &str, history: &[(Speaker, String)], tools: Vec<Tool>) -> Result<Turn, String> {
         let started = Instant::now();
-        let req = ChatRequest::new(vec![ChatMessage::system(system), ChatMessage::user(user)])
-            .with_tools(tools);
+        let mut messages = vec![ChatMessage::system(system)];
+        messages.extend(history.iter().map(|(who, text)| match who {
+            Speaker::User => ChatMessage::user(text.clone()),
+            Speaker::Assistant => ChatMessage::assistant(text.clone()),
+        }));
+        let req = ChatRequest::new(messages).with_tools(tools);
         let res = self
             .client
             .exec_chat(&self.model, req, None)
@@ -142,6 +154,13 @@ impl Llm {
     }
 }
 
+/// Who said a turn, for [`Llm::converse`]'s history.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Speaker {
+    User,
+    Assistant,
+}
+
 /// The tool a cat uses to talk.
 ///
 /// Separate from [`task_tools`] because a cat that is being *spoken to* has no
@@ -150,7 +169,16 @@ impl Llm {
 /// task state, so those are fine here — a DM is exactly how an operator hands
 /// a cat a one-off job outside the formal task lifecycle.
 pub fn chat_tools() -> Vec<Tool> {
-    let mut tools = vec![Tool::new("SendMessage")
+    let mut tools = vec![send_message_tool()];
+    tools.extend(local_tools());
+    tools.extend(note_tools());
+    tools
+}
+
+/// Factored out of [`chat_tools`] so `kot chat` (no node, so no [`note_tools`])
+/// can still offer the same reply channel a cat gets when spoken to.
+pub fn send_message_tool() -> Tool {
+    Tool::new("SendMessage")
         .with_description("Say something. Use this to reply.")
         .with_schema(serde_json::json!({
             "type": "object",
@@ -160,10 +188,7 @@ pub fn chat_tools() -> Vec<Tool> {
                 "body": {"type": "string"}
             },
             "required": ["body"]
-        }))];
-    tools.extend(local_tools());
-    tools.extend(note_tools());
-    tools
+        }))
 }
 
 /// Standalone notes: a markdown artifact with no task behind it, and no
@@ -200,6 +225,18 @@ fn note_tools() -> Vec<Tool> {
                 "properties": {"id": {"type": "string", "description": "the artifact's id, from ArtifactList — keep its 't' prefix if it has one"}},
                 "required": ["id"]
             })),
+        // Root only, chain-side (`pallet_litter::Call::request_compaction`
+        // rejects anyone else with NotAuthorized) — offered everywhere
+        // anyway, same reasoning as the rest of this list: it never touches
+        // task state, so there is no wake reason to withhold it, and the
+        // chain itself is the real gate, not which tools a cat is shown.
+        Tool::new("RequestCompaction")
+            .with_description(
+                "Ask the node to snapshot state and shrink the block log now, instead of \
+                 waiting for the next /clear. Root only — any other caller is refused. Touches \
+                 no task; nothing to report back beyond whether it was accepted.",
+            )
+            .with_schema(serde_json::json!({"type": "object", "properties": {}})),
     ]
 }
 
@@ -207,7 +244,7 @@ fn note_tools() -> Vec<Tool> {
 /// in, tool calls out — there is no loop that feeds a result back for a
 /// further reply, so these don't help decide what to do next; use them to do
 /// work, then a separate `SendMessage`/`TaskUpdate` to report it.
-fn local_tools() -> Vec<Tool> {
+pub fn local_tools() -> Vec<Tool> {
     vec![
         Tool::new("Bash")
             .with_description("Run one shell command on this cat's own host (/bin/sh -c).")

@@ -9,6 +9,7 @@
 //! loop. They merged here (`docs/CLEANUP.md` item 2), and `miot` is gone.
 
 pub mod agent;
+pub mod chat;
 pub mod client;
 pub mod common;
 pub mod node;
