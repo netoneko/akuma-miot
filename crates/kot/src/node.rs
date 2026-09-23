@@ -341,7 +341,15 @@ impl Node {
     fn absorb(&mut self, effects: Vec<Effect<AccountId>>) {
         for e in effects {
             self.seq += 1;
-            let wakes = if e.wakes() { e.to().map(miot_keys::to_hex) } else { None };
+            // `"*"` is the broadcast sentinel every agent's own filter
+            // treats as "wakes me too" (`agent.rs`) — a genuine fan-out
+            // (a `Vec` of every member's hex) was the other option, but it
+            // meant changing `Entry.wakes`'s wire shape for every consumer
+            // of `/events`; a client already ignoring a wake value it
+            // doesn't recognize (a stricter, differently-versioned agent)
+            // degrades to "didn't wake for this broadcast" rather than a
+            // parse error, which a shape change would risk instead.
+            let wakes = if e.wakes() { Some(e.to().map(miot_keys::to_hex).unwrap_or_else(|| "*".to_string())) } else { None };
             let entry = Entry { seq: self.seq, block: self.block, effect: render(&e), wakes };
             if self.log.len() >= LOG_CAP {
                 self.log.pop_front();

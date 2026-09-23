@@ -331,17 +331,24 @@ pub enum Effect<A> {
 }
 
 impl<A> Effect<A> {
-    /// Whether this effect should assemble an LLM turn for its recipient.
+    /// Whether this effect should assemble an LLM turn for its recipient(s).
+    ///
+    /// A broadcast `Said` (`to: None`) always wakes now — every live cat,
+    /// not just root's own broadcasts. Until 2026-09-23 this was
+    /// `to.is_some() || from_root`, so a non-root broadcast woke nobody at
+    /// all despite looking delivered to a human watching the raw log
+    /// (rendering never consulted `wakes()`). Fan-out to "everyone" is a
+    /// wire concern (who the *other* live accounts even are), not
+    /// something this `no_std` type can decide on its own — see
+    /// `Node::absorb` for where a broadcast actually turns into "wakes
+    /// every member but the sender."
     pub const fn wakes(&self) -> bool {
-        match self {
-            Effect::Assigned { .. } | Effect::Directed { .. } | Effect::Nudge { .. } => true,
-            // Directed at somebody, or spoken by the operator.
-            Effect::Said { to, from_root, .. } => to.is_some() || *from_root,
-            _ => false,
-        }
+        matches!(self, Effect::Assigned { .. } | Effect::Directed { .. } | Effect::Nudge { .. } | Effect::Said { .. })
     }
 
-    /// Who this is addressed to, if anyone. `None` is a broadcast.
+    /// Who this is addressed to, if anyone specific. `None` is a broadcast
+    /// — [`Effect::wakes`] is still `true` for it, it just has no *single*
+    /// target for [`Self::to`] to name.
     pub const fn to(&self) -> Option<&A> {
         match self {
             Effect::Assigned { to, .. }

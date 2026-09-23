@@ -54,6 +54,20 @@ pub mod pallet {
     };
     use miot_tasks::{State, Task, TaskTable};
 
+    /// A cat's own cumulative work stats, self-reported via
+    /// [`Pallet::report_stats`] — see [`Stats`]. Plain scalars, not a
+    /// per-tool breakdown: the tool vocabulary this project actually offers
+    /// is small and fixed (`miot_llm`'s `*_tools` functions), so a caller
+    /// wanting a breakdown reads it off the reporter's own turn-by-turn
+    /// log instead of this chain-wide summary paying to store one.
+    #[derive(Debug, Clone, Default, PartialEq, Eq, codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo)]
+    pub struct CatStats {
+        pub turns: u32,
+        pub tool_calls: u32,
+        pub tokens: u64,
+        pub ms: u64,
+    }
+
     /// `State` holds `String`s and `Vec`s whose bounds are enforced by
     /// [`miot_tasks`] itself ([`Limits`]) rather than by the type system, so
     /// FRAME cannot compute a static maximum for it.
@@ -172,6 +186,16 @@ pub mod pallet {
     /// host — a node must re-assert it after replacing its externalities.
     #[pallet::storage]
     pub type Replaying<T: Config> = StorageValue<_, bool, ValueQuery>;
+
+    /// One cat's self-reported cumulative work stats — turns taken, tool
+    /// calls made, tokens spent, milliseconds spent thinking. Self-reported
+    /// and cumulative (each report replaces the whole record, not a delta)
+    /// so a dropped report never desyncs a running total the way an
+    /// increment-only counter would. No `Effect` — nothing here is a wake
+    /// reason, so emitting one would only grow `/events` for every turn of
+    /// every cat, for readers who can already just ask this directly.
+    #[pallet::storage]
+    pub type Stats<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, CatStats, ValueQuery>;
 
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
@@ -409,6 +433,20 @@ pub mod pallet {
             let who = ensure_signed(origin)?;
             let state = Litter::<T>::get();
             ensure!(Self::authority_of(&who, &state) == miot_primitives::Authority::Root, Error::<T>::NotAuthorized);
+            Ok(())
+        }
+
+        /// Report this cat's own cumulative work stats — turns, tool
+        /// calls, tokens, milliseconds — for anyone (any other cat, the
+        /// operator) to read back via [`Self::all_stats`]. `who` is
+        /// `ensure_signed`, same as everywhere else here: a cat can only
+        /// ever overwrite its *own* record, never claim to be reporting
+        /// for another account.
+        #[pallet::call_index(10)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn report_stats(origin: OriginFor<T>, turns: u32, tool_calls: u32, tokens: u64, ms: u64) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            Stats::<T>::insert(who, CatStats { turns, tool_calls, tokens, ms });
             Ok(())
         }
     }

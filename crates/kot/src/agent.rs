@@ -334,7 +334,19 @@ impl Cat {
                 let from = e.effect.get("from")?.as_str()?;
                 let body = e.effect.get("body")?.as_str().unwrap_or("");
                 let who = miot_keys::from_hex(from).map(|a| self.roster.name_of(&a)).unwrap_or_else(|_| "someone".into());
-                format!("{who} said to the litter:\n\"{body}\"\n\nReply with SendMessage. Two sentences at most.")
+                // Found live 2026-09-23: asked to "discuss this with your
+                // littermate" with no name given, two cats each invented a
+                // plausible-sounding one and tried to SendMessage it —
+                // refused, the round silently dropped. The roster is
+                // already loaded locally; there was never a reason to make
+                // the model guess it.
+                let others: Vec<&str> = self.roster.names().filter(|n| *n != self.name.as_str()).collect();
+                format!(
+                    "{who} said to the litter:\n\"{body}\"\n\nThe litter's other members, by \
+                     name (use Peers for who's actually live right now): {}.\n\nReply with \
+                     SendMessage. Two sentences at most.",
+                    others.join(", ")
+                )
             }
             _ => return None,
         };
@@ -421,6 +433,36 @@ impl Cat {
                     Err(e) => println!("  [{}] ArtifactRead {id}: node unreachable: {e}", self.name),
                 }
             }
+            "Peers" => match self.http.get(format!("{}/mesh/peers", self.node)).send().await {
+                Ok(r) => match r.json::<serde_json::Value>().await {
+                    Ok(v) => {
+                        let me_role = v.get("me").and_then(|m| m.get("role")).and_then(|r| r.as_str()).unwrap_or("?");
+                        let mut lines = vec![format!("{} — me, {me_role}", self.name)];
+                        for p in v.get("peers").and_then(|p| p.as_array()).into_iter().flatten() {
+                            let route = p.get("route").and_then(|r| r.as_str()).unwrap_or("?");
+                            match p.get("status").filter(|s| !s.is_null()) {
+                                Some(status) => {
+                                    let name = status
+                                        .get("account")
+                                        .and_then(|a| a.as_str())
+                                        .and_then(|h| miot_keys::from_hex(h).ok())
+                                        .map(|a| self.roster.name_of(&a))
+                                        .unwrap_or_else(|| route.to_string());
+                                    let role = status.get("role").and_then(|r| r.as_str()).unwrap_or("?");
+                                    match p.get("seen_ms_ago").and_then(|s| s.as_u64()) {
+                                        Some(ms) => lines.push(format!("{name} — {role}, seen {ms}ms ago")),
+                                        None => lines.push(format!("{name} — {role}")),
+                                    }
+                                }
+                                None => lines.push(format!("{route} — never answered")),
+                            }
+                        }
+                        println!("  [{}] peers (live):\n  {}\n  [{}] roster (configured, not all necessarily live): {}", self.name, lines.join("\n  "), self.name, self.roster.names().collect::<Vec<_>>().join(", "));
+                    }
+                    Err(e) => println!("  [{}] Peers: bad response: {e}", self.name),
+                },
+                Err(e) => println!("  [{}] Peers: node unreachable: {e}", self.name),
+            },
             _ => return false,
         }
         true
@@ -584,7 +626,17 @@ pub async fn run(cfg: AgentConfig) {
         // task are waiting, and the newest supersedes them all. Keep the
         // newest per (task, kind) — the `Coalesce` policy from docs/CLI.md.
         let mut latest: HashMap<(String, String), Entry> = HashMap::new();
-        for e in batch.into_iter().filter(|e| e.wakes.as_deref() == Some(my_hex.as_str())) {
+        for e in batch.into_iter().filter(|e| {
+            match e.wakes.as_deref() {
+                Some(w) if w == my_hex => true,
+                // The broadcast sentinel (`Node::absorb`) wakes every live
+                // cat but the one that sent it — otherwise a cat's own
+                // broadcast would wake itself and it'd start replying to
+                // its own message.
+                Some("*") => e.effect.get("from").and_then(|v| v.as_str()) != Some(my_hex.as_str()),
+                _ => false,
+            }
+        }) {
             let k = (
                 e.effect.get("task").and_then(|v| v.as_str()).unwrap_or("").to_string(),
                 e.effect.get("t").and_then(|v| v.as_str()).unwrap_or("").to_string(),

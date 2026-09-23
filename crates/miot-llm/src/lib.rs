@@ -291,6 +291,20 @@ fn note_tools() -> Vec<Tool> {
                  no task; nothing to report back beyond whether it was accepted.",
             )
             .with_schema(serde_json::json!({"type": "object", "properties": {}})),
+        // Found live 2026-09-23: a cat asked to address "your littermate"
+        // with no name given invented a plausible-sounding one and tried
+        // to SendMessage it. The roster is now stated in every `said`
+        // prompt (`Cat::prompt`) so that specific guess never has to
+        // happen again, but who's actually *live* right now — as opposed
+        // to just genesis-configured — still isn't something a cat could
+        // ask before this.
+        Tool::new("Peers")
+            .with_description(
+                "Who else is in this litter, by name, and which of them is the mesh's current \
+                 primary (the node that actually seals blocks — separate from the litter's \
+                 planning leader).",
+            )
+            .with_schema(serde_json::json!({"type": "object", "properties": {}})),
     ]
 }
 
