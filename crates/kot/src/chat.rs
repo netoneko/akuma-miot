@@ -7,9 +7,13 @@
 //! `ReadFile`, `WriteFile`) and runs them right here, rather than routing
 //! through a node that isn't running. `Artifact`/`ArtifactList`/
 //! `ArtifactRead` are left out: those publish to the chain, and there is
-//! none here to publish to. Unlike a cat's turn (stateless, the chain
-//! carries the question) this keeps real conversation history in memory for
-//! as long as the process runs — there is nothing else here to carry it.
+//! none here to publish to.
+//!
+//! Unlike a cat's turn (stateless, the chain carries the question) this
+//! keeps real conversation history in memory for as long as the process
+//! runs — the one place in this project where a session actually
+//! accumulates context and can run out of room, so it's the one place
+//! that tracks a token budget and can compact ([`miot_llm::budget_tools`]).
 
 use crate::common::{DIM, OFF};
 use miot_llm::{Call, Llm, Speaker};
@@ -27,11 +31,16 @@ const CHAT_RULES: &str = "\n\nRules:\n\
 machine before replying — their output is shown to the operator, not fed \
 back to you, so make each call self-contained.\n\
 - Always call SendMessage with your reply, even if you called nothing else. \
-Never answer in plain text alone.";
+Never answer in plain text alone.\n\
+- TokenBudget tells you how much context you have left and lists ids of \
+past tool results. Compact writes a summary of the conversation so far and \
+replaces it, to free up room — past tool results survive a Compact; \
+Inspect one back by id if you need it again.";
 
 fn tools() -> Vec<miot_llm::Tool> {
     let mut t = vec![miot_llm::send_message_tool()];
     t.extend(miot_llm::local_tools());
+    t.extend(miot_llm::budget_tools());
     t
 }
 
@@ -73,12 +82,57 @@ async fn act_local(c: &Call) -> String {
     }
 }
 
+/// `used_pct` against `context_window`, if either is known — `None` means
+/// "can't tell" (a hosted provider with no queryable window), not zero.
+fn pct_used(total_tokens: u32, context_window: Option<u32>) -> Option<u32> {
+    let window = context_window?;
+    if window == 0 {
+        return None;
+    }
+    Some(((total_tokens as u64 * 100) / window as u64) as u32)
+}
+
+fn budget_report(pct: Option<u32>, context_window: Option<u32>, total_tokens: u32, tool_log_len: usize) -> String {
+    let usage = match (pct, context_window) {
+        (Some(p), Some(w)) => format!("{total_tokens}/{w} tokens ({p}%) used last turn"),
+        _ => format!("{total_tokens} tokens used last turn (context window unknown for this model)"),
+    };
+    if tool_log_len == 0 {
+        format!("{usage}. No tool results stored yet.")
+    } else {
+        format!("{usage}. Tool results stored: ids 0..{} — Inspect{{id}} to pull one back.", tool_log_len - 1)
+    }
+}
+
+/// One extra call, no tools, asking the model to summarize itself — used
+/// both when it calls `Compact` and when a session is force-compacted at
+/// `miot_llm::FORCE_COMPACT_PCT` without waiting for that.
+async fn summarize(llm: &Llm, system: &str, history: &[(Speaker, String)]) -> String {
+    let ask = "Summarize this conversation so far for your own future reference — what was asked, \
+               what you found or did, what's still open. Plain text, no tools, as concise as it can \
+               be while staying useful.";
+    let mut h = history.to_vec();
+    h.push((Speaker::User, ask.to_string()));
+    match llm.converse(system, &h, Vec::new()).await {
+        Ok(turn) if !turn.text.trim().is_empty() => turn.text.trim().to_string(),
+        _ => "(compaction summary unavailable — history cleared anyway)".to_string(),
+    }
+}
+
 pub async fn run(cfg: ChatConfig) {
     println!("talking to {} — {}", cfg.llm.label(), DIM.to_string() + "/quit or Ctrl-D to leave" + OFF);
+    let context_window = cfg.llm.context_window().await;
+    match context_window {
+        Some(w) => println!("{DIM}context window: {w} tokens{OFF}"),
+        None => println!("{DIM}context window: unknown for this model — budget warnings won't fire{OFF}"),
+    }
     println!();
 
     let system = format!("{}{CHAT_RULES}", cfg.persona);
     let mut history: Vec<(Speaker, String)> = Vec::new();
+    let mut tool_log: Vec<(String, String)> = Vec::new();
+    let mut warned_tier: u32 = 0;
+    let mut pending_warning: Option<String> = None;
     let stdin = std::io::stdin();
 
     loop {
@@ -99,18 +153,49 @@ pub async fn run(cfg: ChatConfig) {
         }
 
         history.push((Speaker::User, line.to_string()));
-        match cfg.llm.converse(&system, &history, tools()).await {
+        let system_now = match pending_warning.take() {
+            Some(w) => format!("{system}\n\n{w}"),
+            None => system.clone(),
+        };
+        match cfg.llm.converse(&system_now, &history, tools()).await {
             Ok(turn) => {
                 let mut said: Option<String> = None;
-                let mut ran: Vec<&str> = Vec::new();
+                let mut ran: Vec<String> = Vec::new();
+                let mut compacted = false;
+
                 for call in &turn.calls {
-                    if call.name == "SendMessage" {
-                        said = call.str("body");
-                        continue;
+                    match call.name.as_str() {
+                        "SendMessage" => said = call.str("body"),
+                        "Compact" => {
+                            let summary = call.str("summary").unwrap_or_default();
+                            println!("{DIM}  compacted: history replaced with a {}-char summary the model wrote. Tool results kept ({} stored).{OFF}", summary.len(), tool_log.len());
+                            history = vec![(Speaker::Assistant, summary)];
+                            warned_tier = 0;
+                            compacted = true;
+                        }
+                        "TokenBudget" => {
+                            let report = budget_report(pct_used(turn.total_tokens, context_window), context_window, turn.total_tokens, tool_log.len());
+                            println!("{DIM}  {report}{OFF}");
+                            history.push((Speaker::User, format!("[TokenBudget] {report}")));
+                        }
+                        "Inspect" => {
+                            let id = call.args.get("id").and_then(|v| v.as_u64()).map(|n| n as usize);
+                            let text = match id.and_then(|i| tool_log.get(i)) {
+                                Some((name, out)) => format!("[Inspect #{} — {name}]\n{out}", id.unwrap()),
+                                None => format!("[Inspect] no stored result with that id ({} stored: 0..{})", tool_log.len(), tool_log.len().saturating_sub(1)),
+                            };
+                            println!("{DIM}  {}{OFF}", text.replace('\n', "\n  "));
+                            history.push((Speaker::User, text));
+                        }
+                        other => {
+                            ran.push(other.to_string());
+                            let out = act_local(call).await;
+                            println!("{DIM}  {}{OFF}", out.replace('\n', "\n  "));
+                            tool_log.push((other.to_string(), out));
+                        }
                     }
-                    ran.push(&call.name);
-                    println!("{DIM}  {}{OFF}", act_local(call).await.replace('\n', "\n  "));
                 }
+
                 // Always answer — a model that only reached for Bash, or
                 // that replied in plain text instead of calling
                 // SendMessage, still gets treated as having said something.
@@ -119,6 +204,26 @@ pub async fn run(cfg: ChatConfig) {
                     .unwrap_or_else(|| if ran.is_empty() { "(no reply)".to_string() } else { format!("(ran {} — no further reply)", ran.join(", ")) });
                 println!("{reply}\n{DIM}({} tok, {:.1}s){OFF}\n", turn.tokens, turn.ms as f64 / 1000.0);
                 history.push((Speaker::Assistant, reply));
+
+                // Budget check, against what this turn actually cost — not
+                // affected by whatever got pushed into `history` above,
+                // since that's for the *next* turn to pay for.
+                if let Some(pct) = pct_used(turn.total_tokens, context_window) {
+                    if pct >= miot_llm::FORCE_COMPACT_PCT && !compacted {
+                        println!("{DIM}  {pct}% of context window used — force-compacting before continuing.{OFF}");
+                        let summary = summarize(&cfg.llm, &system, &history).await;
+                        println!("{DIM}  compacted: {} tool results kept, Inspect to pull one back.{OFF}\n", tool_log.len());
+                        history = vec![(Speaker::Assistant, summary)];
+                        warned_tier = 0;
+                    } else if let Some(tier) = miot_llm::budget_checkpoint(pct, warned_tier) {
+                        warned_tier = tier;
+                        pending_warning = Some(format!(
+                            "⚠ context budget: {pct}% of your window used. Consider calling Compact soon \
+                             (past tool results survive it) — this session force-compacts at {}%.",
+                            miot_llm::FORCE_COMPACT_PCT
+                        ));
+                    }
+                }
             }
             Err(e) => {
                 println!("{DIM}error: {e}{OFF}\n");

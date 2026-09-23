@@ -61,7 +61,16 @@ impl Call {
 pub struct Turn {
     pub text: String,
     pub calls: Vec<Call>,
+    /// Completion tokens only — kept for existing callers' `{tokens} tok`
+    /// logging.
     pub tokens: u32,
+    /// The size of what was actually sent this call (prompt) — meaningful
+    /// for [`Llm::converse`], where the prompt grows to hold the whole
+    /// history every turn, so this doubles as "context used so far."
+    pub prompt_tokens: u32,
+    /// `prompt_tokens + tokens`, or the provider's own total if it reports
+    /// one directly.
+    pub total_tokens: u32,
     pub ms: u64,
 }
 
@@ -70,6 +79,13 @@ pub struct Llm {
     client: Client,
     model: String,
     label: String,
+    // Only `Llm::local` can answer this (a raw `/v1/models` GET; no
+    // provider-agnostic way to ask a hosted model its context length), and
+    // only ever needs answering once — a chat/model pair's window doesn't
+    // change mid-session.
+    base_url: Option<String>,
+    http: reqwest::Client,
+    context_window: tokio::sync::OnceCell<Option<u32>>,
 }
 
 impl Llm {
@@ -99,6 +115,9 @@ impl Llm {
             client: Client::builder().with_service_target_resolver(resolver).build(),
             model: model.to_string(),
             label: format!("{model} @ {}", base_url.rsplit('/').next().unwrap_or(base_url)),
+            base_url: Some(base_url.trim_end_matches('/').to_string()),
+            http: reqwest::Client::new(),
+            context_window: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -109,6 +128,9 @@ impl Llm {
             client: Client::default(),
             model: model.to_string(),
             label: model.to_string(),
+            base_url: None,
+            http: reqwest::Client::new(),
+            context_window: tokio::sync::OnceCell::new(),
         }
     }
 
@@ -128,7 +150,23 @@ impl Llm {
             })
             .build();
         let model = if model.contains("::") { model.to_string() } else { format!("zai-coding::{model}") };
-        Llm { client, label: model.clone(), model }
+        Llm { client, label: model.clone(), model, base_url: None, http: reqwest::Client::new(), context_window: tokio::sync::OnceCell::new() }
+    }
+
+    /// This model's context window, if it can be determined at all — only
+    /// `Llm::local` can (one cached `GET {base}/v1/models`, reading
+    /// `data[0].meta.n_ctx`); a hosted provider has no such endpoint here,
+    /// so this stays `None` rather than guessing a number that isn't
+    /// verified for the specific model in use.
+    pub async fn context_window(&self) -> Option<u32> {
+        *self
+            .context_window
+            .get_or_init(|| async {
+                let base = self.base_url.as_ref()?;
+                let v: serde_json::Value = self.http.get(format!("{base}/v1/models")).send().await.ok()?.json().await.ok()?;
+                v.get("data")?.as_array()?.first()?.get("meta")?.get("n_ctx")?.as_u64().map(|n| n as u32)
+            })
+            .await
     }
 
     pub fn label(&self) -> &str {
@@ -158,13 +196,15 @@ impl Llm {
             .map_err(|e| format!("{}: {e}", self.label))?;
 
         let tokens = res.usage.completion_tokens.unwrap_or(0).max(0) as u32;
+        let prompt_tokens = res.usage.prompt_tokens.unwrap_or(0).max(0) as u32;
+        let total_tokens = res.usage.total_tokens.map(|t| t.max(0) as u32).unwrap_or(prompt_tokens + tokens);
         let text = res.first_text().unwrap_or_default().to_string();
         let calls = res
             .into_tool_calls()
             .into_iter()
             .map(|c| Call { name: c.fn_name, args: c.fn_arguments })
             .collect();
-        Ok(Turn { text, calls, tokens, ms: started.elapsed().as_millis() as u64 })
+        Ok(Turn { text, calls, tokens, prompt_tokens, total_tokens, ms: started.elapsed().as_millis() as u64 })
     }
 }
 
@@ -283,6 +323,44 @@ pub fn local_tools() -> Vec<Tool> {
                     "content": {"type": "string"}
                 },
                 "required": ["path", "content"]
+            })),
+    ]
+}
+
+/// Session/context-window management — offered only where a session
+/// actually accumulates history across turns (`kot chat`; not `agent.rs`,
+/// whose turns are stateless per wake and so have nothing to compact).
+/// `TokenBudget` and `Inspect` are the one exception in this project to "a
+/// local tool's result is never fed back to the model": their entire
+/// purpose is to put something back in front of the model on request, so
+/// the caller feeds their result into the next turn's history rather than
+/// only printing it.
+pub fn budget_tools() -> Vec<Tool> {
+    vec![
+        Tool::new("TokenBudget")
+            .with_description(
+                "Check how much of your context window this session has used, and list the ids \
+                 of past tool-call results you can still Inspect — compaction clears the \
+                 conversation but keeps those.",
+            )
+            .with_schema(serde_json::json!({"type": "object", "properties": {}})),
+        Tool::new("Compact")
+            .with_description(
+                "Replace your own conversation history with a summary you write, to free up \
+                 context. Past tool-call results are NOT cleared by this — list them again with \
+                 TokenBudget and Inspect one back if you need it after compacting.",
+            )
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"summary": {"type": "string", "description": "everything about the conversation so far worth remembering"}},
+                "required": ["summary"]
+            })),
+        Tool::new("Inspect")
+            .with_description("Pull one of your own past tool-call results (by id, from TokenBudget's list) back into view.")
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "integer", "description": "an id TokenBudget listed"}},
+                "required": ["id"]
             })),
     ]
 }

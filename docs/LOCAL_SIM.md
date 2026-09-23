@@ -203,3 +203,60 @@ kind of throwaway solo node: `pallet_litter::Call::request_compaction`
 everywhere `Artifact`/`ArtifactList`/`ArtifactRead` are) both exist now.
 Verified: `[node] compacted at block 3 (3 block(s) pruned)` as root,
 `NotAuthorized` as anyone else.
+
+## Token budget + self-compaction — `kot chat` only, design
+
+Asked for 2026-09-23, landing in `kot chat` (`crates/kot/src/chat.rs`)
+specifically, not `agent.rs`. That's a deliberate scope line, not an
+oversight: `agent.rs`'s turns are stateless per wake by design (`Cat::prompt`
+builds a fresh system+user pair every time — the "conversation" a human
+sees in `kot log` is reconstructed from many independent turns, each of
+which never saw the others). There is no accumulating history in the agent
+loop to run out of room, so there is nothing for a budget warning or a
+compaction tool to act on. `kot chat`'s `history: Vec<(Speaker, String)>`
+is the one place that actually grows across a session — this is for that.
+
+**Budget tracking.** `Llm::context_window()` (`miot_llm`) is best-effort:
+for `Llm::local`, one cached `GET {base}/v1/models` reads
+`data[0].meta.n_ctx` (confirmed present on `llama-server`'s response,
+2026-09-23 — see the earlier local-model check in this doc's history);
+for GLM/hosted there is no such endpoint, so it stays `None` and every
+budget feature below simply doesn't fire — no fabricated number. `Turn`
+carries `prompt_tokens`/`total_tokens` (from `genai`'s `Usage`) alongside
+the existing completion-only `tokens`, since a turn's `total_tokens` *is*
+the current context size once `converse` sends the whole history every
+call — no separate running sum needed.
+
+**Warnings.** `miot_llm::budget_checkpoint(used_pct, last_warned)` returns
+the next crossed threshold: 25% first, then every 10 up to 80%, then every
+2% to 100% — finer near the end, where a session actually runs out. Crossing
+a new checkpoint appends one warning to the *next* turn's system prompt
+(not `history` — it's an ambient nudge, not something either party "said"),
+cleared after that one use.
+
+**Force compaction at 98%** (`miot_llm::FORCE_COMPACT_PCT`) — happens
+regardless of whether the model ever calls the tool below: one extra
+`converse` call asks the model to summarize `history` for its own future
+reference, then `history` is replaced with that single summary as an
+assistant turn. A session should never actually hit 100% and fail a turn
+outright.
+
+**Self-compaction, model-initiated: the `Compact` tool.** Takes a
+`summary` argument the model writes itself; `history` is replaced with
+just that summary. Same mechanism as the forced path, model's own call
+instead of an automatic one — offered so a cat can compact proactively
+(e.g., right after finishing a large piece of work) rather than only ever
+being forced at 98%.
+
+**Tool call results survive compaction; the conversation doesn't.**
+Every non-`SendMessage` tool call's output (`Bash`, `ReadFile`, ...) is
+kept in a `tool_log: Vec<(String, String)>` — name and full result — that
+`Compact`/force-compaction never touches, only `history` does. Nothing
+about this is auto-restored into context after a compaction, on purpose:
+a cat that needs something it read before must deliberately call `Inspect
+{id}` (new tool; `TokenBudget`'s report lists the ids currently held) to
+pull one result back into `history` — the two tools that actually inform
+the model (`TokenBudget`, `Inspect`) are the exception to the rest of this
+project's "a local tool's result is never fed back" rule, because their
+entire point is to put something back in front of the model on request;
+`Bash`/`ReadFile`/`WriteFile`/`Artifact*` stay fire-and-forget as before.
