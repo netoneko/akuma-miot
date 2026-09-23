@@ -25,8 +25,7 @@ Models: `llama-<agent>.service` on ryzen (`deploy.sh llama ryzen-linux`),
 ## Look at it
 
 ```bash
-R="$(grep ^MIOT_ROSTER overlays/deploy/mesh.env | cut -d= -f2-)"
-kot --node http://192.168.1.126:9944 --roster "$R" peers
+kot --node https://192.168.1.126:9944 peers     # the roster comes from the node; no --roster
 ```
 
 `peers` prints the litter roster (who's litter leader) and the mesh as the
@@ -46,9 +45,9 @@ cat's `block N … — thinking` / tool-call lines.
 Any node will do — a replica forwards writes to the primary.
 
 ```bash
-kot --node http://192.168.1.126:9944 --roster "$R" say --to mac-linux "hi"   # a targeted say wakes that cat
-kot --node http://192.168.1.126:9944 --roster "$R" task open "the question"   # the litter leader plans it
-kot --node http://192.168.1.126:9944 --roster "$R"                            # REPL
+kot --node https://192.168.1.126:9944 say --to kuro "hi"          # a targeted say wakes that cat
+kot --node https://192.168.1.126:9944 task open "the question"    # the litter leader plans it
+kot --node https://192.168.1.126:9944                             # REPL
 ```
 
 An untargeted `say` wakes nobody, by design (a broadcast that woke every cat

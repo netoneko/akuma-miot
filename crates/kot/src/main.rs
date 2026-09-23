@@ -56,7 +56,9 @@ struct Cli {
     /// Sign with the seed in this file instead.
     #[arg(long, env = "MIOT_SEED_FILE", global = true)]
     seed_file: Option<String>,
-    /// name=seed or name=pub:<hex>, comma-separated.
+    /// name=seed or name=pub:<hex>, comma-separated. `run`: the genesis
+    /// roster. A client doesn't need one — it reads the roster from the node
+    /// (`/roster`); here it's only where `--as <name>` finds a dev seed.
     #[arg(long, env = "MIOT_ROSTER", global = true, default_value = DEV_ROSTER)]
     roster: String,
     #[command(subcommand)]
@@ -136,17 +138,8 @@ struct RunArgs {
     /// The block log. Default: kot-<name>.db
     #[arg(long, env = "MIOT_DB")]
     db: Option<String>,
-    /// A llama-server (or any OpenAI-compatible) base URL.
-    #[arg(long, env = "MIOT_LLM", conflicts_with = "glm")]
-    llm: Option<String>,
-    /// GLM on z.ai, key read from --glm-token-file.
-    #[arg(long, env = "MIOT_GLM")]
-    glm: bool,
-    #[arg(long, env = "MIOT_GLM_TOKEN_FILE", default_value = "~/.akuma/z.ai/token")]
-    glm_token_file: String,
-    /// Default: qwen3:4b, or glm-5.3 (z.ai coding plan) with --glm.
-    #[arg(long, env = "MIOT_MODEL")]
-    model: Option<String>,
+    #[command(flatten)]
+    llm: LlmArgs,
     #[arg(long, env = "MIOT_PERSONA")]
     persona: Option<String>,
     /// Root: an authorized_keys line, 64-hex account, or dev seed. Genesis.
@@ -174,34 +167,55 @@ struct RunArgs {
 
 #[derive(Args)]
 struct ChatArgs {
-    /// A llama-server (or any OpenAI-compatible) base URL.
-    #[arg(long, env = "MIOT_LLM", conflicts_with = "glm")]
-    llm: Option<String>,
-    /// GLM on z.ai, key read from --glm-token-file.
-    #[arg(long, env = "MIOT_GLM")]
-    glm: bool,
-    #[arg(long, env = "MIOT_GLM_TOKEN_FILE", default_value = "~/.akuma/z.ai/token")]
-    glm_token_file: String,
-    /// Default: qwen3:4b, or glm-5.3 (z.ai coding plan) with --glm.
-    #[arg(long, env = "MIOT_MODEL")]
-    model: Option<String>,
+    #[command(flatten)]
+    llm: LlmArgs,
     #[arg(long, env = "MIOT_PERSONA")]
     persona: Option<String>,
 }
 
-/// Shared with `run`: `--llm` and `--glm` build the same [`miot_llm::Llm`]
-/// either way, and a service unit or a one-off `chat` session both take it
-/// from the same token file rather than `ZAI_API_KEY` in the environment.
-fn build_llm(llm: &Option<String>, glm: bool, glm_token_file: &str, model: &Option<String>) -> Option<miot_llm::Llm> {
-    match (llm, glm) {
-        (Some(url), _) => Some(miot_llm::Llm::local(url, model.as_deref().unwrap_or("qwen3:4b"))),
-        (None, true) => {
-            let path = expand_home(glm_token_file);
-            let token = std::fs::read_to_string(&path).unwrap_or_else(|e| die(format!("--glm: {}: {e}", path.display())));
-            Some(miot_llm::Llm::glm(&token, model.as_deref().unwrap_or("glm-5.3")))
-        }
-        (None, false) => None,
+/// What a cat thinks with — shared by `run` and `chat`, so a service unit
+/// and a one-off `chat` session build the same [`miot_llm::Llm`], each hosted
+/// provider's key read from a token file rather than the environment.
+#[derive(Args)]
+struct LlmArgs {
+    /// A llama-server (or any OpenAI-compatible, keyless) base URL.
+    #[arg(long, env = "MIOT_LLM", conflicts_with_all = ["glm", "openrouter"])]
+    llm: Option<String>,
+    /// GLM on z.ai, key read from --glm-token-file.
+    #[arg(long, env = "MIOT_GLM", conflicts_with = "openrouter")]
+    glm: bool,
+    #[arg(long, env = "MIOT_GLM_TOKEN_FILE", default_value = "~/.akuma/z.ai/token")]
+    glm_token_file: String,
+    /// Any OpenRouter model (--model is required: `moonshotai/kimi-k2`, …),
+    /// key read from --openrouter-token-file.
+    #[arg(long, env = "MIOT_OPENROUTER")]
+    openrouter: bool,
+    #[arg(long, env = "MIOT_OPENROUTER_TOKEN_FILE", default_value = "~/.akuma/openrouter/token")]
+    openrouter_token_file: String,
+    /// Default: qwen3:4b, or glm-5.3 (z.ai coding plan) with --glm. No
+    /// default with --openrouter: an OpenRouter model is a spending choice.
+    #[arg(long, env = "MIOT_MODEL")]
+    model: Option<String>,
+}
+
+fn read_token(flag: &str, file: &str) -> String {
+    let path = expand_home(file);
+    std::fs::read_to_string(&path).unwrap_or_else(|e| die(format!("{flag}: {}: {e}", path.display())))
+}
+
+fn build_llm(a: &LlmArgs) -> Option<miot_llm::Llm> {
+    let model = a.model.as_deref();
+    if let Some(url) = &a.llm {
+        return Some(miot_llm::Llm::local(url, model.unwrap_or("qwen3:4b")));
     }
+    if a.glm {
+        return Some(miot_llm::Llm::glm(&read_token("--glm", &a.glm_token_file), model.unwrap_or("glm-5.3")));
+    }
+    if a.openrouter {
+        let model = model.unwrap_or_else(|| die("--openrouter needs --model (an OpenRouter model id, e.g. qwen/qwen3-coder)"));
+        return Some(miot_llm::Llm::openrouter(&read_token("--openrouter", &a.openrouter_token_file), model));
+    }
+    None
 }
 
 fn die(msg: impl std::fmt::Display) -> ! {
@@ -273,9 +287,9 @@ async fn run(cli: &Cli, a: &RunArgs) {
     };
     let running = node::start(cfg).await.unwrap_or_else(|e| die(e));
 
-    let llm = build_llm(&a.llm, a.glm, &a.glm_token_file, &a.model);
+    let llm = build_llm(&a.llm);
     match llm {
-        None => println!("[{name}] no --llm/--glm: node only, no agent loop"),
+        None => println!("[{name}] no --llm/--glm/--openrouter: node only, no agent loop"),
         Some(llm) => {
             let persona = a
                 .persona
@@ -304,8 +318,7 @@ async fn main() {
     match &cli.cmd {
         Some(Cmd::Run(a)) => run(&cli, a).await,
         Some(Cmd::Chat(a)) => {
-            let llm = build_llm(&a.llm, a.glm, &a.glm_token_file, &a.model)
-                .unwrap_or_else(|| die("chat needs --llm <url> or --glm"));
+            let llm = build_llm(&a.llm).unwrap_or_else(|| die("chat needs --llm <url>, --glm or --openrouter"));
             let name = cli.as_.clone().unwrap_or_else(|| "cat".to_string());
             let persona = a
                 .persona

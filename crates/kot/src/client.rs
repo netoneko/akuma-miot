@@ -49,15 +49,16 @@ pub struct Client {
 }
 
 impl Client {
-    /// Pick the first node in `candidates` that answers `/head`. `roster`
-    /// doubles as the trusted-account set for mTLS pinning (`crate::tls`) —
-    /// the same accounts this client can already resolve names for are the
-    /// only ones it will accept a cert from.
+    /// Pick the first node in `candidates` that answers `/head`, then take
+    /// the roster from it. The node isn't pinned: it's a private chain the
+    /// operator runs, so whichever node answers is trusted, and it's the
+    /// source of the roster rather than something checked against one
+    /// (`crate::tls`'s module docs). `roster` is only a fallback for names
+    /// from a node too old to serve `/roster`.
     pub async fn connect(candidates: Vec<String>, identity: Identity, roster: Roster) -> Result<Self, String> {
-        let trusted = roster.0.iter().map(|(_, a)| a.clone()).collect();
         let http = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(30))
-            .use_preconfigured_tls(crate::tls::client_config(&identity, trusted))
+            .use_preconfigured_tls(crate::tls::client_config_any_node(&identity))
             .build()
             .unwrap();
         let mut c = Client { http, candidates, node: String::new(), identity, roster, dm_target: None };
@@ -66,12 +67,9 @@ impl Client {
         Ok(c)
     }
 
-    /// Name accounts by the chain's own genesis roster (`/roster`) rather
-    /// than this client's copy, so a stale or mislabeled `MIOT_ROSTER` can't
-    /// put the wrong name on anyone. The local roster still decides which
-    /// node certs to trust — that's needed before anything can be read — so
-    /// it only ever loses its *names* here, never its say over trust. A node
-    /// too old to have `/roster` leaves the local names in place.
+    /// Name accounts by the chain's own genesis roster (`/roster`), not by
+    /// any local copy. A node too old to have `/roster` leaves the local
+    /// (`--roster`) names in place.
     async fn adopt_chain_roster(&mut self) {
         let Ok(v) = self.get_json("/roster").await else { return };
         let rows: Vec<(String, AccountId)> = v

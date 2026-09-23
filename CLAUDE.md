@@ -94,6 +94,13 @@ read that first, it is kept current and this file does not repeat it.
   either is a coordinated restart, not an operation. A block log remembers
   the genesis it was built under and refuses a different one.
   No joint consensus — fine for one operator, not for anything else.
+- **An operator's client doesn't pin the node (2026-09-23).** `kot`'s
+  client reads the roster from whichever node it connects to (`/roster`)
+  and trusts that node's cert as presented (`tls::client_config_any_node`);
+  the node still pins the client to genesis. Something on the path can pose
+  as a node to the client (fake reads, seeing what's sent) but can't relay
+  to a real one without a member's key. Accepted for a private chain; node↔
+  node traffic stays fully pinned.
 - **Election ≠ replication.** A block the primary produced that no replica
   pulled before it died is lost to the rewind (records, not work —
   `miot-store`'s docs). There is no commit index.

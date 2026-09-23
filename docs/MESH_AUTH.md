@@ -227,6 +227,19 @@ real binary: a plain HTTP request against the port gets nothing (TLS only
 now); `openssl s_client` with no client cert gets a `certificate_required`
 TLS1.3 alert; a real `kot` client, signed and trusted, works normally.
 
+## The operator's client stopped pinning the node, 2026-09-23
+
+A client needed a local roster only to decide, at the first handshake, which
+node certs to accept. Now it accepts any node's (valid, Ed25519) cert and
+reads the roster from that node's `/roster`: the operator runs every node of
+a private chain, so the node is trusted by fiat (`tls::client_config_any_node`,
+used by `client.rs` only). The node still pins the client (`server_config`),
+so a non-member is refused exactly as before, and node↔node and the agent
+loop's own client stay fully pinned. The cost is a client-side MITM: something
+on the path can pose as a node to a client. It can't relay the client to a
+real node, since that needs a member's key to pass the node's pin. Revisit
+when a client ever runs somewhere the path isn't the operator's.
+
 ## Rejected alternatives
 
 - **`sc-network`/`rust-libp2p`** (what Polkadot actually uses) — Kademlia

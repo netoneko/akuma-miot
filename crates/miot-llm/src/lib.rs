@@ -21,7 +21,7 @@
 
 use genai::adapter::AdapterKind;
 pub use genai::chat::Tool;
-use genai::chat::{ChatMessage, ChatRequest};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 use std::time::Instant;
@@ -86,7 +86,17 @@ pub struct Llm {
     base_url: Option<String>,
     http: reqwest::Client,
     context_window: tokio::sync::OnceCell<Option<u32>>,
+    /// A cap on one turn's output, when the provider needs one: OpenRouter
+    /// checks a request's *worst case* (max output × price) against the key's
+    /// remaining limit, and with no cap it assumes the model's maximum (65k
+    /// for qwen3-coder), refusing with 402 long before the budget is spent.
+    max_tokens: Option<u32>,
 }
+
+/// [`Llm::openrouter`]'s cap. A cat's turn is a tool call or a few lines;
+/// 4096 is generous for that and keeps the worst case a small fraction of a
+/// $1-a-week key.
+pub const OPENROUTER_MAX_TOKENS: u32 = 4096;
 
 impl Llm {
     /// `base_url` is a server root — `http://127.0.0.1:8081` for a
@@ -118,6 +128,7 @@ impl Llm {
             base_url: Some(base_url.trim_end_matches('/').to_string()),
             http: reqwest::Client::new(),
             context_window: tokio::sync::OnceCell::new(),
+            max_tokens: None,
         }
     }
 
@@ -131,6 +142,7 @@ impl Llm {
             base_url: None,
             http: reqwest::Client::new(),
             context_window: tokio::sync::OnceCell::new(),
+            max_tokens: None,
         }
     }
 
@@ -150,7 +162,38 @@ impl Llm {
             })
             .build();
         let model = if model.contains("::") { model.to_string() } else { format!("zai-coding::{model}") };
-        Llm { client, label: model.clone(), model, base_url: None, http: reqwest::Client::new(), context_window: tokio::sync::OnceCell::new() }
+        Llm { client, label: model.clone(), model, base_url: None, http: reqwest::Client::new(), context_window: tokio::sync::OnceCell::new(), max_tokens: None }
+    }
+
+    /// Any model on OpenRouter (`moonshotai/kimi-k2`, `qwen/qwen3-coder`, …),
+    /// key handed in like [`Llm::glm`]'s so a service unit reads it from a
+    /// token file. OpenRouter speaks the OpenAI chat-completions dialect, so
+    /// this is genai's OpenAI adapter pointed at `openrouter.ai/api/v1/` —
+    /// genai 0.5 has no OpenRouter adapter of its own (0.7's, still in beta,
+    /// is the same thing: an OpenAI-compatible gateway).
+    pub fn openrouter(token: &str, model: &str) -> Self {
+        let token = token.trim().to_string();
+        let endpoint = Endpoint::from_static("https://openrouter.ai/api/v1/");
+        let resolver = ServiceTargetResolver::from_resolver_fn(
+            move |target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                Ok(ServiceTarget {
+                    endpoint: endpoint.clone(),
+                    auth: AuthData::from_single(token.clone()),
+                    model: ModelIden::new(AdapterKind::OpenAI, target.model.model_name),
+                })
+            },
+        );
+        Llm {
+            client: Client::builder().with_service_target_resolver(resolver).build(),
+            model: model.to_string(),
+            label: format!("{model} @ openrouter"),
+            // Not a llama-server: its `/models` is the whole catalog, with no
+            // `meta.n_ctx`, so there's no context window to learn from it.
+            base_url: None,
+            http: reqwest::Client::new(),
+            context_window: tokio::sync::OnceCell::new(),
+            max_tokens: Some(OPENROUTER_MAX_TOKENS),
+        }
     }
 
     /// This model's context window, if it can be determined at all — only
@@ -191,7 +234,7 @@ impl Llm {
         let req = ChatRequest::new(messages).with_tools(tools);
         let res = self
             .client
-            .exec_chat(&self.model, req, None)
+            .exec_chat(&self.model, req, self.max_tokens.map(|n| ChatOptions::default().with_max_tokens(n)).as_ref())
             .await
             .map_err(|e| format!("{}: {e}", self.label))?;
 

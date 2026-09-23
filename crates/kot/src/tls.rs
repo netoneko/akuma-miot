@@ -8,8 +8,18 @@
 //! key; what's checked instead is exactly [`node::Node::is_trusted_signer`]'s
 //! question — is the cert's embedded public key one of the genesis accounts
 //! everything else here already trusts — on every connection, both
-//! directions: the server requires a client cert, the client requires a
-//! server cert it recognizes, both pinned the same way.
+//! directions between mesh nodes: the server requires a client cert, the
+//! client requires a server cert it recognizes, both pinned the same way.
+//!
+//! **An operator's client doesn't pin the node** ([`client_config_any_node`],
+//! 2026-09-23): it's a private chain whose nodes the operator runs, so the
+//! node it connects to is trusted by fiat, and the roster comes *from* that
+//! node (`/roster`) instead of from a local copy the client would have to
+//! carry just to check the first handshake. The node still pins the client —
+//! a stranger still gets nothing — and the handshake still proves the node
+//! holds the key its cert names; what's given up is only "…and that key is a
+//! genesis member", i.e. protection against someone impersonating a node on
+//! the path. Node↔node traffic stays fully pinned: that's the mesh itself.
 //!
 //! What this buys over the `x-miot-signer`/`x-miot-sig` header envelope
 //! (`node.rs`) is confidentiality (the wire is no longer plaintext) and a
@@ -87,20 +97,22 @@ fn account_of(cert: &CertificateDer<'_>) -> Result<AccountId, rustls::Error> {
 }
 
 /// Same rule both verifier directions check: [`node::Node::is_trusted_signer`]'s
-/// set, applied to a TLS cert instead of a header signature.
-fn check_trusted(cert: &CertificateDer<'_>, trusted: &[AccountId]) -> Result<(), rustls::Error> {
+/// set, applied to a TLS cert instead of a header signature. `None` trusts
+/// any account — the cert must still be an Ed25519 one this module's shape
+/// accepts, and the handshake signature is still checked against it.
+fn check_trusted(cert: &CertificateDer<'_>, trusted: Option<&[AccountId]>) -> Result<(), rustls::Error> {
     let account = account_of(cert)?;
-    if trusted.contains(&account) {
-        Ok(())
-    } else {
-        Err(rustls::Error::General("certificate's account is not trusted".into()))
+    match trusted {
+        Some(set) if !set.contains(&account) => Err(rustls::Error::General("certificate's account is not trusted".into())),
+        _ => Ok(()),
     }
 }
 
 #[derive(Debug)]
 struct Pinned {
     provider: Arc<CryptoProvider>,
-    trusted: Vec<AccountId>,
+    /// `None`: any Ed25519 key (an operator's client, see the module docs).
+    trusted: Option<Vec<AccountId>>,
 }
 
 impl ServerCertVerifier for Pinned {
@@ -112,7 +124,7 @@ impl ServerCertVerifier for Pinned {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        check_trusted(end_entity, &self.trusted)?;
+        check_trusted(end_entity, self.trusted.as_deref())?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -143,7 +155,7 @@ impl ClientCertVerifier for Pinned {
     }
 
     fn verify_client_cert(&self, end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>], _now: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
-        check_trusted(end_entity, &self.trusted)?;
+        check_trusted(end_entity, self.trusted.as_deref())?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -172,7 +184,7 @@ fn provider() -> Arc<CryptoProvider> {
 /// certs to `trusted` — used for the node's own TLS listener.
 pub fn server_config(identity: &Identity, trusted: Vec<AccountId>) -> rustls::ServerConfig {
     let provider = provider();
-    let verifier: Arc<dyn ClientCertVerifier> = Arc::new(Pinned { provider: provider.clone(), trusted });
+    let verifier: Arc<dyn ClientCertVerifier> = Arc::new(Pinned { provider: provider.clone(), trusted: Some(trusted) });
     let (cert, key) = cert_for(identity);
     let mut config = rustls::ServerConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -185,9 +197,19 @@ pub fn server_config(identity: &Identity, trusted: Vec<AccountId>) -> rustls::Se
 }
 
 /// The mTLS client config for `identity`, presenting its own cert and
-/// pinning the server's to `trusted` — used by every caller of a node:
-/// `node.rs`'s own peer client, `client.rs`'s `Client`, `agent.rs`'s `Cat`.
+/// pinning the server's to `trusted` — for callers that already hold the
+/// genesis: `node.rs`'s own peer client, `agent.rs`'s `Cat`.
 pub fn client_config(identity: &Identity, trusted: Vec<AccountId>) -> rustls::ClientConfig {
+    configured_client(identity, Some(trusted))
+}
+
+/// [`client_config`] minus the pin on the server: `client.rs`'s `Client`,
+/// which learns the roster from the node it connects to (module docs).
+pub fn client_config_any_node(identity: &Identity) -> rustls::ClientConfig {
+    configured_client(identity, None)
+}
+
+fn configured_client(identity: &Identity, trusted: Option<Vec<AccountId>>) -> rustls::ClientConfig {
     let provider = provider();
     let verifier: Arc<dyn ServerCertVerifier> = Arc::new(Pinned { provider: provider.clone(), trusted });
     let (cert, key) = cert_for(identity);
@@ -264,6 +286,10 @@ mod tests {
     /// this exercises the exact path `node.rs`'s listener and every
     /// caller's client config will run in production.
     async fn handshake(server_id: &Identity, server_trusts: Vec<AccountId>, client_id: &Identity, client_trusts: Vec<AccountId>) -> Result<(), String> {
+        handshake_with(server_id, server_trusts, client_config(client_id, client_trusts)).await
+    }
+
+    async fn handshake_with(server_id: &Identity, server_trusts: Vec<AccountId>, client: rustls::ClientConfig) -> Result<(), String> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
         let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config(server_id, server_trusts)));
@@ -272,7 +298,7 @@ mod tests {
             acceptor.accept(tcp).await.map(|_| ()).map_err(|e| e.to_string())
         });
 
-        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config(client_id, client_trusts)));
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client));
         let tcp = TcpStream::connect(addr).await.unwrap();
         let name = ServerName::IpAddress(addr.ip().into());
         let client_result = connector.connect(name, tcp).await.map(|_| ()).map_err(|e| e.to_string());
@@ -305,6 +331,17 @@ mod tests {
         let b = Identity::from_seed(&[2; 32]);
         let result = handshake(&a, vec![a.account(), b.account()], &b, vec![b.account()]).await;
         assert!(result.is_err(), "expected the untrusted server to be refused");
+    }
+
+    #[tokio::test]
+    async fn an_operator_client_takes_any_node_but_the_node_still_pins_it() {
+        let node = Identity::from_seed(&[1; 32]);
+        let root = Identity::from_seed(&[2; 32]);
+        let stranger = Identity::from_seed(&[3; 32]);
+        // The client knows nothing about the node's account, and connects.
+        assert!(handshake_with(&node, vec![root.account()], client_config_any_node(&root)).await.is_ok());
+        // The node still refuses a client that isn't a member.
+        assert!(handshake_with(&node, vec![root.account()], client_config_any_node(&stranger)).await.is_err());
     }
 
     #[tokio::test]
