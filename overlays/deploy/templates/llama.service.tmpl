@@ -1,0 +1,11 @@
+[Unit]
+Description=llama-server for kot {agent} (port {port}, {threads} threads)
+After=network-online.target
+
+[Service]
+ExecStart=/root/llama.cpp/build/bin/llama-server -m {gguf} --host {bind} --port {port} -c 8192 --jinja --parallel 1 -t {threads}
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

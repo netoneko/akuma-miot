@@ -14,7 +14,11 @@ read that first, it is kept current and this file does not repeat it.
   no I/O. This is the real thing; everything else hosts it.
 - `crates/pallet-litter` — thin FRAME wrapper: `ensure_signed` → load →
   `TaskTable::apply` → store → emit. One dispatchable per verb
-  (`open`/`plan`/`update`/`reassign`/`say`/`set_leader`/`set_root`).
+  (`open`/`plan`/`update`/`reassign`/`say`/`set_leader`/`set_root`/
+  `clear_all`/`publish_standalone_artifact`/`request_compaction`).
+  `request_compaction` (root-only, added 2026-09-23) touches no task state —
+  it exists only so `node.rs::submit` can match it and fire `Store::compact`
+  on demand, the same mechanism `clear_all` triggers as a side effect.
 - `crates/miot-runtime` — `construct_runtime!`, executed **natively** (no
   wasm, no `sc-executor`). Timer/limit constants live here as
   `parameter_types!`, tuned against measured LLM turn lengths, not against
@@ -38,12 +42,16 @@ read that first, it is kept current and this file does not repeat it.
   "cat". `kot run --as <name>` is a mesh node (`node.rs`) plus, given
   `--llm`/`--glm`, that cat's agent loop (`agent.rs`) in the same process,
   still talking to its node over HTTP (`docs/CLI.md` §5a). Every other verb
-  (`task open|list`, `say`, `artifact`, `peers`, `log`, `clear`, `id`, bare
-  `kot` = REPL) is a stateless client of *any* node (`client.rs`); a
-  replica forwards `/submit` and `/account` to the elected primary.
-  `crates/miot` (the old node+client binary) was merged in and deleted
-  2026-09-22 (`docs/CLEANUP.md` item 2). `tests/election.rs` runs three
-  real nodes over localhost HTTP, kills the primary, revives it.
+  (`task open|list`, `say`, `artifact`, `peers`, `log`, `clear`, `compact`,
+  `id`, bare `kot` = REPL) is a stateless client of *any* node
+  (`client.rs`); a replica forwards `/submit` and `/account` to the elected
+  primary. `chat` (`chat.rs`, added 2026-09-23) is the one verb that isn't:
+  a model in this process with no node and no chain at all, real tool
+  execution (`Bash`/`ReadFile`/`WriteFile`/`SendMessage`) via
+  `miot_llm::local_tools`. `crates/miot` (the old node+client binary) was
+  merged in and deleted 2026-09-22 (`docs/CLEANUP.md` item 2).
+  `tests/election.rs` runs three real nodes over localhost HTTP, kills the
+  primary, revives it.
 - `miot-cli` never shipped under that name — `docs/CLI.md` is its design of
   record, and `kot`'s client verbs are the implementation.
 
@@ -61,6 +69,11 @@ read that first, it is kept current and this file does not repeat it.
   local: Turso), why they're split, and the leader-wins rewind rule.
 - `docs/FLEET.md` — which cat runs which model on which host, updated as
   hardware changes; check dates before trusting a host/model assignment.
+- `docs/LOCAL_SIM.md` — running the agent loop and multi-cat behavior with
+  no fleet and no real infra (`kot chat`; a peered local mesh of `kot run`
+  cats against dev `llama-server`s). Two real `agent.rs` bugs and two open
+  findings (a non-root broadcast wakes nobody; a failed `/submit` is never
+  retried) came out of actually doing this, 2026-09-23.
 
 ## Known gaps (don't assume these are fixed without checking the code)
 
@@ -76,6 +89,18 @@ read that first, it is kept current and this file does not repeat it.
 - **`seq` in `/events` restarts when a node rebuilds its log** (demotion,
   rewind, adopted checkpoint). The agent loop resets its cursor; any other
   client holding one should too.
+- **A non-root broadcast (`say` with no `to`) wakes no cat's agent loop.**
+  `Effect::wakes()` says it should (`to.is_some() || from_root`), but
+  `Effect::to()` — what actually reaches the wire as the `wakes` hex field
+  — collapses `to: None` to `None` regardless of `from_root`. A human
+  watching the REPL/`kot log` still sees the text (rendering doesn't
+  consult `wakes()`), which is why this went unnoticed. Found 2026-09-23,
+  not fixed — `docs/LOCAL_SIM.md`.
+- **A failed `/submit` is never retried.** `Cat::submit` (`agent.rs`) makes
+  one HTTP attempt; on failure the wake is gone for good — `seen`/`cursor`
+  already advanced before the attempt. Task wakes get incidental cover from
+  the chain's own re-nudge tick; a `"said"` DM has no backstop at all.
+  Found 2026-09-23, not fixed — `docs/LOCAL_SIM.md`.
 
 ## Build, run, test
 
@@ -132,24 +157,41 @@ symptom matrix ("I see X, what do I read?") — check there before forming a
 theory about anything that looks like a kernel-level oddity rather than an
 akuma-miot bug.
 
-**`../akuma/scripts/box/` is the pattern `overlays/deploy/deploy.sh` should
-eventually be rewritten on top of** (asked 2026-09-23; deliberately deferred,
-not started). It's the box's own build environment — five files
-(`akuma-dev.env`, `kbuild`, `ubuild`, `mbuild`, `kinstall`) checked into
-`../akuma` and copied onto the physical box rather than authored there, so
-the rig can be rebuilt from a checkout and can't silently drift from what
-the repo documents (`../akuma/scripts/box/README.md`). Two properties worth
-carrying over: an env file every wrapper sources (an sshd session inherits
-*no* environment — the same reason `deploy.sh`'s own `on()`/`put()` fight
-akuma's shell every time), and build/state kept out of the checkout's own
-tree so `git status` on the box stays clean. `deploy.sh`'s akuma/fcguest
-shape is currently the least reliable part of it — see HANDOFF's herd traps
-and the 2026-09-23 session that found `deploy.sh`'s fcguest identity check
-comparing against a key `mesh.env` no longer uses (relabeled to persona
-names 2026-09-22) and a `ryzen-akuma-amd64` crash loop (`[herd] Service kot
-exited with code 241`, herd retries a few times then stops) — exactly the
-kind of drift `scripts/box/`'s checked-in-and-copied model exists to
-prevent.
+**`overlays/deploy/deploy.py` is now the Python rewrite of `deploy.sh`
+(2026-09-23), built on the pattern `../akuma/scripts/box/` uses for the
+bare-metal box's own build environment** — five files (`akuma-dev.env`,
+`kbuild`, `ubuild`, `mbuild`, `kinstall`) checked into `../akuma` and copied
+onto the physical box rather than authored there, so the rig can be
+rebuilt from a checkout and can't silently drift from what the repo
+documents (`../akuma/scripts/box/README.md`). Same two properties, carried
+over: an env file every wrapper sources (an sshd session inherits *no*
+environment — the same reason `deploy.sh`'s own `on()`/`put()` fight
+akuma's shell every time), now generated once as `kot.env`/`start.sh` and
+templated from `overlays/deploy/templates/*.tmpl` (checked in, not authored
+inline as heredocs); and every remote command is an argv list handed
+straight to `subprocess`, never a hand-quoted string a second shell
+re-interprets — the concrete fix for `deploy.sh`'s akuma/fcguest shape
+being "the least reliable part" (HANDOFF's herd traps; the fcguest identity
+check that once compared against a key `mesh.env` no longer used, relabeled
+to persona names 2026-09-22; the `ryzen-akuma-amd64` crash loop, `[herd]
+Service kot exited with code 241`). `deploy.py env <agent>` was checked
+byte-for-byte identical to `deploy.sh env <agent>` for all five agents
+before anything shipped. `--dry-run` prints every `on`/`put` a real run
+would do without touching a host. `deploy.sh` itself is untouched and still
+works — `deploy.py` is the one to reach for going forward, not a like-for-
+like replacement forced on anything already depending on the shell one.
+
+**Redeployed 2026-09-23 with `deploy.py`, four of five agents — every box
+except the bare-metal `akuma` host** (`dumpster-akuma-amd64`; skipped
+deliberately, not attempted and not verified this round):
+`mac-linux-aarch64` (Lima `fc`) redeployed for real and confirmed live
+(`systemctl is-active kot.service` → `active`, replayed 5087 blocks,
+running the rebuilt binary with today's `agent.rs` fixes). The other three
+— `ryzen-linux-amd64`, `ryzen-akuma-amd64`, `mac-akuma-aarch64` — were
+*not* reachable this session (done from a coffee shop, off the home LAN:
+`ryzen`/`akuma` both timed out) and still need `python3 overlays/deploy/
+deploy.py up <agent>` run once back on it. Don't assume they're already on
+the new binary without checking.
 
 ## Working with Claude Code in this repo
 

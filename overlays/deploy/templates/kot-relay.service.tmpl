@@ -1,0 +1,10 @@
+[Unit]
+Description=LAN :9945 -> {agent} (Akuma guest 10.0.2.15:9944)
+After=network-online.target
+
+[Service]
+ExecStart=/usr/bin/socat TCP-LISTEN:9945,fork,reuseaddr TCP:10.0.2.15:9944
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

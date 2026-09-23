@@ -1,6 +1,6 @@
 # Handoff
 
-State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated — `docs/MESH_AUTH.md`). What runs, what doesn't, what to do next,
+State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
@@ -29,6 +29,7 @@ kot --node http://192.168.1.126:9944 --roster "$R"                  # the REPL
 kot --node http://192.168.1.126:9944 --roster "$R" log --follow
 
 cargo run -p kot -- run --as solo --seed 1 --db /tmp/solo.db         # a mesh of one: local dev
+cargo run -p kot --bin kot -- chat --glm --model glm-5.3              # a model, in-process, no chain at all
 ```
 
 Signing defaults to the operator's root identity (`~/.akuma/miot/id_ed25519.seed`);
@@ -269,6 +270,38 @@ Part 1 writeup.
 **a fourth node, on the actual Akuma kernel, 2026-09-22** — item 3, below,
 used to be "run `storeprobe` on Akuma"; the bigger claim turned out true
 first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
+**`kot chat` and standalone compaction, 2026-09-23** — `kot chat` talks to a
+model in-process with real tool execution (`Bash`/`ReadFile`/`WriteFile`/
+`SendMessage`) and no node at all; `RequestCompaction` (a new root-only
+`pallet_litter` call) lets `kot compact`, or any cat's tool call, trigger
+`Store::compact` on demand instead of only as `/clear`'s side effect. Both
+verified live. `docs/LOCAL_SIM.md`.
+**`deploy.py`, a Python rewrite of `deploy.sh`, 2026-09-23** — built on the
+`../akuma/scripts/box/` pattern (checked-in templates, an env file every
+wrapper sources, argv-list subprocess calls instead of hand-quoted strings
+a second shell re-interprets — the specific fix for the akuma/fcguest
+shape `CLAUDE.md` calls out as least reliable). `env <agent>` verified
+byte-identical to `deploy.sh env <agent>` for all five agents before
+anything shipped, `--dry-run` traced a full `up all` with no host touched,
+then `mac-linux-aarch64` (Lima `fc`) was redeployed for real and confirmed
+live on the rebuilt binary. `ryzen-linux-amd64`, `ryzen-akuma-amd64`,
+`mac-akuma-aarch64` still need `up`'d — not reachable this session (off
+the home LAN). `dumpster-akuma-amd64` (bare metal) deliberately untouched.
+`deploy.sh` itself still works, unmodified.
+**two cats debated something for real, 2026-09-23** — two local Qwen3-4B
+`llama-server`s, each its own `kot run` node, peered into a real two-node
+mesh (election, primary/replica, the works — same code path as the fleet).
+Given the Akuma OS description and told to discuss it, they held a genuine
+multi-round back-and-forth and one published a joint `Artifact`. Doing this
+found and fixed two real bugs in `agent.rs`: `SendMessage`'s `to` argument
+was silently discarded (a cat could never address another cat by name, only
+the operator's own `kot say --to` ever worked), and a `"said"` turn that
+didn't call `SendMessage` sent nothing back at all, ever. Also surfaced,
+not yet fixed: a non-root broadcast (`to: None`) doesn't wake anyone's
+agent loop despite `Effect::wakes()` saying it should (`Effect::to()`
+collapses to the same `None`), and a failed `/submit` is never retried by
+the agent loop — full writeup, repro commands and what's still open in
+`docs/LOCAL_SIM.md`.
 
 **Not yet real:**
 
@@ -608,6 +641,31 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
    an operator's shell env would silently resolve `@sora` to nothing or the
    wrong account rather than erroring.
 
+   **Update, 2026-09-23, a related but distinct bug found and fixed:**
+   `agent.rs`'s `SendMessage` handling hardcoded `to: None` for every reply
+   a cat sent, discarding the tool's own `to` argument entirely — so a
+   *cat* could never address another cat by name (only the operator's own
+   `kot say --to`, `client.rs`, a different code path, ever worked). This
+   doesn't explain the report above by itself (that was a human tagging a
+   cat, and `client.rs` already resolved `to` correctly), but it's worth
+   re-checking `@name` against the live fleet now that it's fixed: a reply
+   from the tagged cat would previously have gone out as a broadcast
+   regardless of what it meant to say, and — separately found the same
+   session — a non-root broadcast doesn't wake anyone's agent loop at all
+   (`Effect::to()` collapses to `None` same as a real broadcast, so
+   `agent.rs`'s wake filter never matches). Full detail: `docs/LOCAL_SIM.md`.
+
+7. **Finish the `deploy.py` rollout: three agents still on the old binary.**
+   `mac-linux-aarch64` was redeployed with `deploy.py` 2026-09-23 and
+   confirmed live; `ryzen-linux-amd64`, `ryzen-akuma-amd64` and
+   `mac-akuma-aarch64` were not reachable that session (off the home LAN)
+   and still need `python3 overlays/deploy/deploy.py up <agent>` each, once
+   back on it. `dumpster-akuma-amd64` (bare metal) is deliberately excluded
+   from this round, not just untested — redeploy it by hand
+   (`deploy.sh up dumpster-akuma-amd64` or `deploy.py up dumpster-akuma-amd64`,
+   either works) only when it's specifically wanted, not as part of "the
+   rest of the fleet."
+
 ---
 
 ## Where to read
@@ -627,6 +685,10 @@ first. `docs/TOPOLOGY.md` has the diagram and the honest caveat.
 - `docs/RESULTS.md` — **what actually ran, with numbers.** Evidence, not
   intentions. Read this before trusting any claim elsewhere.
 - `docs/CLI.md` — `miot-cli` requirements. Scrollback is sacred.
+- `docs/LOCAL_SIM.md` — running the agent loop and multi-cat behavior with
+  no fleet and no real infra: `kot chat` (a model, in-process, no chain),
+  and a peered local mesh of two `kot run` cats against dev `llama-server`s.
+  Two real bugs and two open findings came out of actually doing this.
 - `docs/runbooks/run-the-mesh.md` — the everyday loop: build, `deploy.sh up`,
   `kot peers` to see who leads, logs, and what "stable" looks like.
 - `overlays/deploy/deploy.sh` — the deployment blueprint: one script, three

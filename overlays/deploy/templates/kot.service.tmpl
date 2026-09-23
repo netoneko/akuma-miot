@@ -1,0 +1,13 @@
+[Unit]
+Description=kot {agent} — mesh node + agent loop (akuma-miot)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/root/kot/kot.env
+ExecStart=/root/kot/bin/kot run
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target
