@@ -119,6 +119,15 @@ kot --node https://kot.akuma.sh:9441 --theme ink   # the REPL
   - meow's box leaks one pipe per ssh session (64 machine-wide) and then
     stops spawning processes (`exit 241`, `failed to spawn '/bin/sh'`) until
     power-cycled (`../akuma/docs/README.md`).
+    **Since 2026-09-24 that state no longer needs a walk to the machine.**
+    meow's box runs an sshd built with `builtin-paws`: when neither
+    `/bin/sh` nor `/bin/paws` can be spawned, sshd runs paws *inside its
+    own process* (builtins only, nothing exec'd), and `reboot` there is a
+    direct `reboot(2)`. So `ssh akuma reboot` works even in the
+    failed-to-spawn state. Verified under QEMU with both spawns forced to
+    fail, then deployed to the box. It cannot help if sshd itself is gone:
+    herd did not restart a killed sshd during that deploy
+    (`../akuma/docs/archive/AMD64_TRASHCAN_ISSUES.md` §9).
   - mimi's herd lists kot as enabled but never starts it.
   - sora's guest answers ping and nothing else.
   - An untested theory ties these together (heap fragmentation or cache
