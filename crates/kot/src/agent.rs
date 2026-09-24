@@ -556,6 +556,17 @@ impl Cat {
                                 None => lines.push(format!("{route} — never answered")),
                             }
                         }
+                        for p in v.get("inbound").and_then(|p| p.as_array()).into_iter().flatten() {
+                            let status = &p["status"];
+                            let name = status["account"]
+                                .as_str()
+                                .and_then(|h| miot_keys::from_hex(h).ok())
+                                .map(|a| self.roster.name_of(&a))
+                                .unwrap_or_else(|| status["name"].as_str().unwrap_or("?").to_string());
+                            let role = status["role"].as_str().unwrap_or("?");
+                            let ms = p["seen_ms_ago"].as_u64().unwrap_or(0);
+                            lines.push(format!("{name} — {role}, calls us but we can't reach it, heard {ms}ms ago"));
+                        }
                         lines.push(format!("roster (configured, not all necessarily live): {}", self.roster.names().collect::<Vec<_>>().join(", ")));
                         ToolOut::new("", true).meta(format!("{} live", lines.len() - 1)).body(lines.join("\n"))
                     }

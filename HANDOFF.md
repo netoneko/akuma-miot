@@ -165,7 +165,8 @@ head, can't win with blocks the majority never saw. Heartbeats are
 **pulled** (everyone polls everyone's `/mesh/status`), so each node only
 needs its own outbound routes, which is what the NAT'd guests allow.
 Blocks still move the old way: pull-sync plus *leader wins, back to the
-last compaction*. A node that changes role rebuilds from its store
+last compaction*. Since 2026-09-25 there is also a leader push, for a peer
+that can't call out; see "One-way reachability" below. A node that changes role rebuilds from its store
 (demotion) or runs the open block's missing tick (promotion); a replica
 that gets a new primary reconciles its whole range against it once. A
 replica forwards `/submit` and `/account` to the primary, so a cat's
@@ -329,6 +330,61 @@ an empty answer is erased from history); results are fed head and tail;
 `Inspect` pages by `offset`; `Bash` takes `timeout` up to 3600 s.
 `docs/AGENT_STATE_MACHINE.md` has the diagram and the whole account.
 **Not yet deployed to any cat.**
+
+## One-way reachability (2026-09-25)
+
+**The AWS pair had never followed a home primary.** Everything in the mesh
+was started by the node that wanted something: a follower GETs
+`/mesh/status` and `/chain/*`, a candidate POSTs `/mesh/vote`, and the
+primary never calls anyone. yuki and shiro reach home only through
+87.71.28.157:9944-9948, whose router forwards were probably never set up
+(closed from AWS on all five, including tama's unchanged address). Home
+could call *them* the whole time, but a status GET teaches the callee
+nothing, and a vote request says "I'm running", not "I won". So whenever a
+home node was primary, they followed nobody and sat as pre-candidates. The
+AWS journal since Sep 23 has them following only each other. TEAHOUSE's
+"primary moves between home and AWS" hid this: they rejoined each time the
+primary came back to AWS. On 2026-09-24 it stayed home (terms 9-12), and
+they stayed stuck.
+
+Two fixes, both leaving who decides what unchanged:
+
+- **Status goes both ways.** `mesh_round` POSTs `/mesh/status` with its own
+  `Status` as the signed body; the handler takes it in (`Mesh::on_inbound`)
+  and answers as before. A status heard with no route back is keyed by
+  name (`Mesh::heard`), and check-quorum counts distinct names, so a peer
+  heard both ways isn't counted twice. A node from before this answers
+  POST with 405, and the poller falls back to GET, so a mixed-version mesh
+  keeps electing mid-rollout.
+- **The leader pushes to a stuck peer.** `Mesh::push_targets` names every
+  reachable peer whose head differs from the primary's and hasn't moved
+  for an election window, plus, for the rest of that leadership, any peer
+  that has needed a push once (or a push-only peer would trail by a window
+  every time). For each one the primary runs a session (`push_to`): it
+  reconciles *from its side*, reading the peer's `/chain/head` and
+  `/chain/blocks` (readable from here) and running the same
+  `Store::fork_point`, then POSTs `/chain/push` ops: checkpoint, rewind,
+  or a page of blocks. The receiver takes them only from the leader it
+  follows, in its current term, signed by that leader's account
+  (`Mesh::accepts_push_from`), and applies them with the same store calls
+  a pull uses. A pull and a push racing is harmless: each skips rows at or
+  below its head.
+
+Deployed everywhere 2026-09-25. Result, live: yuki and shiro went from
+pre-candidates at 12945/12944 to followers of kuro at the head in about
+80 s, and `kot --node https://kot.akuma.sh:9441 peers` lists every home
+cat as "inbound only". Tests: `miot-mesh` (a node that can't call out
+follows and keeps up; a healthy mesh never pushes; check-quorum dedupe;
+only the stuck peer is targeted; the one-way test fails with the new
+paths disabled), and `tests/election.rs`
+`a_node_that_cannot_call_out_follows_by_push` over real HTTP, where the
+mute node also starts with a fork of its own that the primary has
+rewound.
+
+**Still open:** a push-only node can't *write*. Its `/submit` has no route
+to forward to (`CLAUDE.md`, known gaps), so AWS cats can't post while the
+primary is at home. The router forwards would fix that, and would make
+pull work for them again. Push is the fallback, not a replacement.
 
 ## Block seal times (2026-09-24)
 

@@ -55,7 +55,7 @@
 //!   against it before tailing, since the old and new primaries may disagree
 //!   about the last few blocks.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -178,6 +178,16 @@ pub struct Node {
     peer: Option<String>,
     /// A new primary was just adopted; compare logs before tailing it.
     needs_reconcile: bool,
+    /// The leader we follow, by name, as last logged — so following one we
+    /// have no route to (push-only) is announced once, like a routed one.
+    followed: Option<String>,
+    /// Primary only: per route, when a push session may next start
+    /// (`u64::MAX` while one runs), and the last error logged for it.
+    push_busy_until: BTreeMap<String, u64>,
+    push_last_err: BTreeMap<String, String>,
+    /// Primary only: `(route, term)` pairs whose log was already compared
+    /// against ours, so a push session reconciles once per leadership.
+    push_reconciled: BTreeSet<(String, u64)>,
     http: reqwest::Client,
     started: Instant,
 }
@@ -372,6 +382,10 @@ impl Node {
             producing: false,
             peer: None,
             needs_reconcile: false,
+            followed: None,
+            push_busy_until: BTreeMap::new(),
+            push_last_err: BTreeMap::new(),
+            push_reconciled: BTreeSet::new(),
             // mTLS pinned to the same genesis accounts `is_trusted_signer`
             // already trusts (`crate::tls`, `docs/MESH_AUTH.md`) — every
             // outbound call this node makes, peer traffic and forwarded
@@ -684,6 +698,34 @@ impl Node {
             }
             self.peer = route;
         }
+        let leader = if lead { None } else { self.mesh.leader().map(str::to_string) };
+        if leader != self.followed {
+            if let (Some(l), None) = (&leader, &self.peer) {
+                println!("[mesh] following {l} by push: no route to it from here (term {})", self.mesh.term());
+            }
+            self.followed = leader;
+        }
+    }
+}
+
+impl Node {
+    /// Primary only: which push sessions to start now — every route
+    /// `Mesh::push_targets` names that doesn't have one running or backing
+    /// off. Marks them busy; [`push_session`] clears that when it ends.
+    fn start_pushes(&mut self, now: u64) -> Vec<String> {
+        if !self.producing {
+            self.push_busy_until.clear();
+            self.push_reconciled.clear();
+            return Vec::new();
+        }
+        let head = self.store.head();
+        let targets = self.mesh.push_targets(now, head);
+        let starts: Vec<String> =
+            targets.into_iter().filter(|r| self.push_busy_until.get(r).is_none_or(|&until| now >= until)).collect();
+        for r in &starts {
+            self.push_busy_until.insert(r.clone(), u64::MAX);
+        }
+        starts
     }
 }
 
@@ -719,7 +761,11 @@ impl PeerAuth {
 }
 
 pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
-    let routes = shared.lock().await.mesh.routes().to_vec();
+    let (routes, mine) = {
+        let n = shared.lock().await;
+        let mine = serde_json::to_vec(&n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account()))).expect("Status serializes");
+        (n.mesh.routes().to_vec(), mine)
+    };
     let auth = PeerAuth::snapshot(shared).await;
     // Longer than the poll interval on purpose: a slow answer is still an
     // answer. Only a peer that misses every poll for a whole election
@@ -728,10 +774,28 @@ pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
     let mut set = tokio::task::JoinSet::new();
     for r in routes {
         let auth = auth.clone();
+        let mine = mine.clone();
         set.spawn(async move {
             let st = async {
-                let headers = sign_headers(&auth.identity, b"");
-                let resp = auth.http.get(format!("{r}/mesh/status")).headers(headers).timeout(timeout).send().await.ok()?;
+                // Our own status rides along, so the peer hears from us even
+                // if it can't call us back (`Mesh::on_inbound`). A node from
+                // before this answers POST with 405; ask it the old way.
+                let url = format!("{r}/mesh/status");
+                let posted = auth
+                    .http
+                    .post(&url)
+                    .headers(sign_headers(&auth.identity, &mine))
+                    .header(http::header::CONTENT_TYPE, "application/json")
+                    .body(mine)
+                    .timeout(timeout)
+                    .send()
+                    .await
+                    .ok()?;
+                let resp = if posted.status() == StatusCode::METHOD_NOT_ALLOWED {
+                    auth.http.get(&url).headers(sign_headers(&auth.identity, b"")).timeout(timeout).send().await.ok()?
+                } else {
+                    posted
+                };
                 let resp_headers = resp.headers().clone();
                 let bytes = resp.bytes().await.ok()?;
                 verify_headers(&resp_headers, &bytes, |a| auth.is_trusted(a)).ok()?;
@@ -757,8 +821,13 @@ pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
         let head = n.store.head();
         let req = n.mesh.tick(now, head);
         n.follow_mesh();
-        req
+        let pushes = n.start_pushes(now);
+        (req, pushes)
     };
+    let (req, pushes) = req;
+    for route in pushes {
+        tokio::spawn(push_session(shared.clone(), route));
+    }
     if let Some(req) = req {
         campaign(shared, req, timeout).await;
     }
@@ -900,6 +969,9 @@ async fn sync_once(shared: &Shared, peer: &str) {
             return;
         }
         for row in &rows {
+            if row.height <= n.store.head() {
+                continue; // a push got there first
+            }
             let Ok(body) = hex::decode(&row.body_hex) else {
                 eprintln!("[node] sync: peer sent bad hex for block {}", row.height);
                 return;
@@ -1034,6 +1106,264 @@ async fn rewind(shared: &Shared, peer: &str, fork: u64) {
     n.reload_from_store();
 }
 
+// ------------------------------------------------------------- leader push
+//
+// Pull assumes a follower can call its primary. One behind a NAT it doesn't
+// control can't — the AWS pair, calling home through a router with no
+// forwards (2026-09-24): home could call *them*, but nothing in the protocol
+// ever did anything useful with that. So the primary, which sees from its
+// own status polls that a peer's head has been stuck off its own for an
+// election window (`Mesh::push_targets`), brings that peer's log to its own
+// from this side. It runs the follower's reconcile itself — the peer's
+// `/chain/head` and `/chain/blocks` are readable from here, and
+// `Store::fork_point` is the same byte compare — then sends the result as
+// `/chain/push` operations. The receiver applies them through the same
+// store calls a pull uses, and only from the leader it follows, in the
+// current term (`Mesh::accepts_push_from`).
+
+/// A failed session waits this long before the next one to the same peer.
+const PUSH_BACKOFF_MS: u64 = 10_000;
+
+#[derive(Serialize, Deserialize)]
+struct Push {
+    /// The pusher's own status — who it is, and that it leads, in what term.
+    leader: Status,
+    #[serde(flatten)]
+    op: PushOp,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "kebab-case")]
+enum PushOp {
+    /// Adopt this checkpoint: ours is past yours.
+    Checkpoint { height: u64, state_hex: String },
+    /// Leader wins: drop your log above `fork`, back to your last
+    /// compaction at or below it (`Store::rewind_for_fork`).
+    Rewind { fork: u64 },
+    /// Append these, from your head + 1.
+    Blocks { rows: Vec<BlockRow> },
+}
+
+#[derive(Serialize, Deserialize)]
+struct PushReply {
+    accepted: bool,
+    head: u64,
+    last_checkpoint: u64,
+    #[serde(default)]
+    why: Option<String>,
+}
+
+async fn push_session(shared: Shared, route: String) {
+    let result = push_to(&shared, &route).await;
+    let mut n = shared.lock().await;
+    let now = n.now_ms();
+    match result {
+        Ok(()) => {
+            n.push_busy_until.insert(route.clone(), now);
+            n.push_last_err.remove(&route);
+        }
+        Err(why) => {
+            n.push_busy_until.insert(route.clone(), now + PUSH_BACKOFF_MS);
+            // Once per distinct error: a peer on an older build (no
+            // `/chain/push`) would otherwise say so every ten seconds.
+            if n.push_last_err.get(&route) != Some(&why) {
+                eprintln!("[mesh] push to {route}: {why}");
+                n.push_last_err.insert(route, why);
+            }
+        }
+    }
+}
+
+/// One session: reconcile, then blocks, until the peer is at our head.
+async fn push_to(shared: &Shared, route: &str) -> Result<(), String> {
+    let auth = PeerAuth::snapshot(shared).await;
+    let mut theirs = peer_head(&auth, route).await.ok_or("no answer from /chain/head")?;
+    let started = theirs.head;
+    let mut reconciled_now = false;
+    // Bounded: a checkpoint, a rewind, and then pages — never a loop that
+    // outlives a leadership by much.
+    for _ in 0..1_000 {
+        let (op, term) = {
+            let n = shared.lock().await;
+            if !n.producing {
+                return Ok(()); // no longer primary; nothing of ours to push
+            }
+            let (my_cp, my_head, term) = (n.store.last_checkpoint(), n.store.head(), n.mesh.term());
+            if theirs.last_checkpoint > my_cp {
+                // They compacted where we never did. Same rule as a
+                // follower's reconcile: rebuild from what we have.
+                (Some(PushOp::Rewind { fork: theirs.last_checkpoint.saturating_sub(1) }), term)
+            } else if theirs.last_checkpoint < my_cp {
+                let state = n.store.checkpoint_state().map_err(|e| e.to_string())?.ok_or("our checkpoint has no state")?;
+                (Some(PushOp::Checkpoint { height: my_cp, state_hex: hex::encode(state) }), term)
+            } else if !n.push_reconciled.contains(&(route.to_string(), term)) {
+                (None, term) // compare logs first, below, without holding the lock
+            } else if theirs.head < my_head {
+                let mut rows = Vec::new();
+                let mut h = theirs.head + 1;
+                while h <= my_head && (rows.len() as u64) < SYNC_PAGE {
+                    if let Some(body) = n.store.block(h).map_err(|e| e.to_string())? {
+                        rows.push(BlockRow { height: h, body_hex: hex::encode(body) });
+                    }
+                    h += 1;
+                }
+                (Some(PushOp::Blocks { rows }), term)
+            } else {
+                // The steady state is a block per session; say so only for
+                // the first session of a leadership and for real catch-ups.
+                if theirs.head != started && (reconciled_now || theirs.head.abs_diff(started) > 10) {
+                    println!("[mesh] pushed {route} to block {} (was {started})", theirs.head);
+                }
+                return Ok(());
+            }
+        };
+        let op = match op {
+            Some(op) => op,
+            None => {
+                let fork = fork_against(shared, &auth, route, &theirs).await?;
+                shared.lock().await.push_reconciled.insert((route.to_string(), term));
+                reconciled_now = true;
+                if fork >= theirs.head {
+                    continue; // their log is a prefix of ours
+                }
+                println!("[mesh] {route} diverged from us above block {fork}; telling it to rewind");
+                PushOp::Rewind { fork }
+            }
+        };
+        let reply = push_op(shared, &auth, route, op).await?;
+        if !reply.accepted {
+            return Err(format!("refused: {}", reply.why.unwrap_or_default()));
+        }
+        theirs = ChainHead { head: reply.head, last_checkpoint: reply.last_checkpoint };
+    }
+    Ok(())
+}
+
+/// The last height the peer's log agrees with ours, read page by page from
+/// its `/chain/blocks` and compared as `reconcile_if_diverged` does.
+async fn fork_against(shared: &Shared, auth: &PeerAuth, route: &str, theirs: &ChainHead) -> Result<u64, String> {
+    let mut fork = theirs.last_checkpoint;
+    let mut from = theirs.last_checkpoint + 1;
+    while from <= theirs.head {
+        let rows = fetch_blocks(auth, route, from, SYNC_PAGE).await;
+        if rows.is_empty() {
+            break;
+        }
+        let bodies: Vec<Vec<u8>> = rows.iter().map_while(|r| hex::decode(&r.body_hex).ok()).collect();
+        let agreed = shared.lock().await.store.fork_point(from, &bodies).map_err(|e| e.to_string())?;
+        fork = agreed;
+        if agreed < from + bodies.len() as u64 - 1 || bodies.len() < rows.len() {
+            break;
+        }
+        from += bodies.len() as u64;
+    }
+    Ok(fork)
+}
+
+async fn push_op(shared: &Shared, auth: &PeerAuth, route: &str, op: PushOp) -> Result<PushReply, String> {
+    let leader = {
+        let n = shared.lock().await;
+        n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account()))
+    };
+    let bytes = serde_json::to_vec(&Push { leader, op }).expect("Push serializes");
+    let resp = auth
+        .http
+        .post(format!("{route}/chain/push"))
+        .headers(sign_headers(&auth.identity, &bytes))
+        .header(http::header::CONTENT_TYPE, "application/json")
+        .body(bytes)
+        .timeout(Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| format!("POST /chain/push: {e}"))?;
+    if resp.status() == StatusCode::NOT_FOUND || resp.status() == StatusCode::METHOD_NOT_ALLOWED {
+        return Err("peer has no /chain/push (an older build)".into());
+    }
+    let resp_headers = resp.headers().clone();
+    let rbytes = resp.bytes().await.map_err(|e| e.to_string())?;
+    verify_headers(&resp_headers, &rbytes, |a| auth.is_trusted(a)).map_err(|e| format!("reply: {e}"))?;
+    serde_json::from_slice(&rbytes).map_err(|e| format!("reply: {e}"))
+}
+
+/// The receiving side of a push.
+async fn chain_push(AxState(s): AxState<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut n = s.lock().await;
+    let signer = match verify_headers(&headers, &body, |a| n.is_trusted_signer(a)) {
+        Ok(a) => a,
+        Err(why) => return unauthorized(why),
+    };
+    let push: Push = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "malformed push").into_response(),
+    };
+    if push.leader.account != miot_keys::to_hex(&signer) {
+        return (StatusCode::FORBIDDEN, "a push must be signed by the leader it names").into_response();
+    }
+    let now = n.now_ms();
+    let from = push.leader.name.clone();
+    n.mesh.on_inbound(push.leader.clone(), now);
+    n.follow_mesh();
+    let reply = |n: &Node, why: Option<String>| {
+        let r = PushReply { accepted: why.is_none(), head: n.store.head(), last_checkpoint: n.store.last_checkpoint(), why };
+        signed_json(&n.identity, StatusCode::OK, &r)
+    };
+    if n.producing || !n.mesh.accepts_push_from(&push.leader) {
+        return reply(&n, Some(format!("not following {from} in term {}", push.leader.term)));
+    }
+    match push.op {
+        PushOp::Checkpoint { height, state_hex } => {
+            if height > n.store.last_checkpoint() {
+                let Ok(state) = hex::decode(&state_hex) else {
+                    return reply(&n, Some("bad checkpoint hex".into()));
+                };
+                if let Err(e) = n.store.adopt_checkpoint(height, &state) {
+                    return reply(&n, Some(format!("adopt_checkpoint: {e}")));
+                }
+                println!("[node] push: adopted {from}'s checkpoint at block {height}");
+                n.reload_from_store();
+                n.mesh.appended();
+                n.save_hard();
+            }
+        }
+        PushOp::Rewind { fork } => {
+            if fork < n.store.head() {
+                match n.store.rewind_for_fork(fork) {
+                    Ok(r) => println!(
+                        "[node] push: diverged from {from} above block {fork}, rewound to {} (dropped {} block(s))",
+                        r.height, r.dropped
+                    ),
+                    Err(e) => return reply(&n, Some(format!("rewind: {e}"))),
+                }
+                n.reload_from_store();
+            }
+        }
+        PushOp::Blocks { rows } => {
+            for row in &rows {
+                let head = n.store.head();
+                if row.height <= head {
+                    continue; // already have it (a pull got there first)
+                }
+                if row.height != head + 1 {
+                    break;
+                }
+                let Ok(body) = hex::decode(&row.body_hex) else {
+                    return reply(&n, Some(format!("bad hex for block {}", row.height)));
+                };
+                let Ok((effects, at)) = open_body(&body) else {
+                    return reply(&n, Some(format!("corrupt body for block {}", row.height)));
+                };
+                if let Err(e) = n.store.append(row.height, &body) {
+                    return reply(&n, Some(format!("append {}: {e}", row.height)));
+                }
+                n.apply_block(row.height, effects, at);
+                n.mesh.appended();
+            }
+            n.save_hard();
+        }
+    }
+    reply(&n, None)
+}
+
 // ------------------------------------------------------------- mesh auth
 //
 // Signs and verifies HTTP traffic — mesh-internal (election, chain sync)
@@ -1127,7 +1457,8 @@ pub fn router(shared: Shared) -> Router {
         .route("/chain/head", get(chain_head))
         .route("/chain/blocks", get(chain_blocks))
         .route("/chain/checkpoint", get(chain_checkpoint))
-        .route("/mesh/status", get(mesh_status))
+        .route("/chain/push", post(chain_push))
+        .route("/mesh/status", get(mesh_status).post(mesh_status_post))
         .route("/mesh/vote", post(mesh_vote))
         .route("/mesh/peers", get(mesh_peers))
         .with_state(shared)
@@ -1237,6 +1568,28 @@ async fn mesh_status(AxState(n): AxState<Shared>, headers: HeaderMap) -> Respons
     signed_json(&n.identity, StatusCode::OK, &status)
 }
 
+/// `POST /mesh/status`: the same answer as `GET`, but the caller sends its
+/// own status too, and we take it in — how a peer that can't call us still
+/// hears from us (`Mesh::on_inbound`).
+async fn mesh_status_post(AxState(n): AxState<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut n = n.lock().await;
+    let signer = match verify_headers(&headers, &body, |a| n.is_trusted_signer(a)) {
+        Ok(a) => a,
+        Err(why) => return unauthorized(why),
+    };
+    // A status that doesn't name its own signer is ignored, not refused:
+    // the caller still gets our answer, which is all the old GET gave it.
+    if let Ok(st) = serde_json::from_slice::<Status>(&body) {
+        if st.account == miot_keys::to_hex(&signer) {
+            let now = n.now_ms();
+            n.mesh.on_inbound(st, now);
+            n.follow_mesh();
+        }
+    }
+    let status = n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account()));
+    signed_json(&n.identity, StatusCode::OK, &status)
+}
+
 async fn mesh_vote(AxState(n): AxState<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     let mut n = n.lock().await;
     if let Err(why) = verify_headers(&headers, &body, |a| n.is_trusted_signer(a)) {
@@ -1271,7 +1624,19 @@ async fn mesh_peers(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response
             None => serde_json::json!({"route": r, "seen_ms_ago": null, "status": null}),
         })
         .collect();
+    // Peers that call us but that we have no working route to — known only
+    // by what they sent. Without these a push-only node's view is all
+    // "never answered" while it's in fact following along.
+    let routed: BTreeSet<&str> = n.mesh.seen().values().map(|(_, st)| st.name.as_str()).collect();
+    let inbound: Vec<_> = n
+        .mesh
+        .heard()
+        .iter()
+        .filter(|(name, _)| !routed.contains(name.as_str()))
+        .map(|(_, (at, st))| serde_json::json!({"seen_ms_ago": now.saturating_sub(*at), "status": st}))
+        .collect();
     Json(serde_json::json!({
+        "inbound": inbound,
         "me": n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account())),
         "quorum": n.mesh.quorum(),
         "producing": n.producing,
@@ -1428,7 +1793,9 @@ enum Route {
     /// its own right and the caller's signature was already checked (or,
     /// for `/submit`, isn't the gate at all) before we got here.
     Primary(String, reqwest::Client, Identity),
-    Nobody,
+    /// No primary to forward to. `Some(name)` when there is one, but this
+    /// node follows it by push and has no route to it.
+    Nobody(Option<String>),
 }
 
 async fn route(n: &Shared) -> Route {
@@ -1438,13 +1805,19 @@ async fn route(n: &Shared) -> Route {
     } else {
         match &n.peer {
             Some(p) => Route::Primary(p.clone(), n.http.clone(), n.identity),
-            None => Route::Nobody,
+            None => Route::Nobody(n.mesh.leader().map(str::to_string)),
         }
     }
 }
 
-fn no_primary() -> (StatusCode, Json<serde_json::Value>) {
-    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":"no primary right now (election in progress); retry shortly"})))
+fn no_primary(leader: Option<String>) -> (StatusCode, Json<serde_json::Value>) {
+    let error = match leader {
+        // A push-only follower (behind a NAT): it has the log, but no way
+        // to hand a write to the primary. Not an election; retrying won't help.
+        Some(l) => format!("the primary is {l}, but this node has no route to it (it follows by push); submit to another node"),
+        None => "no primary right now (election in progress); retry shortly".to_string(),
+    };
+    (StatusCode::SERVICE_UNAVAILABLE, Json(serde_json::json!({"ok":false,"error":error})))
 }
 
 /// Forward to the primary and hand its answer back verbatim.
@@ -1479,7 +1852,7 @@ async fn account(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: H
             let signed = sign_headers(&identity, b"");
             return forward(&http, http.get(format!("{p}/account/{id}")).headers(signed)).await;
         }
-        Route::Nobody | Route::Here => {}
+        Route::Nobody(_) | Route::Here => {}
     }
     let mut n = n.lock().await;
     let nonce = n.ext.execute_with(|| frame_system::Pallet::<Runtime>::account_nonce(&who));
@@ -1495,7 +1868,7 @@ async fn submit(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode, Json<s
         // `/submit` isn't header-gated — the extrinsic's own signature is
         // the authority — so nothing needs re-signing on the way through.
         Route::Primary(p, http, _identity) => return forward(&http, http.post(format!("{p}/submit")).body(body)).await,
-        Route::Nobody => return no_primary(),
+        Route::Nobody(leader) => return no_primary(leader),
     }
     let uxt = match UncheckedExtrinsic::decode(&mut &body[..]) {
         Ok(u) => u,
@@ -1503,7 +1876,7 @@ async fn submit(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode, Json<s
     };
     let mut n = n.lock().await;
     if !n.producing {
-        return no_primary(); // demoted between the check above and now
+        return no_primary(None); // demoted between the check above and now
     }
     match n.submit(uxt) {
         Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok":true}))),

@@ -85,9 +85,15 @@ AWS, with no operator involvement.
   over the public internet between home and AWS, with no VPN. A client with
   root's key can connect to any member from anywhere
   (`kot --node https://kot.akuma.sh:9441`).
-- **Elections work across the WAN.** Rolling restarts of every live member
-  (2026-09-24) moved the primary between home and AWS and settled each time,
-  with all live views agreeing on one leader.
+- **Elections work across the WAN**, with a correction. Rolling restarts
+  (2026-09-24) moved the primary between home and AWS and settled each
+  time, but only home's views agreed. yuki and shiro can't call home (the
+  router has no forwards), and until 2026-09-25 nothing reached them from
+  home that they could use. So during every home term they followed
+  nobody, and caught up only when the primary came back to AWS. Since the
+  two-way status and leader push (HANDOFF, "One-way reachability"), they
+  follow a home primary too. On 2026-09-25 all seven followed kuro at one
+  head. They still can't *write* while the primary is at home.
 - **Cats call tools, and since 2026-09-24 they get the results back.**
   Before that, results were printed and dropped (the agent loop's inbox held
   only chain events), so tama and sora called `Peers` on every wake and never
@@ -128,7 +134,18 @@ kot --node https://kot.akuma.sh:9441 --theme ink   # the REPL
     fail, then deployed to the box. It cannot help if sshd itself is gone:
     herd did not restart a killed sshd during that deploy
     (`../akuma/docs/archive/AMD64_TRASHCAN_ISSUES.md` §9).
-  - mimi's herd lists kot as enabled but never starts it.
+  - mimi's herd listed kot as enabled but never started it. Its pid-1 herd
+    was from a Sep 22 boot that stalled after starting httpd (the boot log
+    shows herd spinning on the BKL, `[bkls>] ... spins=2097152`); the disk
+    already had the current herd. Fixed 2026-09-24 by power-cycling the
+    Firecracker VM (the guest's `reboot` is `EPERM` on its Sep 22 kernel):
+    the new herd started kot, and `herd start kot` answers "already
+    running". Relaunch, if needed: in `fc`, as root,
+    `firecracker --api-sock /tmp/fc.sock --config-file /tmp/akuma-fc.json`.
+  - herd's control port (`127.0.0.1:7117`) is reachable from the network on
+    every Akuma member, because Akuma's `bind()` ignores the address.
+    Anyone who can reach a box can `stop` its services.
+    `../akuma/docs/archive/AKUMA_NET_LOOPBACK_BIND_EXPOSED.md`.
   - sora's guest answers ping and nothing else.
   - An untested theory ties these together (heap fragmentation or cache
     exhaustion, possibly caused by ParityDB): `HANDOFF.md`, "Open theory".

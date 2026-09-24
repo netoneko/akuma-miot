@@ -58,6 +58,9 @@ struct Mesh3 {
     ports: [u16; 3],
     dirs: Vec<tempfile::TempDir>,
     nodes: [Option<Running>; 3],
+    /// A node whose routes to the others go nowhere: it can be called, but
+    /// can't call anyone — a peer behind a NAT with no forwards.
+    mute: Option<usize>,
 }
 
 impl Mesh3 {
@@ -66,20 +69,32 @@ impl Mesh3 {
     }
 
     fn cfg(&self, i: usize) -> NodeConfig {
-        let peers = (0..3).filter(|&j| j != i).map(|j| self.url(j)).collect();
+        let peers = (0..3)
+            .filter(|&j| j != i)
+            .map(|j| if self.mute == Some(i) { format!("https://127.0.0.1:{}", free_port()) } else { self.url(j) })
+            .collect();
         cfg(i as u8 + 1, self.names[i], self.ports[i], peers, self.dirs[i].path().join("db"))
     }
 
-    async fn start() -> Self {
-        let mut m = Mesh3 {
+    fn new() -> Self {
+        Mesh3 {
             names: ["alpha", "beta", "gamma"],
             ports: [free_port(), free_port(), free_port()],
             dirs: (0..3).map(|_| tempfile::tempdir().unwrap()).collect(),
             nodes: [None, None, None],
-        };
-        for i in 0..3 {
-            m.nodes[i] = Some(node::start(m.cfg(i)).await.unwrap());
+            mute: None,
         }
+    }
+
+    async fn start_all(&mut self) {
+        for i in 0..3 {
+            self.nodes[i] = Some(node::start(self.cfg(i)).await.unwrap());
+        }
+    }
+
+    async fn start() -> Self {
+        let mut m = Self::new();
+        m.start_all().await;
         m
     }
 
@@ -330,4 +345,56 @@ async fn a_store_refuses_a_different_genesis() {
     // The same genesis still opens.
     let r = node::start(cfg(1, "solo", free_port(), vec![], db)).await.unwrap();
     r.abort();
+}
+
+/// The AWS pair's case, 2026-09-24: a member that everyone can call and
+/// that can call no one. Pull can't reach it, so before status went both
+/// ways and the primary pushed, it followed nobody. Here it also starts with
+/// a log of its own — blocks and a task nobody else has, made while it ran
+/// alone — so the primary has to find the fork from its side and tell it to
+/// rewind before the blocks it pushes can land.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_cannot_call_out_follows_by_push() {
+    let http = trusted_client();
+    let mut m = Mesh3::new();
+
+    // gamma alone first, on its own store: a log nobody else will have.
+    {
+        let solo = node::start(cfg(3, "gamma", m.ports[2], vec![], m.dirs[2].path().join("db"))).await.unwrap();
+        submit(&http, &m.url(2), open("gamma alone")).await;
+        tokio::time::sleep(Duration::from_millis(800)).await;
+        assert!(solo.shared.lock().await.head() > 0);
+        solo.abort();
+        drop(solo);
+        tokio::time::sleep(Duration::from_millis(300)).await;
+    }
+
+    m.mute = Some(2);
+    m.start_all().await;
+
+    // `primary` waits until every live node follows one producer —
+    // gamma included, which only a push can make happen.
+    let p = m.primary(Duration::from_secs(20)).await;
+    assert_ne!(p, 2, "gamma can't reach anyone, so it can't collect votes");
+    assert_eq!(m.nodes[2].as_ref().unwrap().shared.lock().await.mesh().leader_route(), None, "gamma has no route: push only");
+
+    submit(&http, &m.url(p), open("pushed to gamma")).await;
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    m.converged(Duration::from_secs(20)).await;
+    let texts = task_texts(&http, &m.url(2)).await;
+    assert!(texts.contains(&"pushed to gamma".to_string()), "{texts:?}");
+    assert!(!texts.contains(&"gamma alone".to_string()), "its own fork was rewound: {texts:?}");
+    let theirs = m.blocks(p, &http).await;
+    let ours = m.blocks(2, &http).await;
+    assert!(!ours.is_empty() && theirs.starts_with(&ours[..ours.len().min(theirs.len())]), "gamma's log is the primary's prefix");
+
+    // And it keeps up afterwards, not just once.
+    let head_then = m.nodes[p].as_ref().unwrap().shared.lock().await.head();
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    m.converged(Duration::from_secs(10)).await;
+    assert!(m.nodes[2].as_ref().unwrap().shared.lock().await.head() > head_then);
+
+    for i in 0..3 {
+        m.kill(i).await;
+    }
 }

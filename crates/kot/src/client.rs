@@ -401,6 +401,13 @@ impl Client {
                 None => out.push(format!("    {}  {}  {}", ui::pad(&ui::dim("?"), 14), ui::pad(&ui::plain(&route), 24), ui::warn("never answered"))),
             }
         }
+        // Peers that call this node but that it can't call back: known only
+        // by what they sent (their polls, a leader's pushes).
+        for p in m["inbound"].as_array().into_iter().flatten() {
+            let ago = p["seen_ms_ago"].as_u64().unwrap_or(0);
+            let seen = ui::dim(&format!("heard {:.1}s ago, calls us (no route from here)", ago as f64 / 1000.0));
+            out.push(row(cat_of(p["status"]["name"].as_str().unwrap_or("?")), "(inbound only)", &p["status"], seen));
+        }
         out.join("\n")
     }
 
@@ -593,7 +600,18 @@ pub fn say_call(to: Option<AccountId>, body: &str, off_record: bool) -> RuntimeC
 /// what to call a peer.
 fn mesh_names(m: &serde_json::Value, roster: &Roster) -> std::collections::HashMap<String, String> {
     let mut names = std::collections::HashMap::new();
-    let statuses = std::iter::once(&m["me"]).chain(m["peers"].as_array().into_iter().flatten().map(|p| &p["status"]).filter(|s| s.is_object()));
+    // `inbound`: peers heard only by their calls to this node (no route
+    // from here) — named the same way, so a push-only node's view reads
+    // "kuro", not "mac-linux-aarch64".
+    let statuses = std::iter::once(&m["me"]).chain(
+        m["peers"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(m["inbound"].as_array().into_iter().flatten())
+            .map(|p| &p["status"])
+            .filter(|s| s.is_object()),
+    );
     for st in statuses {
         let Some(mesh_name) = st["name"].as_str() else { continue };
         let cat = st["account"]
@@ -631,7 +649,7 @@ async fn poll_mesh_ui(
         let cat_of = |n: &str| names.get(n).cloned().unwrap_or_else(|| n.to_string());
 
         let primary_name = std::iter::once(&m["me"])
-            .chain(m["peers"].as_array().into_iter().flatten().map(|p| &p["status"]))
+            .chain(m["peers"].as_array().into_iter().flatten().chain(m["inbound"].as_array().into_iter().flatten()).map(|p| &p["status"]))
             .find(|st| st["role"].as_str() == Some("leader"))
             .and_then(|st| st["name"].as_str())
             .map(&cat_of);

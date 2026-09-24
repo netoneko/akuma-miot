@@ -100,12 +100,20 @@ members list.
   two, and the AWS box two. Mac off the home LAN leaves 5. An AWS outage takes
   out both AWS kots at once and leaves 5. Mac away *and* AWS down leaves 3,
   which is below quorum. A home ISP outage splits the mesh 5 | 2: home keeps
-  going, and the two AWS kots can't elect anyone. They catch up by pull-sync
-  when the link returns. Adding or removing a member later is another genesis.
+  going, and the two AWS kots can't elect anyone. They catch up when the
+  link returns: by pull-sync if they can reach the primary, otherwise by
+  the primary's push. Adding or removing a member later is another genesis.
 
 ---
 
 ## 1. Home side: make each home node reachable from AWS
+
+**Optional since 2026-09-25, but still what makes AWS a full member.**
+Without these forwards, yuki and shiro follow a home primary by push (the
+primary calls them) and keep up. But they can't *write*: `/submit` on them
+has no route to a home primary (HANDOFF, "One-way reachability"). The
+forwards were probably never in place before that date; this section's
+check below would have said so.
 
 Election and replication run both ways. Every node polls `/mesh/status` on
 every peer, a candidate POSTs `/mesh/vote` to every peer, and a replica

@@ -20,6 +20,8 @@ struct Sim {
     now: u64,
     /// term → who led it. The safety invariant.
     leaders_by_term: BTreeMap<u64, Name>,
+    /// Blocks delivered by push rather than pull.
+    pushes: usize,
 }
 
 fn name(i: usize) -> Name {
@@ -45,11 +47,19 @@ impl Sim {
             link: vec![vec![true; n]; n],
             now: 0,
             leaders_by_term: BTreeMap::new(),
+            pushes: 0,
         }
     }
 
     fn reach(&self, a: usize, b: usize) -> bool {
-        self.alive[a] && self.alive[b] && self.link[a][b] && self.link[b][a]
+        self.call(a, b) && self.call(b, a)
+    }
+
+    /// Can `a` open a connection to `b`? The answer comes back on it, so
+    /// this is all a request/response needs. `link` is directional:
+    /// `link[a][b]` false with `link[b][a]` true is a NAT.
+    fn call(&self, a: usize, b: usize) -> bool {
+        self.alive[a] && self.alive[b] && self.link[a][b]
     }
 
     /// Split into two sides. Links inside a side stay up.
@@ -74,7 +84,7 @@ impl Sim {
         loop {
             let mut next = None;
             for v in 0..self.nodes.len() {
-                if v == c || !self.reach(c, v) {
+                if v == c || !self.call(c, v) {
                     continue;
                 }
                 let reply = self.nodes[v].on_vote_request(&req, self.now, self.heads[v]);
@@ -97,7 +107,11 @@ impl Sim {
         if self.now % POLL_MS == 0 {
             for a in 0..n {
                 for b in 0..n {
-                    if a != b && self.reach(a, b) {
+                    if a != b && self.call(a, b) {
+                        // The poll carries the poller's status; the answer
+                        // carries the polled node's.
+                        let mine = self.nodes[a].status(self.heads[a], "");
+                        self.nodes[b].on_inbound(mine, self.now);
                         let st = self.nodes[b].status(self.heads[b], "");
                         self.nodes[a].on_status(&name(b), st, self.now);
                     }
@@ -125,9 +139,29 @@ impl Sim {
             }
             for i in 0..n {
                 if let Some(l) = self.nodes[i].leader_route().map(idx) {
-                    if self.reach(i, l) && self.heads[l] > self.heads[i] {
+                    if self.call(i, l) && self.heads[l] > self.heads[i] {
                         self.heads[i] = self.heads[l];
                         self.nodes[i].appended();
+                    }
+                }
+            }
+            // The leader's push to whoever isn't pulling. Taken only from
+            // the leader the receiver follows (what the node checks too).
+            for l in 0..n {
+                if !self.alive[l] || !self.nodes[l].is_leader() {
+                    continue;
+                }
+                let (now, head) = (self.now, self.heads[l]);
+                for t in self.nodes[l].push_targets(now, head).into_iter().map(|r| idx(&r)) {
+                    let st = self.nodes[l].status(head, "");
+                    if !self.call(l, t) {
+                        continue;
+                    }
+                    self.nodes[t].on_inbound(st.clone(), now);
+                    if self.nodes[t].accepts_push_from(&st) {
+                        self.heads[t] = head;
+                        self.nodes[t].appended();
+                        self.pushes += 1;
                     }
                 }
             }
@@ -335,4 +369,90 @@ fn listing_yourself_as_a_peer_does_not_inflate_the_quorum() {
     m.on_status(&"self".to_string(), me, 0);
     assert_eq!(m.routes(), &["b".to_string(), "c".to_string()]);
     assert_eq!(m.quorum(), 2);
+}
+
+// ── one-way reachability (the AWS pair behind home's router, 2026-09-24) ──
+
+/// Node 4 can be called by everyone and can call nobody — a peer behind a
+/// NAT it doesn't control. Before status went both ways and the leader
+/// pushed, it heard nothing, followed nobody and campaigned forever. Now it
+/// follows the leader, keeps up with its log, and never disturbs it.
+#[test]
+fn a_node_that_cannot_call_out_follows_and_keeps_up() {
+    let mut s = Sim::new(5);
+    for b in 0..5 {
+        s.link[4][b] = false;
+    }
+    s.run(20_000);
+    let leaders = s.leaders();
+    let [l] = leaders[..] else { panic!("one leader: {:?}", s.roles()) };
+    assert_ne!(l, 4, "it can't collect votes, so it can't lead");
+    s.run(30_000);
+    assert_eq!(s.leaders(), vec![l], "the leader was never disturbed: {:?}", s.roles());
+    assert_eq!(s.nodes[4].leader(), Some(s.nodes[l].name()), "{:?}", s.roles());
+    assert_eq!(s.nodes[4].role(), Role::Follower);
+    assert_eq!(s.nodes[4].leader_route(), None, "no route: it follows by push alone");
+    assert!(s.heads[l] - s.heads[4] <= 6, "log kept up by push: leader {} vs {}", s.heads[l], s.heads[4]);
+    assert!(s.pushes > 0);
+    assert_eq!(s.leaders_by_term.len(), 1, "no churn: {:?}", s.leaders_by_term);
+}
+
+/// Everyone who can pull is never pushed to: push is for the stuck only.
+#[test]
+fn a_healthy_mesh_never_pushes() {
+    let mut s = Sim::new(5);
+    s.settle(20_000);
+    s.run(30_000);
+    assert_eq!(s.pushes, 0);
+}
+
+/// A peer both polled and polling is one peer for check-quorum, not two.
+/// A leader that only hears one of four peers — by both routes — has two
+/// of five, short of a quorum of three, and steps down.
+#[test]
+fn check_quorum_counts_a_peer_heard_both_ways_once() {
+    let t = Timing::default();
+    let routes = vec!["n1".into(), "n2".into(), "n3".into(), "n4".into()];
+    let mut m = Mesh::new("n0".into(), routes, t, Hard::default(), 0, 7);
+    // Win an election outright: pre-vote, then the real one, from n1..n3.
+    let pre = m.tick(t.election_max_ms, 0).expect("campaigns");
+    let mut real = None;
+    for r in ["n1", "n2", "n3"] {
+        if let Some(v) = m.on_vote_reply(&r.to_string(), &pre, VoteReply { term: 0, granted: true }, t.election_max_ms, 0) {
+            real = Some(v);
+        }
+    }
+    let real = real.expect("pre-vote won");
+    for r in ["n1", "n2", "n3"] {
+        m.on_vote_reply(&r.to_string(), &real, VoteReply { term: real.term, granted: true }, t.election_max_ms, 0);
+    }
+    assert!(m.is_leader());
+    let peer = |term| Status { name: "n1".into(), account: String::new(), term, role: Role::Follower, leader: Some("n0".into()), head: 0, head_term: 0 };
+    let mut now = t.election_max_ms;
+    for _ in 0..20 {
+        now += 500;
+        m.on_status(&"n1".to_string(), peer(real.term), now);
+        m.on_inbound(peer(real.term), now);
+        m.tick(now, 0);
+    }
+    assert!(!m.is_leader(), "one peer heard twice is still one peer");
+}
+
+/// Push targets: a peer whose head keeps moving is pulling; one that
+/// sits still behind us is not.
+#[test]
+fn push_targets_names_only_the_stuck_peer() {
+    let mut s = Sim::new(3);
+    let l = s.settle(20_000);
+    let stuck = (l + 1) % 3;
+    for b in 0..3 {
+        s.link[stuck][b] = false;
+    }
+    let before = s.pushes;
+    s.run(20_000);
+    assert!(s.pushes > before, "the stuck peer was pushed to");
+    let other = (l + 2) % 3;
+    let (now, head) = (s.now, s.heads[l]);
+    let targets = s.nodes[l].push_targets(now, head);
+    assert!(!targets.contains(&name(other)), "a pulling peer is never a target: {targets:?}");
 }

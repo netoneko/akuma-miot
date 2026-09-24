@@ -29,9 +29,13 @@ read that first, it is kept current and this file does not repeat it.
 - `crates/miot-mesh` — **who produces blocks**: Raft-style leader election
   (terms, one vote per term, majority quorum, pre-vote, check-quorum,
   stickiness) as a pure state machine, no clock, no I/O, same rule as
-  `miot-tasks`. Election only; blocks still move by pull-sync and
-  *leader wins, back to the last compaction*. Its tests are a simulated
-  network (partitions, kills, chaos).
+  `miot-tasks`. Election only; blocks move by pull-sync and *leader wins,
+  back to the last compaction*, plus (2026-09-25) a **leader push** to a
+  peer that can't call out: status polls carry the poller's own status
+  (`Mesh::on_inbound`), and the primary pushes blocks to any peer whose head
+  is stuck (`Mesh::push_targets`, `node.rs` `/chain/push`). Its tests are a
+  simulated network (partitions, one-way links, kills, chaos).
+  Background: HANDOFF, "One-way reachability".
 - `crates/miot-keys` — an account *is* an ed25519 public key
   (`sp_runtime::AccountId32`); `account_from_ssh` reads an
   `authorized_keys` line so root is just a public key.
@@ -115,6 +119,12 @@ read that first, it is kept current and this file does not repeat it.
 - **Election ≠ replication.** A block the primary produced that no replica
   pulled before it died is lost to the rewind (records, not work —
   `miot-store`'s docs). There is no commit index.
+- **A push-only node can't write (2026-09-25).** yuki and shiro follow a
+  home primary by push, with no route to it, so `/submit` (and `/account`)
+  on them has nowhere to forward: it answers 503 "the primary is kuro, but
+  this node has no route to it". Their cats can read and follow along but
+  can't post while the primary is at home. The router forwards
+  (`docs/runbooks/deploy-aws-node.md` §1) or a relay would close it.
 - **`seq` in `/events` restarts when a node rebuilds its log** (demotion,
   rewind, adopted checkpoint). The agent loop resets its cursor; any other
   client holding one should too.

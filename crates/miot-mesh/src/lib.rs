@@ -31,10 +31,29 @@
 //!   lost the election"*: an unreachable leader stops counting after one
 //!   timeout, a live one is never voted against.
 //!
-//! **Not** Raft's log replication. Blocks still move by the replica pulling
-//! the leader's log over `/chain/blocks`, and disagreement is still resolved
-//! by `miot-store`'s *leader wins, back to the last compaction*. Election
-//! only decides who the leader is. So there's no commit index. A block the
+//! **Not** Raft's log replication. Blocks move by the replica pulling the
+//! leader's log over `/chain/blocks`, and disagreement is still resolved by
+//! `miot-store`'s *leader wins, back to the last compaction*. Election only
+//! decides who the leader is. So there's no commit index.
+//!
+//! # Reachability that only goes one way
+//!
+//! Pull assumes every follower can call its leader. A node behind someone
+//! else's NAT can't (the AWS pair, reaching home through a router with no
+//! forwards, 2026-09-24): it heard nothing, followed nobody, and sat as a
+//! pre-candidate forever while home, which *could* call it, never said a
+//! thing it could use. Two additions cover that without changing who
+//! decides anything:
+//!
+//! - **Status goes both ways.** The poller sends its own [`Status`] with the
+//!   poll, and the polled node feeds it to [`Mesh::on_inbound`]. A leader's
+//!   poll is then a heartbeat in both directions. A peer heard only this way
+//!   has no route from here, so it is keyed by name ([`Mesh::heard`]).
+//! - **The leader pushes to a peer that's stuck.** [`Mesh::push_targets`]
+//!   names every peer whose head differs from the leader's and hasn't moved
+//!   for an election window: it isn't pulling. The node then sends it
+//!   blocks; the receiver takes them only from the leader it follows, in
+//!   the current term ([`Mesh::accepts_push_from`]). A block the
 //! leader produced but no follower pulled before the leader died is lost to
 //! the rewind, the same "records, not work" loss `miot-store`'s docs
 //! already accept.
@@ -156,6 +175,15 @@ pub struct Mesh {
     campaign_term: u64,
     /// Last successful status per route, and when.
     seen: BTreeMap<Route, (u64, Status)>,
+    /// Last status each peer *sent* us (a poll of ours, a push), by name,
+    /// and when. The only record of a peer we have no working route to.
+    heard: BTreeMap<Name, (u64, Status)>,
+    /// Leader only: per route, a head that differs from ours and when that
+    /// head was first seen. Cleared when the peer matches us again.
+    lagging: BTreeMap<Route, (u64, u64)>,
+    /// Leader only: routes that have needed a push this term. They get one
+    /// whenever they differ, without waiting out another window.
+    pushed: BTreeSet<Route>,
 }
 
 impl Mesh {
@@ -179,6 +207,9 @@ impl Mesh {
             votes: BTreeSet::new(),
             campaign_term: 0,
             seen: BTreeMap::new(),
+            heard: BTreeMap::new(),
+            lagging: BTreeMap::new(),
+            pushed: BTreeSet::new(),
         };
         m.reset_deadline(now);
         m
@@ -211,6 +242,10 @@ impl Mesh {
     /// Last status seen per route, and when. For `kot peers`.
     pub fn seen(&self) -> &BTreeMap<Route, (u64, Status)> {
         &self.seen
+    }
+    /// Last status each peer sent us, by name, and when. For `kot peers`.
+    pub fn heard(&self) -> &BTreeMap<Name, (u64, Status)> {
+        &self.heard
     }
     /// Members needed to win, this node included.
     pub fn quorum(&self) -> usize {
@@ -254,12 +289,16 @@ impl Mesh {
             // Check-quorum. A leader that can't reach a majority can't tell
             // that they haven't already moved on, so it stops claiming to lead.
             if self.quorum() > 1 && now >= self.leader_since + self.timing.election_min_ms {
-                let fresh = self
+                // By name: a peer we both poll and are polled by is one
+                // peer, not two.
+                let fresh: BTreeSet<&str> = self
                     .seen
                     .values()
+                    .chain(self.heard.values())
                     .filter(|(at, st)| now.saturating_sub(*at) <= self.timing.election_min_ms && st.term <= self.hard.term)
-                    .count();
-                if fresh + 1 < self.quorum() {
+                    .map(|(_, st)| st.name.as_str())
+                    .collect();
+                if fresh.len() + 1 < self.quorum() {
                     self.step_down(now);
                 }
             }
@@ -296,6 +335,8 @@ impl Mesh {
     }
 
     fn become_leader(&mut self, now: u64) {
+        self.lagging.clear();
+        self.pushed.clear();
         self.role = Role::Leader;
         self.leader = Some(self.name.clone());
         self.leader_route = None;
@@ -335,21 +376,92 @@ impl Mesh {
             return;
         }
         self.seen.insert(from.clone(), (now, st.clone()));
+        self.observe(Some(from), st, now);
+    }
+
+    /// A peer told us its status by calling *us*: sent with its own poll,
+    /// or with a push. Same effect as polling it, except that we may have
+    /// no route to it — then it's known by name only, and if it leads, we
+    /// follow it without a route to pull from (its pushes are the log).
+    pub fn on_inbound(&mut self, st: Status, now: u64) {
+        if st.name == self.name {
+            return;
+        }
+        self.heard.insert(st.name.clone(), (now, st.clone()));
+        // A route we've had an answer on, if any, is still the better way
+        // to reach it.
+        let route = self.seen.iter().find(|(_, (_, s))| s.name == st.name).map(|(r, _)| r.clone());
+        if let Some(r) = route {
+            self.seen.insert(r.clone(), (now, st.clone()));
+            self.observe(Some(&r), st, now);
+        } else {
+            self.observe(None, st, now);
+        }
+    }
+
+    /// What a peer's status means for us, however it arrived. `route` is how
+    /// to reach it, if we can.
+    fn observe(&mut self, route: Option<&Route>, st: Status, now: u64) {
         if st.term > self.hard.term {
             self.adopt_term(st.term, now);
         }
         if st.role == Role::Leader && st.term == self.hard.term && self.role != Role::Leader {
             self.role = Role::Follower;
             self.votes.clear();
+            // Don't trade a route for none: a leader we can pull from that
+            // also calls us is still one we can pull from.
+            if self.leader.as_deref() != Some(st.name.as_str()) || route.is_some() {
+                self.leader_route = route.cloned();
+            }
             self.leader = Some(st.name);
-            self.leader_route = Some(from.clone());
             self.last_leader_contact = Some(now);
             self.reset_deadline(now);
-        } else if self.leader_route.as_deref() == Some(from.as_str()) && st.role != Role::Leader {
+        } else if self.leader.as_deref() == Some(st.name.as_str()) && st.role != Role::Leader {
             // Our leader stepped down. Keep the deadline running; don't reset it.
             self.leader = None;
             self.leader_route = None;
         }
+    }
+
+    /// Whether to take blocks pushed by the node whose status is `st`: only
+    /// from the leader we follow, in our current term.
+    pub fn accepts_push_from(&self, st: &Status) -> bool {
+        self.role != Role::Leader
+            && st.role == Role::Leader
+            && st.term == self.hard.term
+            && self.leader.as_deref() == Some(st.name.as_str())
+    }
+
+    /// Leader only: the routes to push blocks to, given our `head`. A peer
+    /// qualifies when we can reach it (a fresh status), its head differs
+    /// from ours, and that head hasn't moved for an election window. A peer
+    /// that pulls catches up within a sync interval and never gets here.
+    /// Once a peer has needed a push, it gets one whenever it differs, for
+    /// the rest of this leadership: otherwise a peer that can only be
+    /// pushed to would trail by a whole window every time.
+    pub fn push_targets(&mut self, now: u64, head: u64) -> Vec<Route> {
+        if self.role != Role::Leader {
+            self.lagging.clear();
+            self.pushed.clear();
+            return Vec::new();
+        }
+        let window = self.timing.election_min_ms;
+        let mut out = Vec::new();
+        for (route, (at, st)) in &self.seen {
+            if now.saturating_sub(*at) > window || st.head == head {
+                self.lagging.remove(route);
+                continue;
+            }
+            let e = self.lagging.entry(route.clone()).or_insert((st.head, now));
+            if e.0 != st.head {
+                *e = (st.head, now);
+            }
+            if self.pushed.contains(route) || now.saturating_sub(e.1) >= window {
+                out.push(route.clone());
+            }
+        }
+        self.pushed.extend(out.iter().cloned());
+        out
     }
 
     /// Answer a vote request. `head` is this node's own.

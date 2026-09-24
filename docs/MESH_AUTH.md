@@ -44,6 +44,11 @@ signature), added to:
   `VoteReply` body)
 - `GET /mesh/status` — response (empty request body, since it takes no
   parameters — see below)
+- `POST /mesh/status` (2026-09-25) — request (the caller's own `Status`,
+  which must name the signer's account, or it's ignored) and response
+- `POST /chain/push` (2026-09-25) — request (a `Push`: the leader's
+  `Status`, which must name the signer, plus one op) and response (a
+  `PushReply`)
 - `GET /chain/head`, `GET /chain/checkpoint` — response
 - `GET /chain/blocks` — response, and the request too, signed over the raw
   query string
