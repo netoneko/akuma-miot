@@ -65,6 +65,10 @@ impl Host for Terminal {
         print!("\n> ");
         let _ = std::io::stdout().flush();
     }
+    /// The operator is right here; a stall is one "go on" away.
+    fn check_before_idle(&self) -> bool {
+        false
+    }
 }
 
 pub async fn run(cfg: ChatConfig) {

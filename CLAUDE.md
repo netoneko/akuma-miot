@@ -60,6 +60,11 @@ read that first, it is kept current and this file does not repeat it.
 ## Where to read
 
 - `HANDOFF.md` — state, traps, roadmap. Start here every session.
+- `docs/AGENT_STATE_MACHINE.md` — the one agent loop (`kot run` and
+  `kot chat`) as a diagram: wakes, queries vs records, follow-up cap and
+  held results, the check-in before idling, how long tool output is fed
+  and paged. Written 2026-09-24 after meow's kernel build stalled; read it
+  before changing `agent_state_machine.rs`.
 - `docs/TEAHOUSE.md` — **the teahouse** (茶馆), the name of the mesh/chain:
   the seven-member topology as actually running (5 home + 2 AWS), with a
   diagram, what was shown live, and the honest limits. Current-state; it

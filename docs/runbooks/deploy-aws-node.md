@@ -115,7 +115,7 @@ egress). Inbound to home needs one forward per member on the home router:
 
 | router WAN port | → LAN target | member |
 |---|---|---|
-| `9944` | `192.168.1.123:9944` | dumpster-akuma-amd64 (`meow`) |
+| `9944` | `192.168.1.120:9944` (`.123` until 2026-09-24) | dumpster-akuma-amd64 (`meow`) |
 | `9945` | `192.168.1.126:9944` | ryzen-linux-amd64 (`tama`) |
 | `9946` | `192.168.1.203:9944` | mac-linux-aarch64 (`kuro`), Lima's `0.0.0.0` forward of `fc:9944` |
 | `9947` | `192.168.1.203:9945` | mac-akuma-aarch64 (`mimi`), the `kot-relay` socat in `fc` |
@@ -321,7 +321,7 @@ python3 overlays/deploy/deploy.py up all            # the five home agents
 ## 6. Verify every direction, not just one
 
 ```bash
-for n in https://192.168.1.123:9944 https://192.168.1.126:9944 https://192.168.1.203:9944 \
+for n in https://192.168.1.120:9944 https://192.168.1.126:9944 https://192.168.1.203:9944 \
          https://192.168.1.203:9945 https://192.168.1.50:9944  https://kot.akuma.sh:9441 https://kot.akuma.sh:9442; do
   echo "== $n"; kot --node $n peers
 done

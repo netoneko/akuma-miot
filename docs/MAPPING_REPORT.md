@@ -295,7 +295,8 @@ crates/
 > shared by `kot run` and `kot chat` (see HANDOFF, "The agent state machine").
 > Aggregation is one fixed policy for now — a wake assembles at once; results
 > alone wait for their batch or 10 s (`Quorum` with a `Deadline`) — not the
-> pluggable `trait Aggregate` below.
+> pluggable `trait Aggregate` below. Its current shape, with a diagram, is
+> `docs/AGENT_STATE_MACHINE.md`.
 
 The agent is **not** an event-driven request/response loop. It is a long-lived
 task with an inbox, a set of in-flight futures, and a policy that decides when

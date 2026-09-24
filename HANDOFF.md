@@ -50,7 +50,7 @@ any node will do (`--node` then `--nodes a,b,c`), because a replica forwards
 | `miot-mesh` | **leader election** — Raft's, election only, with pre-vote + check-quorum + stickiness. Pure state machine; tests are a simulated network with partitions and kills | 10 |
 | `miot-keys` | ed25519 identity: seeds for cats, the operator's SSH *public* key → `AccountId32`, hex wire encoding | 14 |
 | `miot-llm` | provider layer on `genai` (15 providers, GLM included) | — |
-| `kot` | **the one binary** (`dist/<arch>/kot`), 2026-09-22: `kot run --as <name>` = a mesh node + that cat's agent loop in one process; every other verb is a stateless client of any node. Absorbed `crates/miot` (node + RPC client), which is deleted. `tests/election.rs` = three real nodes over localhost, kill the primary, revive it. `tests/agent_state_machine.rs` (2026-09-24) = the one agent loop against a scripted fake model server | 2 + 18 |
+| `kot` | **the one binary** (`dist/<arch>/kot`), 2026-09-22: `kot run --as <name>` = a mesh node + that cat's agent loop in one process; every other verb is a stateless client of any node. Absorbed `crates/miot` (node + RPC client), which is deleted. `tests/election.rs` = three real nodes over localhost, kill the primary, revive it. `tests/agent_state_machine.rs` (2026-09-24) = the one agent loop against a scripted fake model server | 15 unit + 4 election + 30 agent loop |
 
 **`miot-tasks` is the real thing.** Everything else hosts it. That is why the
 pallet is thin and why the same machine runs with or without a chain.
@@ -308,12 +308,27 @@ Now: queries (reads, `Bash`, `AboutMe`, ...) are spawned, not awaited; their
 results enter the same inbox as wakes and are fed back labelled `[#id Tool]`.
 Records (chain writes, a chat reply) are fire-and-forget and never fed back.
 A wake assembles a turn at once; results alone wait for their batch (or
-10 s); result-only turns are capped at 4 in a row. Both hosts keep a
+10 s); result-only turns are capped at 8 in a row. Both hosts keep a
 conversation with the same budget warnings/compaction, reset by the chain
 checkpoint moving. Trap already paid for: writing the model's own calls into
 its history as text (`[called: Bash{...}]`) made qwen3-4b *type*
 `[called: SendMessage{...}]` instead of calling the tool — calls stay out of
 assistant turns; each result names its call instead.
+
+**Stalls fixed, same day (meow's kernel build).** Asked to compile the
+akuma kernel, meow did five turns of recon, hit the follow-up cap (then 4),
+had that result *dropped* (not held, despite the note saying so), was fed
+only the first 3000 chars of a 43 KB README, then messaged root "next I'm
+checking a plain `cargo build`" and called nothing. Nothing woke it again,
+so the build never started and the reports stopped. Also, `Bash` was a fixed
+30 s, so a build would have been killed anyway. Now: results past the cap are
+queued and fed with the next wake; the cap is 8 and its last turn says
+"report now"; a turn that worked on results and only wrote things gets one
+**check-in** before the loop idles (cats only, `Host::check_before_idle`;
+an empty answer is erased from history); results are fed head and tail;
+`Inspect` pages by `offset`; `Bash` takes `timeout` up to 3600 s.
+`docs/AGENT_STATE_MACHINE.md` has the diagram and the whole account.
+**Not yet deployed to any cat.**
 
 ## Block seal times (2026-09-24)
 

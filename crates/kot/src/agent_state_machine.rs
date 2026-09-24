@@ -22,7 +22,22 @@
 //!   results are already there. Results alone wait until every outstanding
 //!   query is back, or [`RESULTS_DEADLINE`], whichever is first — and a run
 //!   of result-only turns is capped ([`MAX_FOLLOWUPS`]) so a model can't
-//!   tool-call itself into a loop with nobody speaking to it.
+//!   tool-call itself into a loop with nobody speaking to it. The last
+//!   allowed one tells the model so (report now); past it, results are
+//!   *held* — queued, not dropped — and ride along with the next wake.
+//! - **Check-in before idling.** A turn that worked on results but started
+//!   nothing new (only records — a message, a task update) is about to leave
+//!   the loop with nothing to do. If the host wants it
+//!   ([`Host::check_before_idle`]), the model gets one [`CHECK_IN`] turn
+//!   first: "nothing is running — if you said you'd do something, do it".
+//!   Calling nothing there is the normal answer, and it leaves no trace in
+//!   history. Found live 2026-09-24: meow, asked to build the kernel,
+//!   messaged root "next I'm checking whether a plain `cargo build`
+//!   works", called no tool, and was never woken again.
+//! - **Long results.** A result is fed as its head and tail (build errors
+//!   are at the end, a README's point at its start); `Inspect` with an
+//!   `offset` pages through the middle. `Bash` takes a `timeout` up to
+//!   [`BASH_MAX_TIMEOUT`] — its result lands whenever it finishes.
 //! - **One conversation.** History accumulates for both hosts, with the same
 //!   budget warnings and compaction (`TokenBudget`/`Compact`/`BrowseTools`/
 //!   `Inspect`), and the same `AboutMe`.
@@ -38,12 +53,28 @@ use tokio::sync::mpsc;
 /// How long results with no wake wait for the rest of their batch.
 pub const RESULTS_DEADLINE: Duration = Duration::from_secs(10);
 /// Result-driven turns in a row, with no new wake, before results are held
-/// back (kept for `Inspect`, not fed) until something actually wakes us.
-pub const MAX_FOLLOWUPS: u32 = 4;
-/// A single result fed back is cut to this; the full text stays in the
-/// tool log for `Inspect`.
-const FEED_CHARS: usize = 3000;
-const BASH_TIMEOUT: Duration = Duration::from_secs(30);
+/// back (queued, fed with the next wake) until something actually wakes
+/// us. Was 4 until 2026-09-24 — meow spent five on recon alone before it
+/// would have started a kernel build. A check-in turn counts as one.
+pub const MAX_FOLLOWUPS: u32 = 8;
+/// A single result fed back is cut to this: [`FEED_HEAD`] from the start,
+/// the rest from the end. The full text stays in the tool log for `Inspect`.
+pub const FEED_CHARS: usize = 3000;
+const FEED_HEAD: usize = 1000;
+/// One `Inspect` page — under [`FEED_CHARS`] with its header, so the page
+/// itself is never cut again.
+const INSPECT_CHARS: usize = 2700;
+/// The most of one result kept at all (head quarter, tail rest) — a build
+/// log must not eat a small box's heap.
+const STORE_CHARS: usize = 256 * 1024;
+/// `Bash` without a `timeout`, and the most one may ask for, in seconds.
+pub const BASH_DEFAULT_TIMEOUT: u64 = 30;
+pub const BASH_MAX_TIMEOUT: u64 = 3600;
+/// Fed to the model, alone, when it's about to go idle mid-work.
+pub const CHECK_IN: &str = "(Check-in: none of your tools are running and nothing else is \
+coming back to you. If you said you'd do something next, call its tool now — a message \
+saying you will doesn't do it. If you're finished, or waiting on someone, call nothing and \
+write nothing.)";
 
 pub type Query = Pin<Box<dyn Future<Output = ToolOut> + Send>>;
 /// `None`: the host already showed it its own way.
@@ -89,6 +120,12 @@ pub trait Host: Send + Sync + 'static {
     fn after_turn(&self, _cost: &TurnCost) {}
     /// Nothing in flight, nothing queued — `kot chat` shows its prompt.
     fn idle(&self) {}
+    /// Give the model a [`CHECK_IN`] turn before going idle mid-work. On
+    /// for an unattended cat; `kot chat` turns it off — its operator is
+    /// right there to say "go on".
+    fn check_before_idle(&self) -> bool {
+        true
+    }
     fn show(&self, s: String) {
         println!("{s}");
     }
@@ -103,6 +140,16 @@ each one labelled [#id ToolName]. So call what you need, then act on the results
 they arrive; you don't have to reply in the same response you call a tool.\n\
 - Writes (SendMessage, TaskUpdate, Artifact, ...) are final: they just happen, and \
 nothing comes back from them.\n\
+- Your work stops when you stop calling tools. If you say you'll do something next, call \
+its tool in that same response — a message alone doesn't start anything.\n\
+- Bash waits 30 seconds unless you pass timeout (seconds, up to 3600). Give anything slow, \
+like a build, a big enough timeout, and tell whoever asked that it's running; its output \
+comes back when it finishes, however long that takes.\n\
+- A long result comes back as its start and its end. Inspect with its id and an offset \
+reads the part in between.\n\
+- After many tool turns in a row with nobody writing to you, you'll be told it's your \
+last one; report your progress then. Results that arrive after that aren't lost — they \
+come back with the next message you get.\n\
 - AboutMe tells you who you are: your persona, model, and what you're running on.\n\
 - TokenBudget tells you how much context you have left. BrowseTools lists past tool \
 results (id, name, preview); Inspect pulls one back by id. Compact replaces the \
@@ -140,6 +187,12 @@ struct AgentStateMachine<H: Host> {
     queries: usize,
     records: usize,
     followups: u32,
+    /// Results that arrived past [`MAX_FOLLOWUPS`], oldest first — fed with
+    /// the next wake.
+    held: Vec<(usize, String)>,
+    /// The last turn worked on results and started nothing: give the model
+    /// a [`CHECK_IN`] before going idle.
+    check_armed: bool,
     /// Bumped by every [`Inbound::Reset`]. Anything started in an older
     /// session — a turn still thinking, a query still running, a wake
     /// queued ahead of the reset — is dropped rather than carried into
@@ -172,6 +225,8 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         queries: 0,
         records: 0,
         followups: 0,
+        held: Vec::new(),
+        check_armed: false,
         session: 0,
         pending: std::collections::VecDeque::new(),
     };
@@ -179,6 +234,22 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
     let mut was_idle = false;
 
     loop {
+        // About to idle mid-work: one check-in first — unless something is
+        // already waiting (it gets the turn instead) or the follow-up budget
+        // is spent.
+        if m.check_armed && m.queries == 0 {
+            m.check_armed = false;
+            while let Ok(i) = inbox.try_recv() {
+                m.pending.push_back(i);
+            }
+            if m.pending.is_empty() && m.followups < MAX_FOLLOWUPS {
+                m.followups += 1;
+                was_idle = false;
+                m.turn(Vec::new(), Vec::new(), true, &mut inbox).await;
+                continue;
+            }
+        }
+
         if m.queries == 0 && m.records == 0 {
             if !open {
                 break;
@@ -233,17 +304,22 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         if wakes.is_empty() {
             if m.followups >= MAX_FOLLOWUPS {
                 m.host.show(ui::note(&format!(
-                    "{} result(s) held back — {MAX_FOLLOWUPS} follow-up turns in a row with nobody speaking; Inspect still has them",
+                    "{} result(s) held back — {MAX_FOLLOWUPS} follow-up turns in a row with nobody speaking; fed with the next message",
                     results.len()
                 )));
+                m.held.extend(results);
                 continue;
             }
             m.followups += 1;
         } else {
             m.followups = 0;
+            if !m.held.is_empty() {
+                // Older than anything in this batch, so first.
+                results.splice(0..0, m.held.drain(..));
+            }
         }
         was_idle = false;
-        m.turn(wakes, results, &mut inbox).await;
+        m.turn(wakes, results, false, &mut inbox).await;
     }
 }
 
@@ -261,6 +337,8 @@ impl<H: Host> AgentStateMachine<H> {
                 self.warned_tier = 0;
                 self.pending_warning = None;
                 self.followups = 0;
+                self.held.clear();
+                self.check_armed = false;
                 wakes.clear();
                 results.clear();
             }
@@ -280,8 +358,8 @@ impl<H: Host> AgentStateMachine<H> {
                     return;
                 }
                 let id = self.tool_log.len();
-                self.tool_log.push((name, out.text()));
-                results.push((id, clip(&self.tool_log[id].1, FEED_CHARS)));
+                self.tool_log.push((name, keep(&out.text())));
+                results.push((id, feed(id, &self.tool_log[id].1)));
             }
         }
     }
@@ -298,7 +376,9 @@ impl<H: Host> AgentStateMachine<H> {
         t
     }
 
-    async fn turn(&mut self, wakes: Vec<(String, &'static str, serde_json::Value)>, results: Vec<(usize, String)>, inbox: &mut mpsc::UnboundedReceiver<Inbound>) {
+    /// One turn. `check`: a [`CHECK_IN`] — no wakes, no results, and if the
+    /// model calls nothing it leaves no trace in history.
+    async fn turn(&mut self, wakes: Vec<(String, &'static str, serde_json::Value)>, results: Vec<(usize, String)>, check: bool, inbox: &mut mpsc::UnboundedReceiver<Inbound>) {
         let name = self.host.name().to_string();
         if !wakes.is_empty() {
             self.kinds = wakes.iter().map(|w| w.1).collect();
@@ -311,7 +391,24 @@ impl<H: Host> AgentStateMachine<H> {
             let rows: Vec<String> = results.iter().map(|(id, text)| format!("[#{id} {}] {text}", self.tool_log[*id].0)).collect();
             msg.push(format!("Results of tools you called:\n{}", rows.join("\n\n")));
         }
-        let why = if wakes.is_empty() { format!("{} result(s) back", results.len()) } else { summary(&wakes[wakes.len() - 1].0) };
+        if check {
+            msg.push(CHECK_IN.to_string());
+        }
+        if wakes.is_empty() && self.followups >= MAX_FOLLOWUPS {
+            msg.push(format!(
+                "(This is your last turn without someone writing to you: {MAX_FOLLOWUPS} in a row. \
+                 After it, tool results are held until a message arrives, then fed with it. If \
+                 you're in the middle of something, SendMessage whoever asked now: what you've \
+                 done, what's still running, what's next.)"
+            ));
+        }
+        let why = if check {
+            "check-in — nothing running".to_string()
+        } else if wakes.is_empty() {
+            format!("{} result(s) back", results.len())
+        } else {
+            summary(&wakes[wakes.len() - 1].0)
+        };
         self.host.show(ui::thinking(&name, &why));
         self.history.push((Speaker::User, msg.join("\n\n")));
 
@@ -362,11 +459,21 @@ impl<H: Host> AgentStateMachine<H> {
         // anyway: every result comes back labelled with its tool and
         // argument (`[#3 Bash] $ uname -sm`). A tool-only turn leaves no
         // assistant message, and the results follow as the next user one.
+        // A check-in answered with nothing: the normal "I'm done". Leave no
+        // trace, so a long session isn't a stack of check-ins.
+        if check && turn.calls.is_empty() {
+            self.history.pop();
+            self.host.show(ui::note("check-in: nothing more to do"));
+            self.host.after_turn(&cost);
+            return;
+        }
+
         let own = turn.text.trim();
         if !own.is_empty() {
             self.history.push((Speaker::Assistant, own.to_string()));
         }
 
+        let queries_before = self.queries;
         let mut compacted = false;
         for c in &turn.calls {
             match c.name.as_str() {
@@ -390,6 +497,12 @@ impl<H: Host> AgentStateMachine<H> {
                 _ => self.dispatch(c),
             }
         }
+        // Worked on results, then only wrote things (a message, a task
+        // update): the shape of "I'll do X next" with no X started. A
+        // check-in never arms another.
+        let started_nothing = self.queries == queries_before;
+        let wrote = !turn.calls.is_empty();
+        self.check_armed = !check && !results.is_empty() && wrote && started_nothing && self.host.check_before_idle();
         if turn.calls.is_empty() {
             let text = turn.text.trim();
             if text.is_empty() {
@@ -479,8 +592,18 @@ impl<H: Host> AgentStateMachine<H> {
             }
             "Inspect" => {
                 let id = c.args.get("id").and_then(|v| v.as_u64()).map(|n| n as usize);
+                let offset = c.args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
                 match id.and_then(|i| self.tool_log.get(i).map(|r| (i, r))) {
-                    Some((i, (name, out))) => ToolOut::new(format!("#{i} {name}"), true).body(out.clone()),
+                    Some((i, (name, out))) => {
+                        let total = out.chars().count();
+                        let from = offset.min(total);
+                        let to = (from + INSPECT_CHARS).min(total);
+                        let mut page: String = out.chars().skip(from).take(to - from).collect();
+                        if to < total {
+                            page.push_str(&format!("\n… [Inspect {{\"id\": {i}, \"offset\": {to}}} for the next part]"));
+                        }
+                        ToolOut::new(format!("#{i} {name}"), true).meta(format!("chars {from}–{to} of {total}")).body(page)
+                    }
                     None => ToolOut::new(format!("{id:?}"), false).meta(format!("no such id ({} stored)", self.tool_log.len())),
                 }
             }
@@ -507,9 +630,12 @@ fn local_tool(c: &Call) -> Option<Query> {
     match c.name.as_str() {
         "Bash" => {
             let command = c.str("command").unwrap_or_default();
+            let secs = c.args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(BASH_DEFAULT_TIMEOUT).clamp(1, BASH_MAX_TIMEOUT);
             Some(Box::pin(async move {
-                let run = tokio::process::Command::new("/bin/sh").arg("-c").arg(&command).output();
-                match tokio::time::timeout(BASH_TIMEOUT, run).await {
+                // Timed out means killed, not left running unseen. (Only the
+                // shell itself — a child it forked may outlive it.)
+                let run = tokio::process::Command::new("/bin/sh").arg("-c").arg(&command).kill_on_drop(true).output();
+                match tokio::time::timeout(Duration::from_secs(secs), run).await {
                     Ok(Ok(out)) => {
                         let code = out.status.code();
                         let mut body = String::from_utf8_lossy(&out.stdout).into_owned();
@@ -519,7 +645,9 @@ fn local_tool(c: &Call) -> Option<Query> {
                             .body(body)
                     }
                     Ok(Err(e)) => ToolOut::new(format!("$ {command}"), false).meta("failed to spawn").body(e.to_string()),
-                    Err(_) => ToolOut::new(format!("$ {command}"), false).meta(format!("timed out after {}s", BASH_TIMEOUT.as_secs())),
+                    Err(_) => ToolOut::new(format!("$ {command}"), false)
+                        .meta(format!("timed out after {secs}s, killed"))
+                        .body(format!("Pass a larger timeout (seconds, up to {BASH_MAX_TIMEOUT}) if this needs longer.")),
                 }
             }))
         }
@@ -566,12 +694,35 @@ async fn summarize(llm: &Llm, system: &str, history: &[(Speaker, String)]) -> St
     }
 }
 
-fn clip(s: &str, n: usize) -> String {
-    if s.chars().count() <= n {
+/// What the model is fed of result `id`: all of it if short, else its head
+/// and its tail with a pointer to the middle. Head-only (the old way) fed
+/// meow the first 3000 chars of a 43 KB README and would have fed it the
+/// first screen of a build log, never the error at the end.
+fn feed(id: usize, s: &str) -> String {
+    let n = s.chars().count();
+    if n <= FEED_CHARS {
         return s.to_string();
     }
-    let kept: String = s.chars().take(n).collect();
-    format!("{kept}\n… ({} more chars — Inspect for the rest)", s.chars().count() - n)
+    let tail = FEED_CHARS - FEED_HEAD;
+    let head: String = s.chars().take(FEED_HEAD).collect();
+    let end: String = s.chars().skip(n - tail).collect();
+    format!(
+        "{head}\n… [{} chars cut here — Inspect {{\"id\": {id}, \"offset\": {FEED_HEAD}}} reads on from this point] …\n{end}",
+        n - FEED_CHARS
+    )
+}
+
+/// What the tool log keeps of one result: at most [`STORE_CHARS`], a
+/// quarter from the start and the rest from the end.
+fn keep(s: &str) -> String {
+    let n = s.chars().count();
+    if n <= STORE_CHARS {
+        return s.to_string();
+    }
+    let head_n = STORE_CHARS / 4;
+    let head: String = s.chars().take(head_n).collect();
+    let end: String = s.chars().skip(n - (STORE_CHARS - head_n)).collect();
+    format!("{head}\n… [{} chars not kept] …\n{end}", n - STORE_CHARS)
 }
 
 /// The first line of a wake, for the `thinking ·` row.

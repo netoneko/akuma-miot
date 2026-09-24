@@ -55,7 +55,7 @@ and the evidence is on chain or in a journal. Where it's shaky, it says so.
 
 | cat | OS › what it runs in › machine | arch | agent name | model | reached at |
 |---|---|---|---|---|---|
-| 喵 meow | **Akuma** › bare metal › the HP box ("the dumpster") | amd64 | `dumpster-akuma-amd64` | GLM (`glm-5.3`, z.ai coding plan) | `192.168.1.123:9944` |
+| 喵 meow | **Akuma** › bare metal › the HP box ("the dumpster") | amd64 | `dumpster-akuma-amd64` | GLM (`glm-5.3`, z.ai coding plan) | `192.168.1.120:9944` (`.123` until 2026-09-24) |
 | 玉 tama | Linux (Pop!_OS) › bare metal › ryzen | amd64 | `ryzen-linux-amd64` | qwen3-4b, `llama-server` on ryzen `:8081` | `192.168.1.126:9944` |
 | 黑 kuro | Linux (Ubuntu) › Lima VM `fc` › macOS on the mac | arm64 | `mac-linux-aarch64` | qwen3:4b, `llama-server` on the mac `:8083` | `192.168.1.203:9944` |
 | 咪 mimi | **Akuma** › Firecracker › Lima VM `fc` › macOS (nested virt) | arm64 | `mac-akuma-aarch64` | qwen3:4b, mac `:8084` | `192.168.1.203:9945` (socat relay in `fc`) |

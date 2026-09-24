@@ -158,7 +158,9 @@ def route(frm: str, to: str) -> str:
     if (frm, to) in special:
         return special[(frm, to)]
     if to == "dumpster-akuma-amd64":
-        return "https://192.168.1.123:9944"
+        # .123 until 2026-09-24, when DHCP moved the box to .120 (ARP:
+        # vaporwave.lan). No reservation yet, so check `arp -a` if it moves again.
+        return "https://192.168.1.120:9944"
     if to == "ryzen-linux-amd64":
         return "https://192.168.1.126:9944"
     if to == "mac-linux-aarch64":

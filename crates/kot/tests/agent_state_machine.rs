@@ -5,7 +5,7 @@
 //! results must come back, records must not, wakes queued during a turn
 //! must be folded into the next one, and nothing may loop forever.
 
-use kot::agent_state_machine::{self, Dispatch, Host, Inbound, MAX_FOLLOWUPS};
+use kot::agent_state_machine::{self, Dispatch, Host, Inbound, CHECK_IN, MAX_FOLLOWUPS};
 use kot::ui::ToolOut;
 use miot_llm::{Call, Llm, Tool};
 use serde_json::{json, Value};
@@ -110,6 +110,9 @@ struct Seen {
     turns: usize,
     /// (tools, messages) per turn, as reported to `after_turn`.
     costs: Vec<(usize, usize)>,
+    /// `Host::check_before_idle` — off unless a test is about it, so every
+    /// other test's request count means what it says.
+    check: bool,
 }
 
 struct TestHost(Arc<Mutex<Seen>>);
@@ -163,6 +166,9 @@ impl Host for TestHost {
     fn show(&self, s: String) {
         self.0.lock().unwrap().shown.push(s);
     }
+    fn check_before_idle(&self) -> bool {
+        self.0.lock().unwrap().check
+    }
 }
 
 struct Rig {
@@ -173,10 +179,14 @@ struct Rig {
 }
 
 async fn rig(script: Vec<Reply>) -> Rig {
+    rig_with(script, false).await
+}
+
+async fn rig_with(script: Vec<Reply>, check: bool) -> Rig {
     let fake = Arc::new(Fake::default());
     *fake.script.lock().unwrap() = script.into();
     let url = serve(fake.clone()).await;
-    let seen = Arc::new(Mutex::new(Seen::default()));
+    let seen = Arc::new(Mutex::new(Seen { check, ..Seen::default() }));
     let (tx, rx) = mpsc::unbounded_channel();
     let host = Arc::new(TestHost(seen.clone()));
     let done = tokio::spawn(agent_state_machine::run(host, Llm::local(&url, "fake"), "You are tama.".into(), rx));
@@ -525,4 +535,129 @@ async fn a_query_from_before_a_reset_is_not_fed_back() {
     let all: String = (0..fake.requests().len()).map(|i| fake.all(i)).collect();
     assert!(!all.contains("echo:stale"), "stale result reached the model: {all}");
     assert!(seen.lock().unwrap().shown.iter().any(|l| l.contains("before the session reset")));
+}
+
+// ── stalls, held results, long output (meow, 2026-09-24) ────────────────
+
+/// meow's case: asked to build, it read docs, then messaged "next I'll
+/// build" and called nothing — and nothing ever woke it again. Now a turn
+/// that worked on results and only wrote things gets one check-in, where
+/// it can actually start what it promised.
+#[tokio::test]
+async fn promise_without_a_call_gets_a_check_in() {
+    let r = rig_with(
+        vec![
+            calls(vec![("Bash", json!({"command": "echo recon"}))]),
+            say("next I'll run the build"),
+            calls(vec![("Bash", json!({"command": "echo building"}))]),
+            say("built"),
+            text(""),
+        ],
+        true,
+    )
+    .await;
+    r.wake("build the kernel");
+    r.until("second check-in answered", |_, s| s.shown.iter().any(|l| l.contains("check-in: nothing more to do"))).await;
+    let (fake, seen) = r.finish().await;
+    assert_eq!(fake.requests().len(), 5);
+    assert!(fake.fed(2).contains(CHECK_IN), "the promise turn is followed by a check-in: {}", fake.fed(2));
+    assert!(fake.fed(3).contains("$ echo building"), "the promised work ran and came back: {}", fake.fed(3));
+    assert!(fake.fed(4).contains(CHECK_IN));
+    assert_eq!(seen.lock().unwrap().sent, vec!["next I'll run the build", "built"]);
+}
+
+/// A check-in answered with nothing leaves no trace: the next turn's
+/// history has only the check-in that led somewhere.
+#[tokio::test]
+async fn an_empty_check_in_leaves_no_trace() {
+    let r = rig_with(vec![calls(vec![("Bash", json!({"command": "echo x"}))]), say("done"), text(""), say("hi again")], true).await;
+    r.wake("go");
+    r.until("check-in", |_, s| s.shown.iter().any(|l| l.contains("check-in: nothing more to do"))).await;
+    r.wake("next");
+    r.until("second reply", |_, s| s.sent.len() == 2).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(fake.requests().len(), 4);
+    assert!(!fake.all(3).contains("(Check-in:"), "{}", fake.all(3));
+}
+
+/// Plain chatter — a wake answered with a message, no tools involved —
+/// never costs a check-in.
+#[tokio::test]
+async fn a_reply_to_a_wake_is_not_checked() {
+    let r = rig_with(vec![say("hello")], true).await;
+    r.wake("hi");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(fake.requests().len(), 1);
+}
+
+/// Nor does a turn that started more work — it isn't idle.
+#[tokio::test]
+async fn a_turn_that_starts_a_query_is_not_checked() {
+    let r = rig_with(vec![calls(vec![("Bash", json!({"command": "echo a"}))]), calls(vec![("Bash", json!({"command": "echo b"})), ("SendMessage", json!({"body": "working"}))]), text("")], true).await;
+    r.wake("go");
+    r.until("three turns", |_, s| s.turns == 3).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(fake.requests().len(), 3);
+    assert!(!fake.fed(2).contains(CHECK_IN), "results back, not a check-in: {}", fake.fed(2));
+}
+
+/// Results past the cap aren't dropped: they ride along with the next wake.
+#[tokio::test]
+async fn held_results_are_fed_with_the_next_wake() {
+    let r = rig(vec![]).await;
+    *r.fake.forever.lock().unwrap() = Some(calls(vec![("Bash", json!({"command": "echo held-one"}))]));
+    r.wake("loop");
+    r.until("cap", |_, s| s.shown.iter().any(|l| l.contains("held back"))).await;
+    *r.fake.forever.lock().unwrap() = Some(say("caught up"));
+    r.wake("status?");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, _) = r.finish().await;
+    let n = 1 + MAX_FOLLOWUPS as usize;
+    let fed = fake.fed(n);
+    assert!(fed.contains("status?") && fed.contains(&format!("[#{} Bash]", MAX_FOLLOWUPS)) && fed.contains("held-one"), "{fed}");
+}
+
+/// The last allowed follow-up says so, and only that one.
+#[tokio::test]
+async fn last_followup_is_announced() {
+    let r = rig(vec![]).await;
+    *r.fake.forever.lock().unwrap() = Some(calls(vec![("Bash", json!({"command": "true"}))]));
+    r.wake("loop");
+    r.until("cap", |_, s| s.shown.iter().any(|l| l.contains("held back"))).await;
+    let (fake, _) = r.finish().await;
+    let last = MAX_FOLLOWUPS as usize;
+    assert!(fake.fed(last).contains("last turn without someone writing"), "{}", fake.fed(last));
+    assert!(!fake.fed(last - 1).contains("last turn without someone writing"));
+}
+
+/// A long result is fed as head and tail, with a pointer; Inspect with an
+/// offset reads the middle a page at a time.
+#[tokio::test]
+async fn long_results_feed_head_and_tail_and_page() {
+    let cmd = "i=0; while [ $i -lt 500 ]; do echo line$i-xxxxxxxxxx; i=$((i+1)); done";
+    let r = rig(vec![calls(vec![("Bash", json!({"command": cmd}))]), calls(vec![("Inspect", json!({"id": 0, "offset": 1000}))]), say("read it")]).await;
+    r.wake("go");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("line0-") && fed.contains("line499-"), "head and tail: {fed}");
+    assert!(!fed.contains("line250-"), "not the middle");
+    assert!(fed.contains(r#"Inspect {"id": 0, "offset": 1000}"#), "{fed}");
+    let page = fake.fed(2);
+    assert!(page.contains("line250-") || page.contains("line60-"), "{page}");
+    assert!(page.contains("for the next part"), "{page}");
+    assert!(!page.contains("chars cut here"), "a page is never cut again: {page}");
+}
+
+/// Bash honours its timeout, and says how to get more.
+#[tokio::test]
+async fn bash_timeout_is_honoured() {
+    let r = rig(vec![calls(vec![("Bash", json!({"command": "sleep 5", "timeout": 1}))]), say("ok")]).await;
+    r.wake("go");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("timed out after 1s, killed") && fed.contains("larger timeout"), "{fed}");
 }

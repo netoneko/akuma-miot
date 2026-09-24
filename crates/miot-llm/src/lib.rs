@@ -377,10 +377,17 @@ fn note_tools() -> Vec<Tool> {
 pub fn local_tools() -> Vec<Tool> {
     vec![
         Tool::new("Bash")
-            .with_description("Run one shell command on this cat's own host (/bin/sh -c).")
+            .with_description(
+                "Run one shell command on this cat's own host (/bin/sh -c). Waits 30 seconds \
+                 unless given a timeout; the output comes back when it finishes.",
+            )
             .with_schema(serde_json::json!({
                 "type": "object",
-                "properties": {"command": {"type": "string"}},
+                "properties": {
+                    "command": {"type": "string"},
+                    "timeout": {"type": "integer",
+                                "description": "seconds to let it run before it's killed — default 30, at most 3600; give a build plenty"}
+                },
                 "required": ["command"]
             })),
         Tool::new("ReadFile")
@@ -435,10 +442,16 @@ pub fn budget_tools() -> Vec<Tool> {
                 "required": ["summary"]
             })),
         Tool::new("Inspect")
-            .with_description("Pull one of your own past tool-call results (by id, from BrowseTools) back into view.")
+            .with_description(
+                "Pull one of your own past tool-call results (by id, from BrowseTools) back into \
+                 view, one page at a time — a long one says which offset reads on.",
+            )
             .with_schema(serde_json::json!({
                 "type": "object",
-                "properties": {"id": {"type": "integer", "description": "an id BrowseTools listed"}},
+                "properties": {
+                    "id": {"type": "integer", "description": "an id BrowseTools listed"},
+                    "offset": {"type": "integer", "description": "character to start from (default 0)"}
+                },
                 "required": ["id"]
             })),
     ]

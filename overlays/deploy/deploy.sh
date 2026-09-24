@@ -72,7 +72,7 @@ LLAMAS=(
 # (kot-relay-mac-akuma-aarch64.service) that Lima exposes as mac:9945.
 route() { # route <from> <to>
   case "$1>$2" in
-    *">dumpster-akuma-amd64") echo http://192.168.1.123:9944 ;;
+    *">dumpster-akuma-amd64") echo http://192.168.1.120:9944 ;;
     *">ryzen-linux-amd64") echo http://192.168.1.126:9944 ;;
     "mac-akuma-aarch64>mac-linux-aarch64") echo http://10.0.2.2:9944 ;;
     *">mac-linux-aarch64") echo "http://$MAC_LAN:9944" ;;
