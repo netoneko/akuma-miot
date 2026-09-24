@@ -2,3 +2,14 @@ command = /bin/sh
 args = /root/kot/start.sh
 restart = true
 restart_delay = 2000
+# The Rust toolchain for the cat's Bash tool, the same four variables
+# ../akuma/scripts/box/akuma-dev.env gives the box's own build wrappers — an
+# Akuma process inherits only what its spawner passes, and /etc/profile is
+# read by login shells alone, so without these `rustc`/`cargo` are not on
+# PATH for anything kot runs. LD_LIBRARY_PATH is what rustc's
+# librustc_driver shim needs where `$ORIGIN` cannot be expanded. Harmless
+# on an Akuma root with no /usr/local/rust.
+env = PATH=/usr/local/bin:/usr/local/rust/bin:/usr/bin:/bin
+env = LD_LIBRARY_PATH=/usr/local/rust/lib:/usr/lib:/lib
+env = HOME=/root
+env = CARGO_HOME=/root/.cargo
