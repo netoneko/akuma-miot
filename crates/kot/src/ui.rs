@@ -573,8 +573,24 @@ pub fn submitted() -> String {
 pub fn closed() -> String {
     verb("✓", "closed", theme().done)
 }
+/// Insert a space at each PascalCase word boundary. A `Directive`'s name
+/// (`PlanNeeded`, `ClearanceNeeded`, `ReassignNeeded` — `miot_primitives::
+/// Directive`) arrives as one run of letters; `shout`ed as-is, the case
+/// distinction that marked the word boundary is exactly what gets erased,
+/// collapsing it into an unreadable blob like "PLANNEEDED".
+fn split_words(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 4);
+    for (i, c) in s.chars().enumerate() {
+        if i > 0 && c.is_uppercase() {
+            out.push(' ');
+        }
+        out.push(c);
+    }
+    out
+}
+
 pub fn directed(what: &str) -> String {
-    bold(theme().alarm, &format!("⚑ {}", shout(what)))
+    bold(theme().alarm, &format!("⚑ {}", shout(&split_words(what))))
 }
 pub fn nudged() -> String {
     verb("↻", "nudged", theme().warm)
@@ -1676,5 +1692,30 @@ mod markdown_tests {
     fn unmatched_markers_are_left_as_written() {
         let r = md("a ** b and a lone ` tick and [not a link]");
         assert!(r.contains("a ** b and a lone ` tick and [not a link]"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod directed_tests {
+    use super::*;
+
+    #[test]
+    fn a_directive_names_word_boundary_survives_shouting() {
+        // `Directive::PlanNeeded` etc. (`miot_primitives`) arrive as one run
+        // of PascalCase letters — shouted as-is (`theme().upper`), that
+        // collapses the case distinction that marked the word boundary into
+        // an unreadable "PLANNEEDED". `split_words` puts the boundary back
+        // as a literal space before `shout` ever sees it, so it survives
+        // uppercasing either way.
+        assert_eq!(split_words("PlanNeeded"), "Plan Needed");
+        assert_eq!(split_words("ClearanceNeeded"), "Clearance Needed");
+        assert_eq!(split_words("ReassignNeeded"), "Reassign Needed");
+        assert_eq!(split_words("Plan"), "Plan", "a single word gains no stray space");
+    }
+
+    #[test]
+    fn directed_keeps_the_word_gap_whichever_theme_cases_it() {
+        let r = strip_ansi(&directed("PlanNeeded"));
+        assert!(r.to_uppercase().contains("PLAN NEEDED"), "{r}");
     }
 }

@@ -295,9 +295,21 @@ async fn a_mesh_of_one_produces_on_its_own() {
     let r = node::start(cfg(1, "solo", port, vec![], dir.path().join("db"))).await.unwrap();
     let url = format!("https://127.0.0.1:{port}");
     submit(&http, &url, open("alone")).await;
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    assert!(r.shared.lock().await.is_producing());
-    assert!(r.shared.lock().await.head() > 0);
+    // `submit` now acks as soon as it's queued (mempool_round applies it
+    // once this node wins its own election, `node.rs::mempool_round`'s
+    // `Route::Here` arm) rather than only after `Route::Here` is already
+    // true — a faster ack, but it no longer doubles as "wait for this node
+    // to become primary" the way blocking-until-success incidentally did.
+    // Poll for both explicitly instead of trusting a fixed sleep to outlast
+    // one election timeout (600-1200ms).
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if r.shared.lock().await.is_producing() && r.shared.lock().await.head() > 0 {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "solo node never became primary and applied its own submit");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
     assert_eq!(task_texts(&http, &url).await, vec!["alone".to_string()]);
     r.abort();
 }

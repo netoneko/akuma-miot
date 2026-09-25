@@ -57,7 +57,7 @@
 //!   against it before tailing, since the old and new primaries may disagree
 //!   about the last few blocks.
 
-use std::collections::{BTreeMap, BTreeSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -199,6 +199,55 @@ pub struct Node {
     /// Each peer's cat's, by the account that signed the status carrying
     /// it: when it came in, and how old it already was then.
     peer_activity: BTreeMap<String, (Instant, u64, Activity)>,
+    /// Extrinsics this node accepted but couldn't hand to the primary
+    /// (`Route::Nobody` — a push-only follower with no route to today's
+    /// leader). `mempool_round` retries these every mesh tick: forwards to
+    /// the primary once a route exists, relays to reachable peers
+    /// otherwise. Never persisted, never replicated — same status a block
+    /// itself has before it's sealed. Bounded by `MEMPOOL_CAP`, oldest
+    /// evicted first via `mempool_order`.
+    mempool: HashMap<H256, MempoolEntry>,
+    mempool_order: VecDeque<H256>,
+    /// `/tx/{hash}`'s answer, from this node's own view only: set when this
+    /// node itself applies an extrinsic (as primary) and flipped to
+    /// `Sealed` when that block closes (`advance`), or set to `Pending`
+    /// while the hash sits in `mempool` above. A leadership change loses an
+    /// unsealed entry, same as the block it was riding would be. Bounded by
+    /// `TX_STATUS_CAP`, oldest evicted first via `tx_status_order`.
+    tx_status: HashMap<H256, TxState>,
+    tx_status_order: VecDeque<H256>,
+}
+
+/// See [`Node::mempool`].
+struct MempoolEntry {
+    bytes: Vec<u8>,
+    inserted_at: u64,
+}
+
+/// See [`Node::tx_status`]. `Copy` so `advance` can flip `Applied` entries
+/// to `Sealed` in place without fighting the borrow checker over the map.
+#[derive(Clone, Copy)]
+enum TxState {
+    Pending,
+    Applied { height: u64 },
+    Sealed { height: u64 },
+}
+
+impl TxState {
+    fn json(self) -> serde_json::Value {
+        match self {
+            TxState::Pending => serde_json::json!({"status":"pending"}),
+            TxState::Applied { height } => serde_json::json!({"status":"applied","height":height}),
+            TxState::Sealed { height } => serde_json::json!({"status":"sealed","height":height}),
+        }
+    }
+}
+
+const MEMPOOL_CAP: usize = 512;
+const TX_STATUS_CAP: usize = 1024;
+
+fn tx_hash(bytes: &[u8]) -> H256 {
+    H256::from(sp_io::hashing::blake2_256(bytes))
 }
 
 /// What actually goes over `/mesh/status`: the election's [`Status`], plus
@@ -436,6 +485,10 @@ impl Node {
             started: Instant::now(),
             activity: None,
             peer_activity: BTreeMap::new(),
+            mempool: HashMap::new(),
+            mempool_order: VecDeque::new(),
+            tx_status: HashMap::new(),
+            tx_status_order: VecDeque::new(),
         };
         if !node.store.is_empty() {
             println!(
@@ -574,11 +627,49 @@ impl Node {
         }
     }
 
+    /// Record a hash's status, evicting the oldest tracked hash first once
+    /// `TX_STATUS_CAP` is reached — see [`Node::tx_status`].
+    fn set_tx_status(&mut self, hash: H256, st: TxState) {
+        if !self.tx_status.contains_key(&hash) {
+            if self.tx_status_order.len() >= TX_STATUS_CAP {
+                if let Some(old) = self.tx_status_order.pop_front() {
+                    self.tx_status.remove(&old);
+                }
+            }
+            self.tx_status_order.push_back(hash);
+        }
+        self.tx_status.insert(hash, st);
+    }
+
+    /// Queue an extrinsic this node couldn't hand to the primary — see
+    /// [`Node::mempool`]. A no-op if already queued (a relay can hear the
+    /// same hash from more than one peer).
+    fn mempool_insert(&mut self, hash: H256, bytes: Vec<u8>) {
+        if self.mempool.contains_key(&hash) {
+            return;
+        }
+        if self.mempool_order.len() >= MEMPOOL_CAP {
+            if let Some(old) = self.mempool_order.pop_front() {
+                self.mempool.remove(&old);
+            }
+        }
+        self.mempool_order.push_back(hash);
+        self.mempool.insert(hash, MempoolEntry { bytes, inserted_at: unix_ms() });
+        self.set_tx_status(hash, TxState::Pending);
+    }
+
     /// Close the open block and open the next — the primary's block loop.
     fn advance(&mut self) {
         let closing = self.block;
         let header = self.ext.execute_with(Executive::finalize_block);
         self.persist(closing);
+        for st in self.tx_status.values_mut() {
+            if let TxState::Applied { height } = *st {
+                if height == closing {
+                    *st = TxState::Sealed { height };
+                }
+            }
+        }
         if self.pending_compaction {
             self.compact_at(closing);
             self.pending_compaction = false;
@@ -1504,6 +1595,8 @@ pub fn router(shared: Shared) -> Router {
         .route("/head", get(head))
         .route("/events", get(events))
         .route("/submit", post(submit))
+        .route("/mempool/relay", post(mempool_relay))
+        .route("/tx/{hash}", get(tx_status))
         .route("/meta", get(meta))
         .route("/roster", get(roster))
         .route("/account/{id}", get(account))
@@ -1606,6 +1699,7 @@ pub async fn start(cfg: NodeConfig) -> Result<Running, String> {
         loop {
             iv.tick().await;
             mesh_round(&s, poll_ms).await;
+            mempool_round(&s).await;
         }
     }));
 
@@ -1961,13 +2055,30 @@ async fn account(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: H
 /// Raw SCALE bytes, not JSON — there's no `who` field to trust; the
 /// signature over these exact bytes decides the sender. On a replica, the
 /// bytes go to the primary unchanged: any node will do (`docs/CLI.md` §5a).
-async fn submit(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode, Json<serde_json::Value>) {
-    match route(&n).await {
+/// Accept a raw signed extrinsic, whichever door it came in — a direct
+/// `/submit` from a client, or a `/mempool/relay` hop from a peer that
+/// couldn't reach the primary either. Same routing `/submit` always used
+/// (apply here, or forward to the primary), plus the one new case: no
+/// route to the primary queues it in `mempool` instead of refusing —
+/// `mempool_round` keeps trying it every mesh tick (`HANDOFF.md`, "One-way
+/// reachability": a push-only follower otherwise has no way to write at
+/// all while the primary is on the side it can't reach).
+async fn accept_extrinsic(n: &Shared, body: Bytes) -> (StatusCode, Json<serde_json::Value>) {
+    let hash = tx_hash(&body);
+    match route(n).await {
         Route::Here => {}
         // `/submit` isn't header-gated — the extrinsic's own signature is
         // the authority — so nothing needs re-signing on the way through.
         Route::Primary(p, http, _identity) => return forward(&http, http.post(format!("{p}/submit")).body(body)).await,
-        Route::Nobody(leader) => return no_primary(leader),
+        Route::Nobody(leader) => {
+            let mut n = n.lock().await;
+            n.mempool_insert(hash, body.to_vec());
+            let note = match leader {
+                Some(l) => format!("no route to the primary ({l}) yet; queued locally and relaying to peers"),
+                None => "no primary right now (election in progress); queued locally".to_string(),
+            };
+            return (StatusCode::OK, Json(serde_json::json!({"ok":true,"status":"pending","tx_hash":hex::encode(hash),"note":note})));
+        }
     }
     let uxt = match UncheckedExtrinsic::decode(&mut &body[..]) {
         Ok(u) => u,
@@ -1977,10 +2088,155 @@ async fn submit(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode, Json<s
     if !n.producing {
         return no_primary(None); // demoted between the check above and now
     }
+    let height = n.block;
     match n.submit(uxt) {
-        Ok(()) => (StatusCode::OK, Json(serde_json::json!({"ok":true}))),
+        Ok(()) => {
+            n.mempool.remove(&hash);
+            n.set_tx_status(hash, TxState::Applied { height });
+            (StatusCode::OK, Json(serde_json::json!({"ok":true,"status":"applied","tx_hash":hex::encode(hash),"height":height})))
+        }
         // A refusal is the chain's answer, typed — not an error in the cat.
         Err(e) => (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok":false,"error":e}))),
+    }
+}
+
+async fn submit(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode, Json<serde_json::Value>) {
+    accept_extrinsic(&n, body).await
+}
+
+/// A peer relaying an extrinsic it couldn't forward either — see
+/// `mempool_round`. Same acceptance path as `/submit`; the only difference
+/// is who called it.
+async fn mempool_relay(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode, Json<serde_json::Value>) {
+    accept_extrinsic(&n, body).await
+}
+
+/// Whether/when a submitted extrinsic landed, by hash — the polling target
+/// for a client that got `"status":"pending"` back from `/submit`. Routed
+/// like `/account`: this node's own view if it has one (still in
+/// `mempool`, or applied/sealed here as the node that actually ran it),
+/// otherwise forwarded to whoever the primary is. `"unknown"` covers both
+/// "never seen" and "seen, but the node that resolved it has since been
+/// evicted or lost leadership" — `tx_status` isn't persisted or replicated,
+/// so either looks the same from here.
+async fn tx_status(AxState(n): AxState<Shared>, Path(hash_hex): Path<String>, headers: HeaderMap) -> Response {
+    {
+        let n = n.lock().await;
+        if let Err(r) = require_client_auth(&n, &headers, b"") {
+            return r;
+        }
+    }
+    let Ok(bytes) = hex::decode(&hash_hex) else {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"bad hash hex"}))).into_response();
+    };
+    if bytes.len() != 32 {
+        return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"hash must be 32 bytes"}))).into_response();
+    }
+    let hash = H256::from_slice(&bytes);
+    {
+        let n = n.lock().await;
+        if let Some(st) = n.tx_status.get(&hash) {
+            return Json(st.json()).into_response();
+        }
+    }
+    match route(&n).await {
+        Route::Primary(p, http, identity) => {
+            let signed = sign_headers(&identity, b"");
+            forward(&http, http.get(format!("{p}/tx/{hash_hex}")).headers(signed)).await.into_response()
+        }
+        Route::Nobody(_) | Route::Here => Json(serde_json::json!({"status":"unknown"})).into_response(),
+    }
+}
+
+/// One mesh tick's worth of mempool upkeep — see [`Node::mempool`]. Expired
+/// entries are dropped outright: past `MEMPOOL_TTL`, either it landed via
+/// some other relay path already (nothing here would know) or it's stuck
+/// for a reason retrying won't fix, and the client's own submit-retry
+/// (`Cat::submit`, `Client::try_submit`) will queue it again if it still
+/// matters. Everything else is re-routed fresh: forwarded to the primary if
+/// a route exists now, applied directly if this node *is* the primary now,
+/// or relayed to every peer this node's own config can reach — a peer that
+/// already knows the hash just no-ops (`mempool_insert`), so re-relaying a
+/// stuck entry every tick costs an HTTP round trip, not correctness.
+const MEMPOOL_TTL_MS: u64 = 15 * 60 * 1000;
+
+pub async fn mempool_round(shared: &Shared) {
+    let (entries, peers, http, identity) = {
+        let mut n = shared.lock().await;
+        let now = unix_ms();
+        n.mempool.retain(|_, e| now.saturating_sub(e.inserted_at) < MEMPOOL_TTL_MS);
+        if n.mempool.is_empty() {
+            return;
+        }
+        let entries: Vec<(H256, Vec<u8>)> = n.mempool.iter().map(|(h, e)| (*h, e.bytes.clone())).collect();
+        (entries, n.mesh.routes().to_vec(), n.http.clone(), n.identity)
+    };
+    for (hash, bytes) in entries {
+        match route(shared).await {
+            Route::Here => {
+                let Ok(uxt) = UncheckedExtrinsic::decode(&mut &bytes[..]) else {
+                    shared.lock().await.mempool.remove(&hash); // can't apply what we can't decode
+                    continue;
+                };
+                let mut n = shared.lock().await;
+                let height = n.block;
+                if n.submit(uxt).is_ok() {
+                    n.set_tx_status(hash, TxState::Applied { height });
+                }
+                n.mempool.remove(&hash);
+            }
+            Route::Primary(p, http, _identity) => {
+                if let Ok(r) = http.post(format!("{p}/submit")).body(bytes).send().await {
+                    if r.status().is_success() {
+                        shared.lock().await.mempool.remove(&hash);
+                    }
+                }
+            }
+            // No route to hand the write to — but sealing is a fact about
+            // the *hash*, not about this node, and a reachable peer that
+            // itself has (or can forward to) a route can answer that
+            // whether or not this node ever gets one. Ask before relaying
+            // again: a block carries only effects, not extrinsic hashes
+            // (`seal_body`), so nothing about a pushed/pulled block would
+            // otherwise tell this node its own queued write already landed
+            // by some other path.
+            Route::Nobody(_) => {
+                let hash_hex = hex::encode(hash.as_bytes());
+                let mut sealed = false;
+                for peer in &peers {
+                    let signed = sign_headers(&identity, b"");
+                    let Ok(r) = http.get(format!("{peer}/tx/{hash_hex}")).headers(signed).send().await else { continue };
+                    let Ok(v) = r.json::<serde_json::Value>().await else { continue };
+                    match v.get("status").and_then(|s| s.as_str()) {
+                        Some("sealed") => {
+                            let height = v.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+                            let mut n = shared.lock().await;
+                            n.set_tx_status(hash, TxState::Sealed { height });
+                            n.mempool.remove(&hash);
+                            sealed = true;
+                            break;
+                        }
+                        Some("applied") => {
+                            let height = v.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+                            shared.lock().await.set_tx_status(hash, TxState::Applied { height });
+                        }
+                        _ => {}
+                    }
+                }
+                if sealed {
+                    continue;
+                }
+                // Known applied (just not sealed yet) somewhere reachable —
+                // no point re-submitting the same bytes again this tick,
+                // only re-checking next tick.
+                let already_applied = matches!(shared.lock().await.tx_status.get(&hash), Some(TxState::Applied { .. }));
+                if !already_applied {
+                    for peer in &peers {
+                        let _ = http.post(format!("{peer}/mempool/relay")).body(bytes.clone()).send().await;
+                    }
+                }
+            }
+        }
     }
 }
 

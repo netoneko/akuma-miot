@@ -47,6 +47,68 @@ pub struct Client {
     /// Lives here rather than as a local in `repl()` so `run_command`
     /// (which only ever sees `&mut Client`) can set and clear it.
     pub dm_target: Option<AccountId>,
+    /// Where a housekeeping line (a reconnect, a retry, a "queued locally")
+    /// goes: the REPL's inline-viewport scrollback channel once `repl()` has
+    /// one (raw mode owns the terminal from then on — a bare `eprintln!`
+    /// after that point doesn't get skipped, it corrupts the display, since
+    /// ratatui's own buffer no longer matches what's actually on screen).
+    /// `None` before that (a one-shot verb, or `repl()`'s own pre-raw-mode
+    /// setup calls), where a bare `eprintln!` is the right thing.
+    pub notice: Option<mpsc::UnboundedSender<String>>,
+}
+
+/// See [`Client::notice`]. A free function (not a method) so [`watch_seal`],
+/// spawned independently of any live `&Client` borrow, can use the same
+/// fallback without needing one.
+fn emit(sink: &Option<mpsc::UnboundedSender<String>>, line: String) {
+    match sink {
+        Some(tx) => {
+            let _ = tx.send(line);
+        }
+        None => eprintln!("{line}"),
+    }
+}
+
+/// The confirmation half of `try_submit`'s "pending"/"applied" ack: polls
+/// `/tx/{hash}` (routed through whoever's primary, same as `/submit`
+/// itself) until it reports sealed, and reports exactly one line when it
+/// does — through `sink` ([`emit`]), never a bare `eprintln!`: this runs
+/// spawned, well past the call that started it, so it must keep respecting
+/// whatever `Client::notice` was in force at that point (a live raw-mode
+/// REPL, or a plain one-shot verb) for as long as it keeps polling.
+/// Spawned rather than awaited so `try_submit` stays non-blocking — sealing
+/// can take several seconds (one block tick) or, if this went through the
+/// mempool, however long a relay hop takes to find a route. Gives up
+/// silently-ish (one line) after ~30s; the extrinsic itself isn't lost —
+/// `Cat::submit`/`Client::try_submit`'s own retry, or a later
+/// `mempool_round`, still owns getting it there. `"unknown"` (the node that
+/// resolved it lost leadership before this caught up, or was itself the one
+/// asked and its own tracking evicted the hash) is reported the same way as
+/// a timeout.
+async fn watch_seal(http: reqwest::Client, node: String, identity: Identity, hash: String, sink: Option<mpsc::UnboundedSender<String>>) {
+    let headers = crate::node::sign_headers(&identity, b"");
+    for _ in 0..20 {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        let Ok(r) = http.get(format!("{node}/tx/{hash}")).headers(headers.clone()).send().await else {
+            continue;
+        };
+        let Ok(v) = r.json::<serde_json::Value>().await else {
+            continue;
+        };
+        match v.get("status").and_then(|s| s.as_str()) {
+            Some("sealed") => {
+                let height = v.get("height").and_then(|h| h.as_u64()).unwrap_or(0);
+                emit(&sink, format!("  {DIM}{hash} sealed at block {height}{OFF}"));
+                return;
+            }
+            Some("unknown") => {
+                emit(&sink, format!("  {DIM}{hash}: lost track of it (leadership likely moved before it sealed){OFF}"));
+                return;
+            }
+            _ => {} // still pending or applied-but-unsealed — keep polling
+        }
+    }
+    emit(&sink, format!("  {DIM}{hash}: still not sealed after 30s — it may land later{OFF}"));
 }
 
 impl Client {
@@ -62,7 +124,7 @@ impl Client {
             .use_preconfigured_tls(crate::tls::client_config_any_node(&identity))
             .build()
             .unwrap();
-        let mut c = Client { http, candidates, node: String::new(), identity, roster, dm_target: None };
+        let mut c = Client { http, candidates, node: String::new(), identity, roster, dm_target: None, notice: None };
         c.reconnect().await?;
         c.adopt_chain_roster().await;
         Ok(c)
@@ -92,7 +154,7 @@ impl Client {
             let probe = self.http.get(format!("{n}/head")).headers(headers).timeout(std::time::Duration::from_secs(3)).send().await;
             if matches!(probe, Ok(ref r) if r.status().is_success()) {
                 if self.node != *n && !self.node.is_empty() {
-                    eprintln!("  {DIM}switched to {n}{OFF}");
+                    emit(&self.notice, format!("  {DIM}switched to {n}{OFF}"));
                 }
                 self.node = n.clone();
                 return Ok(());
@@ -111,7 +173,7 @@ impl Client {
             match self.http.get(format!("{}{path}", self.node)).headers(headers.clone()).send().await {
                 Ok(r) => return r.json().await.map_err(|e| format!("bad response from {}{path}: {e}", self.node)),
                 Err(e) if attempt == 0 => {
-                    eprintln!("  {DIM}{} unreachable ({e}); trying the next node{OFF}", self.node);
+                    emit(&self.notice, format!("  {DIM}{} unreachable ({e}); trying the next node{OFF}", self.node));
                     self.reconnect().await?;
                 }
                 Err(e) => return Err(format!("node unreachable: {e}")),
@@ -130,28 +192,76 @@ impl Client {
         })
     }
 
-    /// Sign and submit, no printing — for a caller (the ratatui REPL) that
-    /// renders the outcome itself. [`Client::submit`] is the printing
-    /// wrapper the one-shot verbs use.
+    /// Sign and submit — for a caller (the ratatui REPL) that renders the
+    /// outcome itself. Any housekeeping line this needs to say (a retry, a
+    /// "queued locally," eventually a "sealed") goes through [`Client::
+    /// notice`], never a bare `eprintln!`: once `repl()` has put the
+    /// terminal in raw mode, that corrupts the display rather than getting
+    /// silently skipped. [`Client::submit`] is the printing wrapper the
+    /// one-shot verbs use, where `notice` is `None` and a bare `eprintln!`
+    /// is exactly right.
+    ///
+    /// Retries a transient refusal instead of surfacing it on the first
+    /// try: a `Stale`/`Future` nonce might resync, and "no route to it"
+    /// (this node follows the primary by push and can't forward — see
+    /// `node.rs::no_primary`) might resolve if the term rolls over to a
+    /// leader this node can actually reach. Same retryable set as
+    /// `agent.rs::Cat::submit`; a business-logic refusal
+    /// (`NotAuthorized`, `WrongKind`, ...) still fails on the first attempt.
     pub async fn try_submit(&mut self, call: RuntimeCall) -> Result<(), String> {
-        let m = self.meta().await?;
-        let who = miot_keys::to_hex(&self.identity.account());
-        let nonce = self.get_json(&format!("/account/{who}")).await?["nonce"].as_u64().unwrap_or(0) as u32;
-        let uxt = client::sign(&self.identity, call, nonce, &m);
-        let r = self.http.post(format!("{}/submit", self.node)).body(uxt.encode()).send().await.map_err(|e| format!("node unreachable: {e}"))?;
-        if r.status().is_success() {
-            return Ok(());
+        const ATTEMPTS: u32 = 4;
+        const BACKOFF_MS: [u64; 3] = [1000, 2000, 4000];
+
+        let mut last = String::new();
+        for attempt in 0..ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt as usize - 1])).await;
+                emit(&self.notice, format!("  {DIM}retrying submit (attempt {}/{ATTEMPTS}) — {last}{OFF}", attempt + 1));
+            }
+
+            let m = self.meta().await?;
+            let who = miot_keys::to_hex(&self.identity.account());
+            let nonce = self.get_json(&format!("/account/{who}")).await?["nonce"].as_u64().unwrap_or(0) as u32;
+            let uxt = client::sign(&self.identity, call.clone(), nonce, &m);
+            let r = match self.http.post(format!("{}/submit", self.node)).body(uxt.encode()).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    last = format!("node unreachable: {e}");
+                    continue;
+                }
+            };
+            let ok = r.status().is_success();
+            let v: serde_json::Value = r.json().await.unwrap_or_default();
+            if ok {
+                // "pending" (queued in the mempool, no route to the primary
+                // yet) or "applied" (landed in the currently open block) —
+                // either way, not durable until it seals. Say so once, then
+                // watch in the background so this call stays non-blocking;
+                // `watch_seal` gets its own clone of `notice` so it keeps
+                // reporting correctly (channel or plain print) however long
+                // it runs past this call returning.
+                if let Some(note) = v.get("note").and_then(|n| n.as_str()) {
+                    emit(&self.notice, format!("  {DIM}{note}{OFF}"));
+                }
+                if let Some(hash) = v.get("tx_hash").and_then(|h| h.as_str()).map(str::to_string) {
+                    tokio::spawn(watch_seal(self.http.clone(), self.node.clone(), self.identity, hash, self.notice.clone()));
+                }
+                return Ok(());
+            }
+            let msg = v.get("error").unwrap_or(&v).to_string();
+            if msg.contains("Payment") {
+                return Err(format!(
+                    "{msg} — {} isn't a member of this chain (no `providers`; see HANDOFF.md's \"catnip\"). \
+                     Add it to MIOT_ROSTER on every node (a new genesis), or sign --as a member.",
+                    miot_keys::short(&self.identity.account())
+                ));
+            }
+            if !(msg.contains("Stale") || msg.contains("Future") || msg.contains("no route to it")) {
+                return Err(msg);
+            }
+            last = format!("refused: {msg}");
         }
-        let e: serde_json::Value = r.json().await.unwrap_or_default();
-        let msg = e.get("error").unwrap_or(&e).to_string();
-        if msg.contains("Payment") {
-            return Err(format!(
-                "{msg} — {} isn't a member of this chain (no `providers`; see HANDOFF.md's \"catnip\"). \
-                 Add it to MIOT_ROSTER on every node (a new genesis), or sign --as a member.",
-                miot_keys::short(&self.identity.account())
-            ));
-        }
-        Err(msg)
+        Err(format!("gave up after {ATTEMPTS} attempts — {last}"))
     }
 
     /// Sign and submit. Prints the outcome; returns whether it landed.
@@ -1439,6 +1549,11 @@ pub async fn repl(mut c: Client) {
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    // From here on the terminal is in raw mode (`guard`, above) and ratatui
+    // owns it — any of `c`'s own housekeeping lines (a reconnect, a submit
+    // retry, a mempool "queued locally") must go through this channel too,
+    // not a bare `eprintln!` (`Client::notice`).
+    c.notice = Some(tx.clone());
     let state = Arc::new(AsyncMutex::new(ComposerState { node: c.node.clone(), primary: primary.unwrap_or_else(|| "?".into()), head: head_block, sealing: 0, activity: Vec::new() }));
 
     tokio::spawn(tail_events(c.http.clone(), c.node.clone(), c.identity, c.roster.clone(), me_name.clone(), cursor, tx.clone(), state.clone()));

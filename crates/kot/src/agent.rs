@@ -266,9 +266,11 @@ impl Cat {
     /// resyncs from the chain — cheap, and correct after a rewind, a
     /// restart, or a nonce race this cat didn't cause.
     ///
-    /// Not every failure is worth retrying: a node-unreachable error or a
-    /// `Stale`/`Future` nonce might succeed next time (the node came back,
-    /// or the nonce cache just resynced), but a business-logic refusal
+    /// Not every failure is worth retrying: a node-unreachable error, a
+    /// `Stale`/`Future` nonce, or this node's primary being unreachable
+    /// ("no route to it") might succeed next time (the node came back, the
+    /// nonce cache just resynced, or the term rolled over to a leader this
+    /// node can actually reach), but a business-logic refusal
     /// (`NotAuthorized`, `WrongKind`, `NoSuchTask`, ...) will fail
     /// identically every time — retrying it would just spend wall clock
     /// confirming what the first attempt already proved.
@@ -313,7 +315,7 @@ impl Cat {
                     *self.nonce.lock().await = None;
                     let e: serde_json::Value = r.json().await.unwrap_or_default();
                     let msg = e.get("error").unwrap_or(&e).to_string();
-                    if !(msg.contains("Stale") || msg.contains("Future")) {
+                    if !(msg.contains("Stale") || msg.contains("Future") || msg.contains("no route to it")) {
                         return Err(format!("refused: {msg}"));
                     }
                     last = format!("refused: {msg}");
