@@ -105,13 +105,18 @@ class Agent:
     context_window: int | None = None
 
 
-# z.ai GLM-5.3's window, per Kirill (2026-09-25) — not measured here.
+# The GLM cats' model, since 2026-09-25 (Kirill): flash, reasoning `low`.
+# Checked live on the coding endpoint the same day; it reports
+# `prompt_tokens_details.cached_tokens`.
+GLM_MODEL = "glm-5.3-flash"
+GLM_REASONING = "low"
+# Its window, per Kirill (2026-09-25) — not measured here.
 GLM_CONTEXT_WINDOW = 1_000_000
 
 
 AGENTS: list[Agent] = [
-    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", "glm-5.3", GLM_CONTEXT_WINDOW),
-    Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "glm", "glm-5.3", GLM_CONTEXT_WINDOW),
+    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW),
+    Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW),
     Agent("mac-linux-aarch64", "lima", "fc", "aarch64", "kuro", "http://192.168.5.2:11434", "gemma4-yolo-4b"),
     Agent("ryzen-akuma-amd64", "fcguest", "ryzen", "x86_64", "sora", "http://192.168.1.49:8082", "qwen3-4b"),
     Agent("mac-akuma-aarch64", "fcguest", "fc", "aarch64", "mimi", "http://192.168.5.2:8084", "qwen3:4b"),
@@ -503,7 +508,7 @@ def env_for(name: str) -> str:
         f"MIOT_MODEL={a.model}",
     ]
     if a.llm == "glm":
-        lines += ["MIOT_GLM=true", "MIOT_GLM_TOKEN_FILE=/root/kot/zai.token"]
+        lines += ["MIOT_GLM=true", "MIOT_GLM_TOKEN_FILE=/root/kot/zai.token", f"MIOT_REASONING={GLM_REASONING}"]
     elif a.llm == "asleep":
         # No model: every DM or @name gets "*<name> is currently asleep*".
         lines.append("MIOT_ASLEEP=true")
