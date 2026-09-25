@@ -106,6 +106,28 @@ EOF) drains every query and record still in flight, then returns.
   handled meanwhile. On timeout the shell is killed (`kill_on_drop`) and the
   model is told it can ask for longer. A child the shell forked may outlive
   it.
+- **Aged** (2026-09-25): a fed row stays in the conversation for
+  `RESULT_TURNS` (6) turns. After that it's replaced in place by a one-line
+  stub: its first line (the call and how it went), its length, and
+  `Inspect {"id": N}`. Rows under 400 characters are left alone. Before this,
+  every result ever fed stayed in history for good. meow's GLM loop had no
+  context window to compact against (`Llm::context_window` only asks a
+  llama-server), so it re-sent about 75k tokens a turn, and 181 KB of its
+  235 KB history was old tool output. A hosted model now gets its window
+  from `--context-window`/`MIOT_CONTEXT_WINDOW` (`deploy.py` sets 1M for
+  the GLM cats).
+- **Ids carry on across a restart.** The history file keeps the next id and
+  the rows not yet aged. An id from before the restart answers `Inspect`
+  with "not kept": the tool log itself isn't persisted. A history file in
+  the old format (a bare array) is loaded with every results block cut to
+  one line per row. meow's went from 235 KB to 76 KB.
+- **`LocalTask`** answers a change with the change and the open ids
+  (`L1 is done. 1 open: L2.`), not the whole list. `list` still shows
+  everything, and a mistake still comes back with the list.
+- **`∑ tok`** (the on-chain stats) counts `total − cached`, where the
+  provider reports a prompt cache (`prompt_tokens_details.cached_tokens`,
+  now also in the transcript's `cached_tokens`). A provider that reports none
+  is counted the old way, so `∑` is the sum of every turn's whole context.
 
 ## Watching it work (2026-09-25)
 

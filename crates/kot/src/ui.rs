@@ -882,6 +882,9 @@ pub struct TurnCost {
     pub prompt: u32,
     pub out: u32,
     pub total: u32,
+    /// Of `prompt`, what the provider served from its prompt cache — 0 when
+    /// it doesn't say ([`miot_llm::Turn::cached_tokens`]).
+    pub cached: u32,
     pub window: Option<u32>,
     pub ms: u64,
     /// Tool calls this turn, `SendMessage` not included.
@@ -894,11 +897,12 @@ pub fn turn(caller: &str, c: &TurnCost) -> String {
     let t = theme();
     let sep = || dim(" · ");
     let mut s = format!(
-        "  {} {}  {} {}{}{} {}{}{} {}",
+        "  {} {}  {} {}{}{}{} {}{}{} {}",
         paint(t.done, "◆"),
         sealed(caller),
         dim("in"),
         plain(&thousands(c.prompt as u64)),
+        if c.cached > 0 { dim(&format!(" ({} cached)", thousands(c.cached as u64))) } else { String::new() },
         sep(),
         dim("out"),
         plain(&thousands(c.out as u64)),

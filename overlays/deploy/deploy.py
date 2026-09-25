@@ -99,11 +99,19 @@ class Agent:
     persona: str
     llm: str  # a base URL, "glm", or "asleep" (no model, answers DMs "*… is currently asleep*")
     model: str
+    # MIOT_CONTEXT_WINDOW, for a hosted model the loop can't ask (a
+    # llama-server reports its own). Without it a GLM cat never got a budget
+    # warning or a force-compaction, and meow re-sent ~75k tokens a turn.
+    context_window: int | None = None
+
+
+# z.ai GLM-5.3's window, per Kirill (2026-09-25) — not measured here.
+GLM_CONTEXT_WINDOW = 1_000_000
 
 
 AGENTS: list[Agent] = [
-    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", "glm-5.3"),
-    Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "glm", "glm-5.3"),
+    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", "glm-5.3", GLM_CONTEXT_WINDOW),
+    Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "glm", "glm-5.3", GLM_CONTEXT_WINDOW),
     Agent("mac-linux-aarch64", "lima", "fc", "aarch64", "kuro", "http://192.168.5.2:11434", "gemma4-yolo-4b"),
     Agent("ryzen-akuma-amd64", "fcguest", "ryzen", "x86_64", "sora", "http://192.168.1.49:8082", "qwen3-4b"),
     Agent("mac-akuma-aarch64", "fcguest", "fc", "aarch64", "mimi", "http://192.168.5.2:8084", "qwen3:4b"),
@@ -501,6 +509,8 @@ def env_for(name: str) -> str:
         lines.append("MIOT_ASLEEP=true")
     else:
         lines.append(f"MIOT_LLM={a.llm}")
+    if a.context_window:
+        lines.append(f"MIOT_CONTEXT_WINDOW={a.context_window}")
     lines += [
         f'MIOT_ROOT_PUBKEY="{mesh["MIOT_ROOT_PUBKEY"]}"',
         f'MIOT_LEADER={mesh["MIOT_LEADER"]}',

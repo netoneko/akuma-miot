@@ -1094,3 +1094,74 @@ async fn no_history_path_keeps_nothing() {
     let (_, seen) = r.finish().await;
     assert!(!seen.lock().unwrap().shown.iter().any(|l| l.contains("restored")));
 }
+
+// ── old results age out (meow, 2026-09-25: ~75k tokens re-sent a turn) ──
+
+/// A long result is in the conversation in full for `RESULT_TURNS` turns,
+/// then only as a one-line stub that says how to get it back.
+#[tokio::test]
+async fn an_old_result_shrinks_to_a_stub() {
+    use kot::agent_state_machine::RESULT_TURNS;
+    let mut script = vec![calls(vec![("Bash", json!({"command": "head -c 900 /dev/zero | tr '\\0' Q"}))])];
+    script.extend((0..RESULT_TURNS + 1).map(|_| say("ok")));
+    let r = rig(script).await;
+    r.wake("make a long line");
+    r.until("result fed", |f, _| f.requests().len() == 2).await;
+    // Turn 2 was fed it; each wake after that is one more turn.
+    for i in 0..RESULT_TURNS {
+        r.wake(&format!("wake {i}"));
+        let n = 3 + i as usize;
+        r.until("turn", move |f, _| f.requests().len() == n).await;
+    }
+    let (fake, _) = r.finish().await;
+    let payload = "Q".repeat(900);
+    let last = fake.requests().len() - 1;
+    assert!(fake.all(last - 1).contains(&payload), "still in full {} turns after it was fed", RESULT_TURNS - 1);
+    let aged = fake.all(last);
+    assert!(!aged.contains(&payload), "aged out: {aged}");
+    assert!(aged.contains("[#0 Bash] $ head -c 900") && aged.contains("Inspect {\"id\": 0}"), "a stub in its place: {aged}");
+}
+
+/// Result ids carry on across a restart, so a restored `[#0 …]` never
+/// names a new, different result — and the old one says it's gone.
+#[tokio::test]
+async fn result_ids_carry_on_across_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tama.history.7.json");
+    let r = rig_seen(vec![calls(vec![("Bash", json!({"command": "echo first-life"}))]), text("ok")], with_history(&path)).await;
+    r.wake("go");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    r.finish().await;
+
+    let r = rig_seen(vec![calls(vec![("Inspect", json!({"id": 0}))]), text("ok")], with_history(&path)).await;
+    r.wake("again");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("[#1 Inspect]"), "the first result of the new life is #1, not #0 again: {fed}");
+    assert!(fed.contains("from before a restart"), "Inspect on an id from the last life: {fed}");
+}
+
+/// A history file from before aging (a bare array) has its results cut to
+/// each row's first line, and new ids start above the highest one in it.
+#[test]
+fn an_old_format_history_is_trimmed_on_load() {
+    use kot::agent_state_machine::load_history;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meow.history.1.json");
+    let body = "x".repeat(5000);
+    let old = json!([
+        ["user", "root said: build it"],
+        ["user", format!("Results of tools you called:\n[#4 Bash] $ make  (exit 0, 2s)\n{body}\n\n[#9 ReadFile] /etc/hosts  (1 KB)\n127.0.0.1 localhost")],
+        ["assistant", "built"]
+    ]);
+    std::fs::write(&path, old.to_string()).unwrap();
+    let saved = load_history(&path);
+    assert_eq!(saved.history.len(), 3);
+    assert_eq!(saved.trimmed, 1);
+    assert_eq!(saved.next_id, 10);
+    let said = &saved.history[1].1;
+    assert!(said.contains("[#4 Bash] $ make  (exit 0, 2s)") && said.contains("[#9 ReadFile] /etc/hosts"), "{said}");
+    assert!(!said.contains(&body) && said.len() < 400, "{said}");
+    assert_eq!(saved.history[0].1, "root said: build it");
+}

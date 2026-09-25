@@ -51,6 +51,12 @@
 //!   are at the end, a README's point at its start); `Inspect` with an
 //!   `offset` pages through the middle. `Bash` takes a `timeout` up to
 //!   [`BASH_MAX_TIMEOUT`] — its result lands whenever it finishes.
+//! - **Old results age out.** A result stays in the conversation, as fed,
+//!   for [`RESULT_TURNS`] turns; after that its row is replaced by a one-line
+//!   stub (what ran, how it went, how long it was, `Inspect` to reread).
+//!   Found 2026-09-25: every result ever fed stayed in history for good, and
+//!   meow — a GLM cat, so no window, so never compacted — was re-sending
+//!   ~75k tokens a turn, 181 KB of its 235 KB history old tool output.
 //! - **One conversation.** History accumulates for both hosts, with the same
 //!   budget warnings and compaction (`TokenBudget`/`Compact`/`BrowseTools`/
 //!   `Inspect`), and the same `AboutMe`.
@@ -87,6 +93,14 @@ const FEED_HEAD: usize = 1000;
 /// One `Inspect` page — under [`FEED_CHARS`] with its header, so the page
 /// itself is never cut again.
 const INSPECT_CHARS: usize = 2700;
+/// Turns a fed result stays in the conversation in full before its row is
+/// replaced by a stub ([`AgentStateMachine::age`]). The full text stays in the
+/// tool log for `Inspect`.
+pub const RESULT_TURNS: u64 = 6;
+/// A fed row this short is left alone: its stub would save next to nothing.
+const AGE_MIN_CHARS: usize = 400;
+/// How much of a result's first line (its call and outcome) a stub keeps.
+const STUB_HEAD: usize = 160;
 /// The most of one result kept at all (head quarter, tail rest) — a build
 /// log must not eat a small box's heap.
 const STORE_CHARS: usize = 256 * 1024;
@@ -241,6 +255,8 @@ like a build, a big enough timeout, and tell whoever asked that it's running; it
 comes back when it finishes, however long that takes.\n\
 - A long result comes back as its start and its end. Inspect with its id and an offset \
 reads the part in between.\n\
+- A result stays in the conversation for a few turns, then shrinks to a one-line stub. If \
+you need it again, Inspect it by id rather than rerunning it.\n\
 - After many tool turns in a row with nobody writing to you, you'll be told it's your \
 last one; report your progress then. Results that arrive after that aren't lost — they \
 come back with the next message you get.\n\
@@ -379,8 +395,20 @@ struct AgentStateMachine<H: Host> {
     system: String,
     window: Option<u32>,
     history: Vec<(Speaker, String)>,
-    /// Every query result, full text, by id — survives compaction.
+    /// Every query result, full text — survives compaction. Result `id` is
+    /// at `id - tool_base`.
     tool_log: Vec<(String, String)>,
+    /// The id of `tool_log[0]`. Ids carry on across a restart (the history
+    /// file keeps the next one) so an old `[#3 Bash]` in a restored
+    /// conversation never names a new, different result; one below this is
+    /// from before the restart and no longer kept.
+    tool_base: usize,
+    /// Rows still in the conversation in full, oldest first — aged into
+    /// stubs by [`AgentStateMachine::age`].
+    fresh: Vec<Fresh>,
+    /// Turns taken, over this conversation's whole life (restarts included) —
+    /// the clock [`RESULT_TURNS`] counts on.
+    turns_fed: u64,
     warned_tier: u32,
     pending_warning: Option<String>,
     kinds: Vec<&'static str>,
@@ -455,6 +483,9 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         window,
         history: Vec::new(),
         tool_log: Vec::new(),
+        tool_base: 0,
+        fresh: Vec::new(),
+        turns_fed: 0,
         warned_tier: 0,
         pending_warning: None,
         kinds: Vec::new(),
@@ -478,10 +509,16 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
     };
     if let Some(path) = m.host.history_path() {
         let restored = load_history(&path);
-        if !restored.is_empty() {
-            m.host.show(ui::note(&format!("restored {} message(s) of conversation from {}", restored.len(), path.display())));
-            m.log(serde_json::json!({"t": "restored", "messages": restored.len()}));
-            m.history = restored;
+        if !restored.history.is_empty() {
+            m.host.show(ui::note(&format!("restored {} message(s) of conversation from {}", restored.history.len(), path.display())));
+            if restored.trimmed > 0 {
+                m.host.show(ui::note(&format!("{} old-format message(s) had their tool results cut down to one line each", restored.trimmed)));
+            }
+            m.log(serde_json::json!({"t": "restored", "messages": restored.history.len(), "trimmed": restored.trimmed}));
+            m.history = restored.history;
+            m.fresh = restored.fresh;
+            m.turns_fed = restored.turns;
+            m.tool_base = restored.next_id;
             m.restart_note = Some(m.host.restart_note().unwrap_or_else(|| RESTARTED.to_string()));
         } else {
             m.restart_note = m.host.start_note();
@@ -610,7 +647,35 @@ impl<H: Host> AgentStateMachine<H> {
     /// never this turn.
     fn persist(&self) {
         if let Some(path) = self.host.history_path() {
-            save_history(&path, &self.history);
+            save_history(&path, &Saved { history: self.history.clone(), fresh: self.fresh.clone(), turns: self.turns_fed, next_id: self.next_id(), trimmed: 0 });
+        }
+    }
+
+    fn next_id(&self) -> usize {
+        self.tool_base + self.tool_log.len()
+    }
+
+    /// Result `id`'s tool and full text, if it's still kept.
+    fn logged(&self, id: usize) -> Option<&(String, String)> {
+        id.checked_sub(self.tool_base).and_then(|i| self.tool_log.get(i))
+    }
+
+    /// Replace every row fed [`RESULT_TURNS`] or more turns ago with its
+    /// stub, in the message it went out in. A row whose message is gone (a
+    /// failed turn's prompt, popped) is just forgotten.
+    fn age(&mut self) {
+        let now = self.turns_fed;
+        let (old, keep): (Vec<Fresh>, Vec<Fresh>) = std::mem::take(&mut self.fresh).into_iter().partition(|f| now.saturating_sub(f.turn) >= RESULT_TURNS);
+        self.fresh = keep;
+        for f in old {
+            let stub = if f.id >= self.tool_base {
+                format!("[#{} {}] {} — {} chars, out of the conversation now; Inspect {{\"id\": {}}} reads it again.", f.id, f.name, f.head, f.chars, f.id)
+            } else {
+                format!("[#{} {}] {} — {} chars, from before a restart and no longer kept; run it again if you need it.", f.id, f.name, f.head, f.chars)
+            };
+            if let Some(m) = self.history.iter_mut().rev().find(|(who, said)| *who == Speaker::User && said.contains(&f.full)) {
+                m.1 = m.1.replacen(&f.full, &stub, 1);
+            }
         }
     }
 
@@ -625,6 +690,7 @@ impl<H: Host> AgentStateMachine<H> {
                 self.log(serde_json::json!({"t": "reset", "why": why}));
                 self.session += 1;
                 self.history.clear();
+                self.fresh.clear();
                 self.restart_note = None;
                 self.persist();
                 self.warned_tier = 0;
@@ -660,10 +726,12 @@ impl<H: Host> AgentStateMachine<H> {
                     self.log(serde_json::json!({"t": "result", "id": null, "tool": name, "ok": out.ok, "stale": true, "text": out.text()}));
                     return;
                 }
-                let id = self.tool_log.len();
+                let id = self.next_id();
                 self.tool_log.push((name, keep(&out.text())));
-                self.log(serde_json::json!({"t": "result", "id": id, "tool": self.tool_log[id].0, "ok": out.ok, "text": self.tool_log[id].1}));
-                results.push((id, feed(id, &self.tool_log[id].1)));
+                let (tool, text) = self.tool_log.last().expect("just pushed").clone();
+                let fed = feed(id, &text);
+                self.log(serde_json::json!({"t": "result", "id": id, "tool": tool, "ok": out.ok, "text": text}));
+                results.push((id, fed));
             }
         }
     }
@@ -852,9 +920,19 @@ impl<H: Host> AgentStateMachine<H> {
             self.ctx = wakes.last().map(|w| w.2.clone()).unwrap_or_default();
         }
 
+        self.turns_fed += 1;
         let mut msg: Vec<String> = wakes.iter().map(|w| w.0.clone()).collect();
         if !results.is_empty() {
-            let rows: Vec<String> = results.iter().map(|(id, text)| format!("[#{id} {}] {text}", self.tool_log[*id].0)).collect();
+            let mut rows = Vec::new();
+            for (id, text) in &results {
+                let (name, full_text) = self.logged(*id).cloned().unwrap_or_default();
+                let row = format!("[#{id} {name}] {text}");
+                if row.chars().count() > AGE_MIN_CHARS {
+                    let head = full_text.lines().next().unwrap_or("").chars().take(STUB_HEAD).collect();
+                    self.fresh.push(Fresh { id: *id, name, head, chars: full_text.chars().count(), turn: self.turns_fed, full: row.clone() });
+                }
+                rows.push(row);
+            }
             msg.push(format!("Results of tools you called:\n{}", rows.join("\n\n")));
         }
         if !self.notices.is_empty() {
@@ -887,6 +965,7 @@ impl<H: Host> AgentStateMachine<H> {
         };
         self.host.show(ui::thinking(&name, &why));
         let prompt = msg.join("\n\n");
+        self.age();
         self.history.push((Speaker::User, prompt.clone()));
         self.act.turns += 1;
         self.act.why = why.clone();
@@ -925,6 +1004,7 @@ impl<H: Host> AgentStateMachine<H> {
             "prompt_tokens": turn.prompt_tokens,
             "out_tokens": turn.tokens,
             "total_tokens": turn.total_tokens,
+            "cached_tokens": turn.cached_tokens,
             "ms": turn.ms,
         }));
         let messages = turn.calls.iter().filter(|c| c.name == "SendMessage").count();
@@ -932,6 +1012,7 @@ impl<H: Host> AgentStateMachine<H> {
             prompt: turn.prompt_tokens,
             out: turn.tokens,
             total: turn.total_tokens,
+            cached: turn.cached_tokens,
             window: self.window,
             ms: turn.ms,
             tools: turn.calls.len() - messages,
@@ -996,6 +1077,7 @@ impl<H: Host> AgentStateMachine<H> {
                     )));
                     self.log(serde_json::json!({"t": "compact", "forced": false, "summary": summary}));
                     self.history = vec![(Speaker::Assistant, summary)];
+                    self.fresh.clear();
                     self.warned_tier = 0;
                     compacted = true;
                 }
@@ -1042,6 +1124,7 @@ impl<H: Host> AgentStateMachine<H> {
                 let summary = summarize(&self.llm, &self.system, &self.history).await;
                 self.log(serde_json::json!({"t": "compact", "forced": true, "summary": summary}));
                 self.history = vec![(Speaker::Assistant, summary)];
+                self.fresh.clear();
                 self.warned_tier = 0;
                 self.settle();
             } else if let Some(tier) = miot_llm::budget_checkpoint(pct, self.warned_tier) {
@@ -1131,7 +1214,7 @@ impl<H: Host> AgentStateMachine<H> {
                     .tool_log
                     .iter()
                     .enumerate()
-                    .map(|(id, (name, out))| format!("{id}: {name} — {}", out.lines().next().unwrap_or("").chars().take(60).collect::<String>()))
+                    .map(|(i, (name, out))| format!("{}: {name} — {}", self.tool_base + i, out.lines().next().unwrap_or("").chars().take(60).collect::<String>()))
                     .collect();
                 ToolOut::new("", true).meta(format!("{} stored", lines.len())).body(lines.join("\n"))
             }
@@ -1173,7 +1256,10 @@ impl<H: Host> AgentStateMachine<H> {
             "Inspect" => {
                 let id = c.args.get("id").and_then(|v| v.as_u64()).map(|n| n as usize);
                 let offset = c.args.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
-                match id.and_then(|i| self.tool_log.get(i).map(|r| (i, r))) {
+                if let Some(i) = id.filter(|&i| i < self.tool_base) {
+                    return ToolOut::new(format!("#{i}"), false).meta("from before a restart — not kept; run it again if you need it");
+                }
+                match id.and_then(|i| self.logged(i).map(|r| (i, r))) {
                     Some((i, (name, out))) => {
                         let total = out.chars().count();
                         let from = offset.min(total);
@@ -1184,7 +1270,7 @@ impl<H: Host> AgentStateMachine<H> {
                         }
                         ToolOut::new(format!("#{i} {name}"), true).meta(format!("chars {from}–{to} of {total}")).body(page)
                     }
-                    None => ToolOut::new(format!("{id:?}"), false).meta(format!("no such id ({} stored)", self.tool_log.len())),
+                    None => ToolOut::new(format!("{id:?}"), false).meta(format!("no such id (#{}–#{} stored)", self.tool_base, self.next_id().saturating_sub(1))),
                 }
             }
             _ => {
@@ -1326,29 +1412,125 @@ const RESTARTED: &str = "(You were restarted. The conversation above is from bef
     Anything you started then that was still running is gone, and anything that \
     needed a restart — a reboot, a reinstall — has happened. Check before redoing it.)";
 
-/// `[["user", "…"], ["assistant", "…"]]` — the conversation as JSON. An
+/// A row still in the conversation in full, and what its stub needs.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+struct Fresh {
+    id: usize,
+    name: String,
+    /// The result's first line — its call and how it went.
+    head: String,
+    /// The full result's length, as kept in the tool log.
+    chars: usize,
+    /// [`AgentStateMachine::turns_fed`] when it was fed.
+    turn: u64,
+    /// The row exactly as it went into the message, to find and replace.
+    full: String,
+}
+
+/// What [`Host::history_path`] holds: the conversation, the rows in it not
+/// yet aged, and the two counters that must carry on across a restart.
+#[derive(Default)]
+pub struct Saved {
+    pub history: Vec<(Speaker, String)>,
+    fresh: Vec<Fresh>,
+    pub turns: u64,
+    /// The id the next result gets.
+    pub next_id: usize,
+    /// Old-format messages whose results were cut down on load.
+    pub trimmed: usize,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedFile {
+    history: Vec<(String, String)>,
+    #[serde(default)]
+    fresh: Vec<Fresh>,
+    #[serde(default)]
+    turns: u64,
+    #[serde(default)]
+    next_id: usize,
+}
+
+const RESULTS_HEADER: &str = "Results of tools you called:\n";
+
+/// `{"history": [["user", "…"], ["assistant", "…"]], "fresh": […], …}`. An
 /// unreadable or malformed file is an empty conversation: starting fresh is
 /// what a cat did before this existed, so it's always a safe fallback.
-pub fn load_history(path: &std::path::Path) -> Vec<(Speaker, String)> {
-    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
-    let Ok(rows) = serde_json::from_str::<Vec<(String, String)>>(&text) else { return Vec::new() };
-    rows.into_iter()
-        .filter_map(|(who, said)| match who.as_str() {
-            "user" => Some((Speaker::User, said)),
-            "assistant" => Some((Speaker::Assistant, said)),
-            _ => None,
-        })
-        .collect()
+///
+/// The format before aging was the bare `history` array. Loading one cuts
+/// every results block in it down to each row's first line
+/// ([`trim_legacy`]): nothing records which rows are whose, and those
+/// results are from before the restart anyway. meow's was 235 KB, 181 KB of
+/// it tool output (2026-09-25).
+pub fn load_history(path: &std::path::Path) -> Saved {
+    let Ok(text) = std::fs::read_to_string(path) else { return Saved::default() };
+    let parse = |rows: Vec<(String, String)>| -> Vec<(Speaker, String)> {
+        rows.into_iter()
+            .filter_map(|(who, said)| match who.as_str() {
+                "user" => Some((Speaker::User, said)),
+                "assistant" => Some((Speaker::Assistant, said)),
+                _ => None,
+            })
+            .collect()
+    };
+    if let Ok(f) = serde_json::from_str::<SavedFile>(&text) {
+        return Saved { history: parse(f.history), fresh: f.fresh, turns: f.turns, next_id: f.next_id, trimmed: 0 };
+    }
+    let Ok(rows) = serde_json::from_str::<Vec<(String, String)>>(&text) else { return Saved::default() };
+    let mut history = parse(rows);
+    let (trimmed, max_id) = trim_legacy(&mut history);
+    Saved { history, fresh: Vec::new(), turns: 0, next_id: max_id.map_or(0, |m| m + 1), trimmed }
+}
+
+/// Cut each old-format results block to one line per row (`[#3 Bash] $ make
+/// (exit 0, 2s)`), dropping whatever followed it in that message (a
+/// still-running list, a reminder — stale either way). Returns how many
+/// messages changed and the highest result id seen, so new ids start above it.
+fn trim_legacy(history: &mut [(Speaker, String)]) -> (usize, Option<usize>) {
+    let mut trimmed = 0;
+    let mut max_id = None;
+    for (who, said) in history.iter_mut() {
+        if *who != Speaker::User {
+            continue;
+        }
+        let Some(at) = said.find(RESULTS_HEADER) else { continue };
+        let heads: Vec<String> = said[at..]
+            .lines()
+            .filter(|l| row_id(l).is_some())
+            .inspect(|l| max_id = max_id.max(row_id(l)))
+            .map(|l| l.chars().take(STUB_HEAD).collect())
+            .collect();
+        let short = format!(
+            "{}{RESULTS_HEADER}{}\n(Only each result's first line is kept: they're from before a restart and can't be read again.)",
+            &said[..at],
+            heads.join("\n")
+        );
+        if short.len() < said.len() {
+            *said = short;
+            trimmed += 1;
+        }
+    }
+    (trimmed, max_id)
+}
+
+/// `Some(3)` for a row's first line, `[#3 Bash] …`.
+fn row_id(line: &str) -> Option<usize> {
+    let rest = line.strip_prefix("[#")?;
+    let (n, rest) = rest.split_once(' ')?;
+    rest.split_once("] ")?;
+    n.parse().ok()
 }
 
 /// [`load_history`]'s inverse, written to a temp file and renamed, so a crash
 /// mid-write leaves the previous conversation rather than half of one.
-pub fn save_history(path: &std::path::Path, history: &[(Speaker, String)]) {
-    let rows: Vec<(&str, &str)> = history
-        .iter()
-        .map(|(who, said)| (if *who == Speaker::User { "user" } else { "assistant" }, said.as_str()))
-        .collect();
-    let Ok(text) = serde_json::to_string(&rows) else { return };
+pub fn save_history(path: &std::path::Path, saved: &Saved) {
+    let file = SavedFile {
+        history: saved.history.iter().map(|(who, said)| ((if *who == Speaker::User { "user" } else { "assistant" }).to_string(), said.clone())).collect(),
+        fresh: saved.fresh.clone(),
+        turns: saved.turns,
+        next_id: saved.next_id,
+    };
+    let Ok(text) = serde_json::to_string(&file) else { return };
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }

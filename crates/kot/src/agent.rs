@@ -988,7 +988,11 @@ impl Host for CatHost {
     /// turn: turns are minutes apart, finer than any timer would need.
     fn after_turn(&self, cost: &ui::TurnCost) {
         let cat = self.0.clone();
-        let (tools, messages, tokens, ms) = (cost.tools as u32, cost.messages as u32, cost.total as u64, cost.ms);
+        // Tokens the provider actually had to process: a cached prefix — the
+        // whole conversation, re-sent every turn — isn't counted again. Where
+        // the provider reports no cache this is the full total, as before,
+        // and `∑ tok` is then the sum of every turn's whole context.
+        let (tools, messages, tokens, ms) = (cost.tools as u32, cost.messages as u32, cost.total.saturating_sub(cost.cached) as u64, cost.ms);
         tokio::spawn(async move {
             let snapshot = {
                 let mut s = cat.stats.lock().await;

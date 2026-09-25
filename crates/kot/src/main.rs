@@ -251,6 +251,12 @@ struct LlmArgs {
     /// (`miot_llm::GLM_REASONING`), the provider's own default otherwise.
     #[arg(long, env = "MIOT_REASONING")]
     reasoning: Option<String>,
+    /// The model's context window in tokens, for a hosted model that can't
+    /// be asked (`--glm`, `--openrouter`) — what the loop's budget warnings
+    /// and force-compaction measure against. A llama-server's is read from
+    /// it; this overrides that too.
+    #[arg(long, env = "MIOT_CONTEXT_WINDOW")]
+    context_window: Option<u32>,
 }
 
 fn read_token(flag: &str, file: &str) -> String {
@@ -259,7 +265,10 @@ fn read_token(flag: &str, file: &str) -> String {
 }
 
 fn build_llm(a: &LlmArgs) -> Option<miot_llm::Llm> {
-    let llm = build_llm_for(a)?;
+    let mut llm = build_llm_for(a)?;
+    if let Some(n) = a.context_window {
+        llm = llm.with_context_window(n);
+    }
     Some(match &a.reasoning {
         Some(e) => llm.with_reasoning(e).unwrap_or_else(|e| die(format!("--reasoning: {e}"))),
         None => llm,

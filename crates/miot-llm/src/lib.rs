@@ -71,6 +71,11 @@ pub struct Turn {
     /// `prompt_tokens + tokens`, or the provider's own total if it reports
     /// one directly.
     pub total_tokens: u32,
+    /// How much of `prompt_tokens` the provider says it served from its
+    /// prompt cache (`usage.prompt_tokens_details.cached_tokens`) — 0 when
+    /// it doesn't say. A cat re-sends its whole conversation every turn, so
+    /// this is the part of each turn that wasn't new.
+    pub cached_tokens: u32,
     pub ms: u64,
     /// What the model thought before answering, when the provider sends it
     /// apart (`reasoning_content` — GLM, OpenRouter's reasoning models) or
@@ -88,7 +93,8 @@ pub struct Llm {
     // Only `Llm::local` can answer this (a raw `/v1/models` GET; no
     // provider-agnostic way to ask a hosted model its context length), and
     // only ever needs answering once — a chat/model pair's window doesn't
-    // change mid-session.
+    // change mid-session. A hosted model's comes from config instead
+    // ([`Llm::with_context_window`]).
     base_url: Option<String>,
     http: reqwest::Client,
     context_window: tokio::sync::OnceCell<Option<u32>>,
@@ -194,6 +200,16 @@ impl Llm {
         }
     }
 
+    /// The context window, as configured (`--context-window`) rather than
+    /// asked: a hosted provider has no endpoint that says it. Without one, a
+    /// GLM cat's loop had no budget to warn or force-compact against, and
+    /// meow's history grew to 235 KB — ~75k tokens re-sent every turn
+    /// (2026-09-25).
+    pub fn with_context_window(mut self, tokens: u32) -> Self {
+        self.context_window = tokio::sync::OnceCell::new_with(Some(Some(tokens)));
+        self
+    }
+
     /// Set the reasoning effort: `none`, `minimal`, `low`, `medium`, `high`,
     /// or `default` to send nothing and leave it to the provider.
     pub fn with_reasoning(mut self, effort: &str) -> Result<Self, String> {
@@ -236,10 +252,11 @@ impl Llm {
         }
     }
 
-    /// This model's context window, if it can be determined at all — only
-    /// `Llm::local` can (one cached `GET {base}/v1/models`, reading
-    /// `data[0].meta.n_ctx`); a hosted provider has no such endpoint here,
-    /// so this stays `None` rather than guessing a number that isn't
+    /// This model's context window, if it can be determined at all: the
+    /// configured one ([`Llm::with_context_window`]), else — only for
+    /// `Llm::local` — one cached `GET {base}/v1/models`, reading
+    /// `data[0].meta.n_ctx`. A hosted provider has no such endpoint here, so
+    /// unconfigured it stays `None` rather than guessing a number that isn't
     /// verified for the specific model in use.
     pub async fn context_window(&self) -> Option<u32> {
         *self
@@ -293,6 +310,7 @@ impl Llm {
         let tokens = res.usage.completion_tokens.unwrap_or(0).max(0) as u32;
         let prompt_tokens = res.usage.prompt_tokens.unwrap_or(0).max(0) as u32;
         let total_tokens = res.usage.total_tokens.map(|t| t.max(0) as u32).unwrap_or(prompt_tokens + tokens);
+        let cached_tokens = res.usage.prompt_tokens_details.as_ref().and_then(|d| d.cached_tokens).unwrap_or(0).max(0) as u32;
         let text = res.first_text().unwrap_or_default().to_string();
         let reasoning = res.reasoning_content.clone().map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
         let calls = res
@@ -300,7 +318,7 @@ impl Llm {
             .into_iter()
             .map(|c| Call { name: c.fn_name, args: c.fn_arguments })
             .collect();
-        Ok(Turn { text, calls, tokens, prompt_tokens, total_tokens, ms: started.elapsed().as_millis() as u64, reasoning })
+        Ok(Turn { text, calls, tokens, prompt_tokens, total_tokens, cached_tokens, ms: started.elapsed().as_millis() as u64, reasoning })
     }
 }
 
@@ -584,7 +602,7 @@ pub fn local_task_tool() -> Tool {
              chain, and nobody else sees or assigns it. NOT the litter's tasks (t1, t1.2: those \
              are TaskUpdate's). Use it to break a job into steps and keep track of where you are; \
              it survives a restart of your process but is emptied when the chain starts a new \
-             session. Every call answers with the current list.",
+             session. A change answers with what changed and the open ids; `list` shows everything.",
         )
         .with_schema(serde_json::json!({
             "type": "object",

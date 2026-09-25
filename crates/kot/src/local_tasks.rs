@@ -89,12 +89,17 @@ impl LocalTasks {
     }
 
     /// One `LocalTask` call. `Ok` and `Err` both carry the text the model
-    /// gets back — the whole list, after a line saying what happened.
+    /// gets back. A change answers with what changed and the open ids
+    /// ([`LocalTasks::brief`]); `list` and a mistake answer with the whole
+    /// list. It used to be the whole list every time, and every result
+    /// stays in the conversation: meow's history carried dozens of copies
+    /// of a 20-row list (2026-09-25). A wake's prompt already carries the
+    /// open ones ([`LocalTasks::reminder`]).
     pub fn apply(&mut self, action: &str, id: &str, text: &str) -> Result<String, String> {
         let id = id.trim().to_ascii_uppercase();
         let text = text.trim();
         let what = match action {
-            "list" => String::new(),
+            "list" => return Ok(self.render("")),
             "add" => {
                 if text.is_empty() {
                     return Err(self.render("add needs text: what to do."));
@@ -127,7 +132,13 @@ impl LocalTasks {
         };
         self.trim_closed();
         self.save();
-        Ok(self.render(&what))
+        Ok(format!("{what} {}", self.brief()))
+    }
+
+    /// `3 open: L2, L4, L5.` — after a change, enough to name the next one.
+    fn brief(&self) -> String {
+        let open: Vec<&str> = self.open().map(|t| t.id.as_str()).collect();
+        if open.is_empty() { "None open.".into() } else { format!("{} open: {}.", open.len(), open.join(", ")) }
     }
 
     fn trim_closed(&mut self) {
@@ -205,6 +216,8 @@ mod tests {
         let out = t.apply("start", "l1", "").unwrap();
         assert!(out.starts_with("L1 is doing."), "{out}");
         let out = t.apply("done", "L1", "used defconfig").unwrap();
+        assert_eq!(out, "L1 is done. 1 open: L2.", "a change answers with the change, not the list");
+        let out = t.apply("list", "", "").unwrap();
         assert!(out.contains("L1 [done] configure the kernel — used defconfig"), "{out}");
         assert!(out.contains("Open:\nL2 [todo] build it"), "{out}");
         assert_eq!(t.reminder().unwrap(), "(Your open local tasks — LocalTask to update them:\nL2 [todo] build it)");
