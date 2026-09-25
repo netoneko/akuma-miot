@@ -970,29 +970,110 @@ impl Host for CatHost {
     }
 }
 
-pub async fn run(cfg: AgentConfig) {
-    let account = cfg.identity.account();
+/// A cat's connection to its own node, before any loop runs on it.
+fn new_cat(name: &str, identity: Identity, node: String, roster: Roster) -> Arc<Cat> {
     // mTLS pinned to the roster's accounts (`crate::tls`) — same trust
     // boundary as `client.rs`'s `Client`, since a cat's node connection is
     // just another caller of a node, not a special case.
-    let trusted = cfg.roster.0.iter().map(|(_, a)| a.clone()).collect();
-    let cat = Arc::new(Cat {
-        name: cfg.name.clone(),
-        identity: cfg.identity,
-        account: account.clone(),
-        node: cfg.node,
+    let trusted = roster.0.iter().map(|(_, a)| a.clone()).collect();
+    Arc::new(Cat {
+        name: name.to_string(),
+        identity,
+        account: identity.account(),
+        node,
         http: reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(900))
-            .use_preconfigured_tls(crate::tls::client_config(&cfg.identity, trusted))
+            .use_preconfigured_tls(crate::tls::client_config(&identity, trusted))
             .build()
             .unwrap(),
-        roster: cfg.roster,
+        roster,
         meta: tokio::sync::OnceCell::new(),
         nonce: tokio::sync::Mutex::new(None),
         stats: tokio::sync::Mutex::new(CatStats::default()),
         activity: tokio::sync::watch::channel(None).0,
         local: std::sync::Mutex::new(LocalTasks::default()),
-    });
+    })
+}
+
+/// The reply an asleep cat sends — see [`run_asleep`].
+pub fn asleep_reply(name: &str) -> String {
+    format!("*{name} is currently asleep*")
+}
+
+/// Whether an asleep cat named `name` (account `me`, hex) owes `e` a reply,
+/// and to whom (hex): a DM to it, or a broadcast that tags `@name`, from
+/// someone else. Never a `no_ack` message — that's someone's own auto-reply,
+/// and answering one is how two sleeping cats would talk to each other
+/// forever.
+pub fn asleep_owes_reply(name: &str, me: &str, effect: &serde_json::Value, wakes: Option<&str>) -> Option<String> {
+    let t = effect["t"].as_str()?;
+    if t != "said" && t != "message" {
+        return None;
+    }
+    let from = effect["from"].as_str()?;
+    if from == me || effect["no_ack"].as_bool().unwrap_or(false) {
+        return None;
+    }
+    let dm = wakes == Some(me);
+    let tag = format!("@{}", name.to_ascii_lowercase());
+    let body = effect["body"].as_str().unwrap_or("").to_ascii_lowercase();
+    let tagged = effect["to"].is_null()
+        && (body.split(|c: char| !(c.is_alphanumeric() || c == '@' || c == '-' || c == '_')).any(|w| w == tag)
+            || effect["tags"].as_array().is_some_and(|ts| {
+                ts.iter().filter_map(|x| x.as_str()).any(|x| x.trim_start_matches('@').eq_ignore_ascii_case(name))
+            }));
+    (dm || tagged).then(|| from.to_string())
+}
+
+/// `kot run --asleep`: this cat's node runs as usual, but no model is called.
+/// Every DM or `@name` tag gets [`asleep_reply`] back, and nothing else
+/// happens — no tasks taken, no turns, no tokens. For a cat whose model is
+/// switched off (yuki and shiro, 2026-09-25: their OpenRouter key ran dry)
+/// without leaving the litter wondering why it says nothing.
+pub async fn run_asleep(name: String, identity: Identity, node: String, roster: Roster) {
+    let cat = new_cat(&name, identity, node, roster);
+    let me = miot_keys::to_hex(&cat.account);
+    println!("{}", ui::note(&format!("{name} id={} node={} asleep: no model; DMs and @{name} get \"{}\"", miot_keys::short(&cat.account), cat.node, asleep_reply(&name))));
+    let mut cursor = loop {
+        match cat.head().await {
+            Some(h) => break h["seq"].as_u64().unwrap_or(0),
+            None => tokio::time::sleep(std::time::Duration::from_secs(2)).await,
+        }
+    };
+    loop {
+        tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        let events = cat.events(cursor).await;
+        // `seq` restarts when the node rebuilds its log (CLAUDE.md, "Known
+        // gaps"): start again from its head rather than wait past it.
+        if events.is_empty() {
+            if let Some(seq) = cat.head().await.and_then(|h| h["seq"].as_u64()) {
+                if seq < cursor {
+                    cursor = seq;
+                }
+            }
+            continue;
+        }
+        for e in events {
+            cursor = cursor.max(e.seq);
+            let Some(to) = asleep_owes_reply(&name, &me, &e.effect, e.wakes.as_deref()) else { continue };
+            let Ok(to_acct) = miot_keys::from_hex(&to) else { continue };
+            let call = RuntimeCall::Litter(pallet_litter::Call::say {
+                to: Some(to_acct),
+                body: asleep_reply(&name),
+                no_ack: true,
+                off_record: false,
+            });
+            match cat.submit(call).await {
+                Ok(()) => println!("{}", ui::note(&format!("{name}: asleep, told {}", cat.roster.name_of(&miot_keys::from_hex(&to).unwrap())))),
+                Err(err) => println!("{}", ui::note(&format!("{name}: asleep reply failed: {err}"))),
+            }
+        }
+    }
+}
+
+pub async fn run(cfg: AgentConfig) {
+    let account = cfg.identity.account();
+    let cat = new_cat(&cfg.name, cfg.identity, cfg.node, cfg.roster);
     let name = cat.name.clone();
     let reasoning = cfg.llm.reasoning().map(|e| format!(" reasoning={e}")).unwrap_or_default();
     println!("{}", ui::note(&format!("{name} id={} node={} llm={}{reasoning}", miot_keys::short(&account), cat.node, cfg.llm.label())));

@@ -186,6 +186,11 @@ struct RunArgs {
     /// set it on just the nodes a patron talks to.
     #[arg(long, env = "MIOT_PATRONS", default_value = "")]
     patrons: String,
+    /// No agent loop: this cat's node runs, but no model is called, and every
+    /// DM or @name tag is answered "*<name> is currently asleep*". Overrides
+    /// --llm/--glm/--openrouter.
+    #[arg(long, env = "MIOT_ASLEEP")]
+    asleep: bool,
     /// Run as a patron: pull the chain, never campaign or vote, never
     /// produce. For a node whose key isn't in the roster; the members it
     /// polls must list it in their --patrons.
@@ -336,6 +341,13 @@ async fn run(cli: &Cli, a: &RunArgs) {
     };
     let running = node::start(cfg).await.unwrap_or_else(|e| die(e));
 
+    let node_url = format!("https://127.0.0.1:{}", running.addr.port());
+    if a.asleep {
+        let roster = Roster::parse(&cli.roster).unwrap_or_else(|e| die(e));
+        tokio::spawn(agent::run_asleep(name.clone(), identity, node_url, roster));
+        running.wait().await;
+        return;
+    }
     let llm = build_llm(&a.llm);
     match llm {
         None => println!("[{name}] no --llm/--glm/--openrouter: node only, no agent loop"),
