@@ -1,11 +1,18 @@
 [Unit]
-Description=llama-server for kot {agent} (port {port}, {threads} threads)
+Description=llama-server for kot {agent} (port {port}, {threads} threads, {slots} slot(s) x {ctx_per_slot})
 After=network-online.target
 
 [Service]
-ExecStart=/root/llama.cpp/build/bin/llama-server -m {gguf} --host {bind} --port {port} -c 8192 --jinja --parallel 1 -t {threads}
+# -c is split across slots: {ctx} / {slots} = {ctx_per_slot} per cat.
+ExecStart=/root/llama.cpp/build/bin/llama-server -m {gguf} --host {bind} --port {port} -c {ctx} --parallel {slots} --jinja -t {threads}
 Restart=always
 RestartSec=3
+# Over this, the kernel kills this server (systemd restarts it) instead of
+# the whole box grinding through swap. No swap at all: on ryzen it's zram,
+# which is RAM too.
+MemoryMax={memory_max}
+MemorySwapMax=0
+OOMScoreAdjust=500
 
 [Install]
 WantedBy=multi-user.target

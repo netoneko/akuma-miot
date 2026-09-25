@@ -237,14 +237,60 @@ const ALPN_PROTOCOLS: [&[u8]; 2] = [b"h2", b"http/1.1"];
 /// axum's `Listener::accept` has no error path, the same rule the plain
 /// `TcpListener` impl it's modeled on already follows for a failed
 /// `accept()`.
+///
+/// **Handshakes run on their own, each under [`HANDSHAKE_TIMEOUT`].** They
+/// used to run inline in `accept`, one at a time, with no timeout: a single
+/// client that opened a connection and never sent a ClientHello blocked
+/// every connection after it, for good. Found live 2026-09-25 on the AWS
+/// pair, which face the internet through nginx's stream proxy: the accept
+/// backlog sat full (`Recv-Q 129`), the node stopped answering anyone —
+/// mesh, operator — while its own outbound polling and agent loop carried
+/// on as if nothing was wrong. Now a background task accepts, spawns each
+/// handshake, and hands finished ones to `accept`; a silent client costs
+/// one task for ten seconds.
 pub struct TlsListener {
-    tcp: tokio::net::TcpListener,
-    acceptor: tokio_rustls::TlsAcceptor,
+    ready: tokio::sync::mpsc::Receiver<(tokio_rustls::server::TlsStream<tokio::net::TcpStream>, std::net::SocketAddr)>,
+    local: Option<std::net::SocketAddr>,
 }
 
+/// How long a connection gets to complete the mTLS handshake.
+pub const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl TlsListener {
+    /// Starts accepting at once (a background task). It stops, and the port
+    /// is freed, when this listener is dropped — so aborting a node's
+    /// server (the election tests do) still releases its port.
     pub fn new(tcp: tokio::net::TcpListener, config: rustls::ServerConfig) -> Self {
-        TlsListener { tcp, acceptor: tokio_rustls::TlsAcceptor::from(Arc::new(config)) }
+        let local = tcp.local_addr().ok();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(config));
+        let (tx, ready) = tokio::sync::mpsc::channel(64);
+        tokio::spawn(async move {
+            loop {
+                let (tcp_stream, addr) = tokio::select! {
+                    got = tcp.accept() => match got {
+                        Ok(pair) => pair,
+                        Err(e) => {
+                            eprintln!("[tls] accept error: {e}");
+                            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                            continue;
+                        }
+                    },
+                    // The listener was dropped: stop, and let the port go.
+                    _ = tx.closed() => return,
+                };
+                let (acceptor, tx) = (acceptor.clone(), tx.clone());
+                tokio::spawn(async move {
+                    match tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(tcp_stream)).await {
+                        Ok(Ok(tls_stream)) => {
+                            let _ = tx.send((tls_stream, addr)).await;
+                        }
+                        Ok(Err(e)) => eprintln!("[tls] handshake with {addr} failed: {e}"),
+                        Err(_) => eprintln!("[tls] handshake with {addr} timed out after {}s", HANDSHAKE_TIMEOUT.as_secs()),
+                    }
+                });
+            }
+        });
+        TlsListener { ready, local }
     }
 }
 
@@ -253,27 +299,16 @@ impl axum::serve::Listener for TlsListener {
     type Addr = std::net::SocketAddr;
 
     async fn accept(&mut self) -> (Self::Io, Self::Addr) {
-        loop {
-            let (tcp_stream, addr) = match self.tcp.accept().await {
-                Ok(pair) => pair,
-                Err(e) => {
-                    eprintln!("[tls] accept error: {e}");
-                    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                    continue;
-                }
-            };
-            match self.acceptor.accept(tcp_stream).await {
-                Ok(tls_stream) => return (tls_stream, addr),
-                Err(e) => {
-                    eprintln!("[tls] handshake with {addr} failed: {e}");
-                    continue;
-                }
-            }
+        match self.ready.recv().await {
+            Some(pair) => pair,
+            // The accept task only ends once this listener is gone, so this
+            // can't happen while it's alive; never return a fake connection.
+            None => std::future::pending().await,
         }
     }
 
     fn local_addr(&self) -> std::io::Result<Self::Addr> {
-        self.tcp.local_addr()
+        self.local.ok_or_else(|| std::io::Error::other("listener had no local address"))
     }
 }
 
@@ -342,6 +377,53 @@ mod tests {
         assert!(handshake_with(&node, vec![root.account()], client_config_any_node(&root)).await.is_ok());
         // The node still refuses a client that isn't a member.
         assert!(handshake_with(&node, vec![root.account()], client_config_any_node(&stranger)).await.is_err());
+    }
+
+    /// The AWS outage, reproduced: clients that connect and never speak must
+    /// not stop a real client from being served — well past the 128 a
+    /// listen backlog holds, which is what filled up live.
+    #[tokio::test]
+    async fn silent_connections_do_not_block_a_real_client() {
+        let node = Identity::from_seed(&[1; 32]);
+        let peer = Identity::from_seed(&[2; 32]);
+        let trusted = vec![node.account(), peer.account()];
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let mut listener = TlsListener::new(tcp, server_config(&node, trusted.clone()));
+        let addr = axum::serve::Listener::local_addr(&listener).unwrap();
+
+        // 200 connections that never send a byte, held open.
+        let mut silent = Vec::new();
+        for _ in 0..200 {
+            silent.push(TcpStream::connect(addr).await.unwrap());
+        }
+
+        let client = tokio::spawn(async move {
+            let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config(&peer, trusted)));
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            connector.connect(ServerName::IpAddress(addr.ip().into()), tcp).await.map(|_| ()).map_err(|e| e.to_string())
+        });
+        let served = tokio::time::timeout(std::time::Duration::from_secs(5), axum::serve::Listener::accept(&mut listener)).await;
+        assert!(served.is_ok(), "the real client was never handed over while silent ones were connected");
+        assert!(client.await.unwrap().is_ok());
+        drop(silent);
+    }
+
+    /// Dropping the listener stops its accept task and frees the port —
+    /// what lets an aborted node come back on the same one.
+    #[tokio::test]
+    async fn dropping_the_listener_frees_the_port() {
+        let node = Identity::from_seed(&[1; 32]);
+        let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = tcp.local_addr().unwrap();
+        drop(TlsListener::new(tcp, server_config(&node, vec![node.account()])));
+        let t0 = std::time::Instant::now();
+        loop {
+            if TcpListener::bind(addr).await.is_ok() {
+                break;
+            }
+            assert!(t0.elapsed() < std::time::Duration::from_secs(3), "port {addr} still held after the listener was dropped");
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     #[tokio::test]

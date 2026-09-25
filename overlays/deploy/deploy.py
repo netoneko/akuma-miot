@@ -129,12 +129,25 @@ EXTERNAL: dict[str, tuple[str, str]] = {
 # alone, the home agents joining it later (docs/runbooks/deploy-aws-node.md).
 LEADER = "yuki"
 
-# agent -> (gguf path on its host, port, threads, bind address)
-LLAMAS: dict[str, tuple[str, int, int, str]] = {
-    "ryzen-linux-amd64": ("/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 8081, 6, "127.0.0.1"),
-    # ryzen-akuma-amd64's own, on ryzen's tap0 address (192.168.1.49) so the guest reaches it.
-    "ryzen-akuma-amd64": ("/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 8082, 4, "192.168.1.49"),
+# agent -> (gguf path on its host, port, threads, bind address, slots)
+#
+# ryzen's two cats share ONE server since 2026-09-25: a server each (~5 GB
+# apiece at -c 8192) ran the 13.7 GB box out of memory — both ended up in
+# zram, which is RAM too, and it wedged for 20 minutes. Two slots, -c split
+# across them, so each cat keeps 8192. Capped (`MemoryMax`, no swap) so a
+# runaway server is killed and restarted instead of taking the box down.
+LLAMAS: dict[str, tuple[str, int, int, str, int]] = {
+    "ryzen-linux-amd64": ("/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 8081, 8, "127.0.0.1", 2),
 }
+# agent -> (the agent whose server it shares, the address:port the agent
+# dials). sora's config still says 192.168.1.49:8082 (ryzen's tap0), so a
+# socket there forwards to the shared server — no redeploy into the guest.
+# `FreeBind` lets it bind before tap0 exists.
+LLAMA_PROXIES: dict[str, tuple[str, str]] = {
+    "ryzen-akuma-amd64": ("ryzen-linux-amd64", "192.168.1.49:8082"),
+}
+LLAMA_MEMORY_MAX = "7G"
+LLAMA_CTX_PER_SLOT = 8192
 
 
 def agent(name: str) -> Agent:
@@ -518,26 +531,43 @@ def cmd_up(name: str) -> None:
 # ---- models -----------------------------------------------------------------
 def cmd_llama(name: str) -> None:
     a = agent(name)
-    # A Firecracker guest's model runs on the guest's Linux host.
-    host_agent = agent("ryzen-linux-amd64") if a.name == "ryzen-akuma-amd64" else a
+    if a.name in LLAMA_PROXIES:
+        return _llama_proxy(a)
     row = LLAMAS.get(a.name)
     if row is None:
         die(f"{a.name} has no llama-server row")
-    gguf, port, threads, bind = row
+    gguf, port, threads, bind, slots = row
 
-    have = on(host_agent, "test -x /root/llama.cpp/build/bin/llama-server && echo yes || echo no")
+    have = on(a, "test -x /root/llama.cpp/build/bin/llama-server && echo yes || echo no")
     if not DRY_RUN and have.strip() != "yes":
         die(f"{a.name}: build llama.cpp first (/root/llama.cpp/build/bin/llama-server)")
 
-    unit = template("llama.service.tmpl", agent=a.name, gguf=gguf, port=port, threads=threads, bind=bind)
-    put(host_agent, _write_tmp(unit), f"/etc/systemd/system/llama-{a.name}.service")
+    unit = template(
+        "llama.service.tmpl", agent=a.name, gguf=gguf, port=port, threads=threads, bind=bind,
+        slots=slots, ctx=LLAMA_CTX_PER_SLOT * slots, ctx_per_slot=LLAMA_CTX_PER_SLOT, memory_max=LLAMA_MEMORY_MAX,
+    )
+    put(a, _write_tmp(unit), f"/etc/systemd/system/llama-{a.name}.service")
 
     # ollama nowhere: it loads whatever it's asked for with its own thread
     # policy, which is exactly the unreserved sharing this setup avoids.
-    on(host_agent, "systemctl disable --now ollama.service 2>/dev/null; systemctl daemon-reload && "
-                   f"systemctl enable llama-{a.name}.service 2>/dev/null; systemctl restart llama-{a.name}.service")
+    on(a, "systemctl disable --now ollama.service 2>/dev/null; systemctl daemon-reload && "
+          f"systemctl enable llama-{a.name}.service 2>/dev/null; systemctl restart llama-{a.name}.service")
     _cleanup_tmp()
-    say(f"{a.name}: llama-server on {bind}:{port} ({threads} threads)")
+    say(f"{a.name}: llama-server on {bind}:{port} ({threads} threads, {slots} slot(s) x {LLAMA_CTX_PER_SLOT})")
+
+
+def _llama_proxy(a: Agent) -> None:
+    """A socket on the address `a` dials, forwarding to the server it shares."""
+    owner_name, listen = LLAMA_PROXIES[a.name]
+    owner = agent(owner_name)
+    _, port, _, bind, _ = LLAMAS[owner_name]
+    unit = f"llama-{a.name}-proxy"
+    put(owner, _write_tmp(template("llama-proxy.socket.tmpl", agent=a.name, listen=listen)), f"/etc/systemd/system/{unit}.socket")
+    put(owner, _write_tmp(template("llama-proxy.service.tmpl", agent=a.name, owner=owner_name, target=f"{bind}:{port}")),
+        f"/etc/systemd/system/{unit}.service")
+    on(owner, f"systemctl daemon-reload && systemctl enable --now {unit}.socket")
+    _cleanup_tmp()
+    say(f"{a.name}: {listen} -> {owner_name}'s llama-server at {bind}:{port}")
 
 
 # ---- the old fleet -----------------------------------------------------------

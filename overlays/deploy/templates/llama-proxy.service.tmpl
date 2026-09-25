@@ -1,0 +1,7 @@
+[Unit]
+Description=forward {agent}'s llama-server address to {owner}'s shared server at {target}
+Requires=llama-{owner}.service llama-{agent}-proxy.socket
+After=llama-{owner}.service
+
+[Service]
+ExecStart=/lib/systemd/systemd-socket-proxyd {target}

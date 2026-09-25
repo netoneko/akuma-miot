@@ -1,0 +1,11 @@
+[Unit]
+Description={agent} reaches its shared llama-server at {listen}
+
+[Socket]
+ListenStream={listen}
+# The address may belong to an interface that isn't up yet (a Firecracker
+# guest's tap); bind anyway.
+FreeBind=yes
+
+[Install]
+WantedBy=sockets.target
