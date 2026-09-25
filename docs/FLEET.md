@@ -1,9 +1,51 @@
 # Fleet — hosts and model split
 
-**2026-09-21.** Three boxes, `llama-server` (not Ollama — native GGUF, OpenAI-
-compatible endpoint, `--jinja` for tool-call parsing), one model per cat.
+## As running, 2026-09-25
 
-## Hosts
+`overlays/deploy/deploy.py`'s `AGENTS` table is the source. tama and kuro
+were checked live when this was written (their `kot.env` and the startup
+line's `llm=`); mimi's row is the llama-server actually running on :8084;
+meow, sora and the AWS pair are from `deploy.py`/HANDOFF, not re-checked.
+
+| cat | agent | host | model | served by |
+|---|---|---|---|---|
+| meow | `dumpster-akuma-amd64` | akuma (metal) | `glm-5.3` | z.ai coding plan (`--glm`) |
+| tama | `ryzen-linux-amd64` | ryzen | `glm-5.3` | z.ai coding plan (`--glm`) — was Qwen3-4B on ryzen's llama-server until 2026-09-25 |
+| kuro | `mac-linux-aarch64` | Lima `fc` on the mac | `gemma4-yolo-4b` | **Ollama** on the mac, `192.168.5.2:11434` — was `qwen3:4b` on llama-server :8083 until 2026-09-25 |
+| sora | `ryzen-akuma-amd64` | Firecracker guest on ryzen | Qwen3-4B-Instruct-2507 Q4_K_M | ryzen's shared llama-server (:8081, via the `192.168.1.49:8082` proxy socket) |
+| mimi | `mac-akuma-aarch64` | akuma-guest nested in `fc` | `qwen3:4b` (the Ollama blob `sha256-3e4cb…`, 2.5 GB) | llama-server on the mac, :8084 |
+| yuki, shiro | AWS | `kot.akuma.sh` | OpenRouter | out of credit as of 2026-09-25 (HANDOFF, "Outages") |
+
+What changed on 2026-09-25 and why:
+
+- **tama moved to GLM** so a cat with a real toolchain next to it can try
+  building and changing `kot` itself. ryzen now has rustup (stable, root) and
+  a checkout at `/root/src/akuma-miot`; the build runs as a transient
+  systemd unit (`kot-build`, `MemoryMax=6G`, no swap, `jobs = 4` in
+  `/root/.cargo/config.toml`) so a codegen spike kills the build, not the
+  laptop — the box already ran out of memory once that day. A native glibc
+  build, not `build.sh`'s static musl one. Disk is the constraint: 14 GB free
+  before the first build. ryzen's llama-server stays up for sora alone.
+- **kuro moved to `gemma4-yolo-4b`, on Ollama** — Kirill's call, to see how
+  it does at reviews. This is the one exception to "never ollama in the
+  fleet": Ollama's Gemma 4 blob doesn't load in llama-server
+  (`done_getting_tensors: wrong number of tensors; expected 2131, got 720`
+  — Ollama's own tensor layout), and it's the largest Gemma 4 on the mac's
+  disk. `gemma4-yolo-4b` is `gemma4:e4b` plus `num_ctx 131072` and
+  temperature 1 / top-k 64 / top-p 0.95; 14 GB resident. Ollama is started
+  by `../yolo/run-ollama.sh` (`OLLAMA_KEEP_ALIVE=-1`, flash attention, q8
+  KV cache) — a bare `ollama serve` unloads the model after 5 minutes idle
+  and every wake pays the reload. Nothing restarts it after a mac reboot.
+  The 26B-A4B `../yolo/Modelfile` names isn't pulled; the mac had 10 GB free.
+  kuro's old llama-server on :8083 was stopped.
+
+## The plan of 2026-09-21 (history)
+
+Kept for the reasoning; the table above is what runs. Three boxes,
+`llama-server` (not Ollama — native GGUF, OpenAI-compatible endpoint,
+`--jinja` for tool-call parsing), one model per cat.
+
+### Hosts
 
 | host | RAM | free disk (2026-09-21) | GPU | role |
 |---|---|---|---|---|
@@ -11,7 +53,7 @@ compatible endpoint, `--jinja` for tool-call parsing), one model per cat.
 | **ryzen** | 13 GB | 24 GB | Radeon 780M iGPU, shares system RAM (no dedicated VRAM carve-out seen) | two workers on **one shared llama-server** (2 slots × 8192, `MemoryMax=7G`) since 2026-09-25 — two servers ran it out of memory; swap is zram, i.e. RAM. + a GLM experiment |
 | **akuma** (trashcan) | 16 GB physical, **~10 GB planned budget** — reserved for the Rust toolchain (`rustc`'s LLVM codegen spikes hard, multiplied by `cargo`'s parallelism, during kernel builds) | — | — | **not local inference.** Calls z.ai's GLM API for feature-writing / kernel-compile work. |
 
-## Cats → host → model
+### Cats → host → model
 
 Mimi is the leader (`TaskPlan`/`TaskReassign`); Kuro, Sora, Tama are workers
 (`TaskUpdate` only). Sized asymmetrically — the leader gets the bigger model
@@ -35,7 +77,7 @@ GGUF sources (verified against the HF API before download, not guessed):
   downloaded to ryzen as an experiment per Kirill: "who knows how it's gonna
   perform." Not assigned to a cat. Note below on whether it coexists in RAM.
 
-## Status, 2026-09-21
+### Status, 2026-09-21
 
 - **Downloading now, ryzen only**: `~/models/gguf/` — the Qwen3-4B Q4_K_M
   (Kuro/Sora) and the GLM-4-9B-chat Q4_K_M experiment.

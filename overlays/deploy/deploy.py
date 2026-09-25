@@ -103,8 +103,8 @@ class Agent:
 
 AGENTS: list[Agent] = [
     Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", "glm-5.3"),
-    Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "http://127.0.0.1:8081", "qwen3-4b"),
-    Agent("mac-linux-aarch64", "lima", "fc", "aarch64", "kuro", "http://192.168.5.2:8083", "qwen3:4b"),
+    Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "glm", "glm-5.3"),
+    Agent("mac-linux-aarch64", "lima", "fc", "aarch64", "kuro", "http://192.168.5.2:11434", "gemma4-yolo-4b"),
     Agent("ryzen-akuma-amd64", "fcguest", "ryzen", "x86_64", "sora", "http://192.168.1.49:8082", "qwen3-4b"),
     Agent("mac-akuma-aarch64", "fcguest", "fc", "aarch64", "mimi", "http://192.168.5.2:8084", "qwen3:4b"),
 ]

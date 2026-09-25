@@ -40,7 +40,9 @@ read that first, it is kept current and this file does not repeat it.
   (`sp_runtime::AccountId32`); `account_from_ssh` reads an
   `authorized_keys` line so root is just a public key.
 - `crates/miot-llm` — provider layer on `genai`; `Llm::local` (any
-  OpenAI-compatible server — llama-server, never ollama in the fleet) and
+  OpenAI-compatible server — llama-server, never ollama in the fleet, with one
+  deliberate exception: kuro on Ollama's `gemma4-yolo-4b` since 2026-09-25,
+  `docs/FLEET.md`) and
   `Llm::glm` (z.ai **coding plan** endpoint, token from a file).
 - `crates/kot` — **the one binary**, ships as `dist/<arch>/kot`. Polish for
   "cat". `kot run --as <name>` is a mesh node (`node.rs`) plus, given
@@ -63,7 +65,8 @@ read that first, it is kept current and this file does not repeat it.
   "Watching the litter".
 - `overlays/deploy/hosts/ryzen/` — sora's host side as systemd units
   (`sora-net.service`, `sora.service`), 2026-09-25. ryzen's llama-server
-  (one, shared by tama and sora) comes from `deploy.py llama`.
+  (one; since 2026-09-25 only sora uses it — tama is on GLM) comes from
+  `deploy.py llama`.
 - `miot-cli` never shipped under that name — `docs/CLI.md` is its design of
   record, and `kot`'s client verbs are the implementation.
 

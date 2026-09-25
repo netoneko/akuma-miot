@@ -560,6 +560,29 @@ doesn't cover however kot died this time. Why it died left no trace: the
 generated `start.sh` didn't send stderr to herd's log, so a panic or a failed
 allocation had nowhere to go. It does now (`exec … 2>&1`, template and meow).
 
+## Model swaps: tama on GLM, kuro on Gemma (2026-09-25)
+
+Two cats changed model the same evening; `docs/FLEET.md` "As running" has the
+full table (and mimi, still `qwen3:4b` on llama-server :8084).
+
+- **tama → `glm-5.3`** (z.ai, same as meow), so a cat can try building and
+  extending `kot` on its own host. ryzen got rustup (root, stable 1.98.1) and
+  a plain `git clone` at `/root/src/akuma-miot`. The first build was launched
+  by hand, not by tama: `systemd-run --unit kot-build -p MemoryMax=6G -p
+  MemorySwapMax=0 -p Nice=10`, `jobs = 4`, log in `/root/src/build.log`.
+  Capped because ryzen OOMed earlier the same day (above). A native glibc
+  build, not the shipped static musl one. The shared llama-server now serves
+  only sora.
+- **kuro → `gemma4-yolo-4b` on Ollama**, `MIOT_LLM=http://192.168.5.2:11434`
+  (`Llm::local` appends `/v1/`; Ollama's OpenAI-compatible endpoint answered
+  a Bash tool call correctly from inside `fc` before the switch). The first
+  Ollama cat in the fleet, on purpose: llama-server refuses Ollama's Gemma 4
+  blob (`wrong number of tensors; expected 2131, got 720`). Ollama must be
+  started by `../yolo/run-ollama.sh` — the bare `ollama serve` that was
+  running had no `OLLAMA_KEEP_ALIVE`, so the 14 GB model would unload after
+  5 idle minutes and reload on the next wake. Nothing brings it back after a
+  mac reboot.
+
 ## Compaction: what a window would cost (measured 2026-09-25)
 
 A node keeps the current state and the last 4,096 events in memory
