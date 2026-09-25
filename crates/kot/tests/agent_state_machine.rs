@@ -128,6 +128,8 @@ struct Seen {
     reminder: Option<String>,
     /// `Host::stall_after` — the default (minutes) unless a test is about it.
     stall: Option<Duration>,
+    /// `Host::local_nag_after` — the default (minutes) unless a test is about it.
+    local_nag: Option<Duration>,
 }
 
 struct TestHost(Arc<Mutex<Seen>>);
@@ -203,6 +205,9 @@ impl Host for TestHost {
     }
     fn stall_after(&self) -> Duration {
         self.0.lock().unwrap().stall.unwrap_or(agent_state_machine::STALL_AFTER)
+    }
+    fn local_nag_after(&self) -> Duration {
+        self.0.lock().unwrap().local_nag.unwrap_or(agent_state_machine::LOCAL_TASK_NAG_AFTER)
     }
 }
 
@@ -617,6 +622,44 @@ async fn an_empty_check_in_leaves_no_trace() {
     let (fake, _) = r.finish().await;
     assert_eq!(fake.requests().len(), 4);
     assert!(!fake.all(3).contains("(Check-in:"), "{}", fake.all(3));
+}
+
+/// The other half of meow's case: the check-in itself gets nothing back
+/// (`an_empty_check_in_leaves_no_trace`), but this time there's an open
+/// `LocalTask` — so, like a chain task's `nudge`, the cat gets woken again
+/// on its own, without an operator's line, instead of sitting idle forever.
+#[tokio::test]
+async fn an_ignored_check_in_with_open_local_tasks_gets_nudged() {
+    let r = rig_seen(
+        vec![calls(vec![("Bash", json!({"command": "echo x"}))]), say("done"), text(""), say("continuing")],
+        Seen { check: true, local_nag: Some(Duration::from_millis(80)), reminder: Some("(Your open local tasks — LocalTask to update them:\nL2 [doing] read the runbook)".into()), ..Seen::default() },
+    )
+    .await;
+    r.wake("build the kernel");
+    r.until("check-in answered with nothing", |_, s| s.shown.iter().any(|l| l.contains("check-in: nothing more to do"))).await;
+    r.until("nudged back to life", |_, s| s.sent.len() == 2).await;
+    let (fake, seen) = r.finish().await;
+    assert_eq!(fake.requests().len(), 4, "wake, result, check-in, nudge — no fifth turn piles on");
+    let fed = fake.fed(3);
+    assert!(fed.contains("open local tasks") && fed.contains("L2") && fed.contains("read the runbook"), "the nudge carries the open list: {fed}");
+    assert!(!fed.contains(CHECK_IN), "a real wake, not another check-in: {fed}");
+    assert_eq!(seen.lock().unwrap().sent, vec!["done", "continuing"]);
+}
+
+/// A cat with nothing open on its local list is left alone — the nudge only
+/// fires when there's actually something to remind it about.
+#[tokio::test]
+async fn no_open_local_tasks_means_no_nudge() {
+    let r = rig_seen(
+        vec![calls(vec![("Bash", json!({"command": "echo x"}))]), say("done"), text("")],
+        Seen { check: true, local_nag: Some(Duration::from_millis(80)), reminder: None, ..Seen::default() },
+    )
+    .await;
+    r.wake("build the kernel");
+    r.until("check-in answered with nothing", |_, s| s.shown.iter().any(|l| l.contains("check-in: nothing more to do"))).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(fake.requests().len(), 3, "no fourth, nudged turn — nothing to nudge about");
 }
 
 /// Plain chatter — a wake answered with a message, no tools involved —

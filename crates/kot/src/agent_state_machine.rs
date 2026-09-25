@@ -40,6 +40,13 @@
 //!   history. Found live 2026-09-24: meow, asked to build the kernel,
 //!   messaged root "next I'm checking whether a plain `cargo build`
 //!   works", called no tool, and was never woken again.
+//! - **Local-task nudge.** An ignored check-in still leaves the loop with no
+//!   further wake queued — found live again 2026-09-25, same meow, a later
+//!   kernel-build task this time. If [`Host::reminder`] says there's an open
+//!   `LocalTask`, idling past [`Host::local_nag_after`] queues a real wake
+//!   ([`AgentStateMachine::maybe_nag`]) — the same shape as a chain task's
+//!   `nudge`, bounded by [`MAX_LOCAL_TASK_NUDGES`] and reset once a turn
+//!   starts a query again.
 //! - **Long results.** A result is fed as its head and tail (build errors
 //!   are at the end, a README's point at its start); `Inspect` with an
 //!   `offset` pages through the middle. `Bash` takes a `timeout` up to
@@ -92,6 +99,20 @@ const LIVE_BYTES: usize = 512 * 1024;
 const LIVE_HEAD: usize = 64 * 1024;
 /// A running call quiet this long gets the model a notice (`Host::stall_after`).
 pub const STALL_AFTER: Duration = Duration::from_secs(120);
+/// Idle this long with open local tasks gets the model a nudge — the same
+/// idea as a chain task's `work_nag` (`Timers::work_nag`, 150 s default):
+/// "you claimed this, do it now." Added 2026-09-25 after meow answered a
+/// check-in with nothing, went idle with an open `LocalTask`, and was never
+/// woken again (`docs/AGENT_STATE_MACHINE.md`, "A model that ignores the
+/// check-in" — the one case the check-in itself doesn't cover, since a
+/// check-in that gets nothing back leaves no trace and arms no other wake).
+pub const LOCAL_TASK_NAG_AFTER: Duration = Duration::from_secs(150);
+/// Consecutive unanswered local-task nudges before we stop — same bound and
+/// reason as a chain task's `max_nudges` (default 3): nagging a model that
+/// will never answer burns turns forever otherwise. Resets the moment the
+/// model starts a query again (mirrors `max_nudges`: "resets whenever the
+/// holder acts").
+pub const MAX_LOCAL_TASK_NUDGES: u32 = 3;
 /// How much of a running call's output `Running <id>` shows — its tail.
 const RUNNING_TAIL: usize = 2400;
 /// `Bash` without a `timeout`, and the most one may ask for, in seconds.
@@ -159,6 +180,11 @@ pub trait Host: Send + Sync + 'static {
     /// A call quiet this long gets the model a notice. A test shortens it.
     fn stall_after(&self) -> Duration {
         STALL_AFTER
+    }
+    /// Idle this long with open local tasks gets the model a nudge. A test
+    /// shortens it.
+    fn local_nag_after(&self) -> Duration {
+        LOCAL_TASK_NAG_AFTER
     }
     /// The live record changed — a cat sends it to its node. Called often
     /// (every step); coalescing is the host's business.
@@ -364,6 +390,13 @@ struct AgentStateMachine<H: Host> {
     /// The next flight id.
     flights: u64,
     transcript: Option<Transcript>,
+    /// Since when we've been continuously idle (no query, no record in
+    /// flight) — `None` while working. Drives the local-task nudge.
+    idle_since: Option<Instant>,
+    /// Consecutive local-task nudges sent with no query started in between —
+    /// bounded by [`MAX_LOCAL_TASK_NUDGES`], reset by [`AgentStateMachine::turn`]
+    /// the moment a turn actually starts one.
+    local_nudges: u32,
 }
 
 /// Think until `inbox` closes and nothing is left in flight.
@@ -413,11 +446,14 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         transcript,
         live: std::collections::HashMap::new(),
         notices: Vec::new(),
+        idle_since: None,
+        local_nudges: 0,
     };
     // Checks running calls for silence, and refreshes their output figures
-    // in the live record. Often enough to notice a stall within a quarter
-    // of the threshold; never more than every 5 s.
-    let every = (m.host.stall_after() / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    // in the live record — and, the same way, catches an idle cat with open
+    // local tasks within a quarter of its nag threshold. Never more than
+    // every 5 s.
+    let every = (m.host.stall_after().min(m.host.local_nag_after()) / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
     let mut watchdog = tokio::time::interval(every);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     m.publish();
@@ -436,6 +472,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
             if m.pending.is_empty() && m.followups < MAX_FOLLOWUPS {
                 m.followups += 1;
                 was_idle = false;
+                m.idle_since = None;
                 m.turn(Vec::new(), Vec::new(), true, &mut inbox).await;
                 continue;
             }
@@ -448,6 +485,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
             if !was_idle {
                 m.host.idle();
                 was_idle = true;
+                m.idle_since = Some(Instant::now());
             }
         }
 
@@ -521,6 +559,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
             }
         }
         was_idle = false;
+        m.idle_since = None;
         m.turn(wakes, results, false, &mut inbox).await;
     }
 }
@@ -543,6 +582,8 @@ impl<H: Host> AgentStateMachine<H> {
                 self.held.clear();
                 self.notices.clear();
                 self.check_armed = false;
+                self.local_nudges = 0;
+                self.idle_since = None;
                 wakes.clear();
                 results.clear();
             }
@@ -577,9 +618,11 @@ impl<H: Host> AgentStateMachine<H> {
     }
 
     /// On the watchdog's tick: refresh each running call's output figures,
-    /// and queue a notice for any that has gone quiet for
-    /// [`Host::stall_after`] — once per silence.
+    /// queue a notice for any that has gone quiet for [`Host::stall_after`]
+    /// — once per silence — and nudge a cat that's gone idle with open
+    /// local tasks.
     fn watch(&mut self) {
+        self.maybe_nag();
         if self.act.running.is_empty() {
             return;
         }
@@ -603,6 +646,49 @@ impl<H: Host> AgentStateMachine<H> {
             }
         }
         self.publish();
+    }
+
+    /// Idle (no query, no record in flight) with open local tasks, for
+    /// longer than [`LOCAL_TASK_NAG_AFTER`]: queue a wake reminding the
+    /// model to get on with it — the same shape as a chain task's `nudge`
+    /// (`agent.rs`: `"[work: {task}] You claimed this. Do it now."`), just
+    /// for the to-do list nothing on chain knows about. This is the case
+    /// `docs/AGENT_STATE_MACHINE.md` names as uncovered: a model that
+    /// answers the check-in with nothing leaves no trace and arms no other
+    /// wake, so an open `LocalTask` sat forever with nobody nudging it.
+    /// Bounded by [`MAX_LOCAL_TASK_NUDGES`], same reason a chain nudge is
+    /// bounded — nagging a model that will never answer burns turns
+    /// forever otherwise. `Host::check_before_idle` off (`kot chat`) means
+    /// no unattended cat to answer for, so it's skipped there too.
+    fn maybe_nag(&mut self) {
+        if self.queries != 0 || self.records != 0 || !self.host.check_before_idle() {
+            return;
+        }
+        if self.local_nudges >= MAX_LOCAL_TASK_NUDGES {
+            return;
+        }
+        let Some(since) = self.idle_since else { return };
+        if since.elapsed() < self.host.local_nag_after() {
+            return;
+        }
+        let Some(reminder) = self.host.reminder() else { return };
+        self.local_nudges += 1;
+        let last = self.local_nudges >= MAX_LOCAL_TASK_NUDGES;
+        let tail = if last {
+            " This is the last reminder on these — if you're stuck or waiting on someone, say so; nothing more will nudge you about them."
+        } else {
+            ""
+        };
+        let text = format!(
+            "(Idle {} with open local tasks.{tail}\n{reminder}\nDo the next step now, or call LocalTask to update the list.)",
+            ui::human(since.elapsed().as_secs())
+        );
+        self.host.show(ui::note(&format!("nudging {} on its open local tasks — idle {}", self.host.name(), ui::human(since.elapsed().as_secs()))));
+        let kind = self.kinds.last().copied().unwrap_or("said");
+        self.pending.push_back(Inbound::Wake { text, kind, ctx: self.ctx.clone() });
+        // Restart the clock: if this nudge also gets nothing back, the next
+        // one waits a full interval again rather than firing right away.
+        self.idle_since = Some(Instant::now());
     }
 
     /// The queries still out — what the model can look at or cancel.
@@ -874,6 +960,13 @@ impl<H: Host> AgentStateMachine<H> {
         // update): the shape of "I'll do X next" with no X started. A
         // check-in never arms another.
         let started_nothing = self.queries == queries_before;
+        if !started_nothing {
+            // The holder acted — same rule a chain task's nudge budget
+            // follows (`Timers::max_nudges`: "resets whenever the holder
+            // acts"). Otherwise three real turns of work would still leave
+            // a nag due the moment it next goes idle.
+            self.local_nudges = 0;
+        }
         let wrote = !turn.calls.is_empty();
         self.check_armed = !check && !results.is_empty() && wrote && started_nothing && self.host.check_before_idle();
         if turn.calls.is_empty() {

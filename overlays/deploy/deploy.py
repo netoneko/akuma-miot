@@ -63,6 +63,12 @@ TEMPLATES = HERE / "templates"
 MESH_ENV = HERE / "mesh.env"
 MAC_LAN = "192.168.1.203"
 HTTP_PORT = 8765  # the mac serves a staged file to the akuma/fcguest boxes on this
+# `scp`/`limactl copy` in `put()` had no timeout at all until 2026-09-25:
+# ryzen (linux shape), same night as the akuma-shape fix above, measured
+# ~120 KB/s over what's normally a fast home-LAN hop — the 13 MB kot took
+# over a minute and scp was still going. Bound it instead of hanging
+# forever on a slow or wedged link.
+PUT_TIMEOUT = 600
 AKUMA_REPO = Path(os.environ.get("AKUMA_REPO", str(ROOT.parent / "akuma")))
 
 DRY_RUN = False
@@ -193,7 +199,17 @@ def on(a: Agent, cmd: str) -> str:
     """Run `cmd` as root on `a`'s host over its shape's transport, return stdout."""
     if a.shape == "akuma":
         argv = ["ssh", "-o", "BatchMode=yes", "akuma", cmd]
-        timeout = 60
+        # Generous, same reason as fcguest below: measured live 2026-09-25,
+        # a 13 MB x86_64 kot into the bare-metal box's wget ran at ~100-
+        # 150 KB/s — 60s wasn't enough, and three `deploy.py up` attempts in
+        # a row all timed out mid-transfer looking exactly like the box's
+        # documented "can't spawn a second process" wedge (a plain ssh
+        # command still answered instantly). A live `wget -O ... ; echo
+        # done` run to completion, watched, showed it was just slow, not
+        # stuck — 30% at 35s, climbing steadily. Don't mistake a slow
+        # `put` on this box for that wedge again without watching a live
+        # transfer first.
+        timeout = 600
     elif a.shape == "linux":
         argv = ["ssh", "-o", "BatchMode=yes", a.host, cmd]
         timeout = 60
@@ -279,13 +295,13 @@ def put(a: Agent, src: Path, dst: str) -> None:
         say(f"[dry-run] put {a.name}: {src} -> {dst}")
         return
     if a.shape == "linux":
-        r = subprocess.run(["scp", "-q", str(src), f"{a.host}:{dst}.new"], capture_output=True, text=True)
+        r = subprocess.run(["scp", "-q", str(src), f"{a.host}:{dst}.new"], capture_output=True, text=True, timeout=PUT_TIMEOUT)
         if r.returncode != 0:
             die(f"{a.name}: scp {src} failed: {r.stderr.strip()}")
         on(a, f"mv {dst}.new {dst}")
     elif a.shape == "lima":
         staged = f"/tmp/{Path(dst).name}.new"
-        r = subprocess.run(["limactl", "copy", str(src), f"fc:{staged}"], capture_output=True, text=True)
+        r = subprocess.run(["limactl", "copy", str(src), f"fc:{staged}"], capture_output=True, text=True, timeout=PUT_TIMEOUT)
         if r.returncode != 0:
             die(f"{a.name}: limactl copy {src} failed: {r.stderr.strip()}")
         on(a, f"mv {staged} {dst}")

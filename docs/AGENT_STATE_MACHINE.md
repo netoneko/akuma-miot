@@ -212,7 +212,21 @@ What it doesn't cover:
 - A reply to a wake that promises work but calls no query ("on it!"). No
   results are involved, so nothing arms. The rules now say plainly that a
   message alone doesn't start anything.
-- A model that ignores the check-in.
+- ~~A model that ignores the check-in.~~ **Covered for the case that
+  actually bit meow (2026-09-25):** an ignored check-in with an open
+  `LocalTask` now gets nudged — the same idea as a chain task's `nudge`
+  (`Timers::work_nag`, "you claimed this, do it now."), just for the to-do
+  list nothing on chain knows about. `AgentStateMachine::maybe_nag`, run off
+  the same watchdog tick that catches a stalled call: idle
+  ([`LOCAL_TASK_NAG_AFTER`], 150 s, mirrors `work_nag`'s default) with
+  `Host::reminder` returning something queues a real wake (resets the
+  follow-up budget, unlike a stall notice), bounded to
+  [`MAX_LOCAL_TASK_NUDGES`] (3, mirrors `max_nudges`) and reset the moment a
+  turn starts a query again. A cat with nothing on its local list, or a host
+  with `check_before_idle` off (`kot chat`), is left alone. **Still not
+  covered:** a model that ignores the check-in with *no* open local task —
+  a bare "I'll get to it" with nothing written down has nothing to nudge it
+  back with.
 
 ## Also seen in the same log, not fixed here
 
