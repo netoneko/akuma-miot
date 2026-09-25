@@ -134,7 +134,7 @@ const BUND: Theme = Theme {
         ("mimi", Rgb(255, 138, 61), "咪"),
     ],
     title: "恶魔猫窝",
-    subtitle: "· akuma miot",
+    subtitle: "· akuma tea house",
     tagline: "distributed cat system",
     vista: Vista::Skyline,
     rule: "─",
@@ -168,7 +168,7 @@ const NEON: Theme = Theme {
         ("mimi", Rgb(255, 120, 40), "咪"),
     ],
     title: "恶魔猫窝",
-    subtitle: "// A K U M A · M I O T",
+    subtitle: "// A K U M A · T E A  H O U S E",
     tagline: "[ distributed cat system ]",
     vista: Vista::Glitch,
     rule: "═",
@@ -202,7 +202,7 @@ const INK_WASH: Theme = Theme {
         ("mimi", Rgb(196, 160, 90), "咪"),
     ],
     title: "恶魔猫窝",
-    subtitle: "  akuma miot",
+    subtitle: "  akuma tea house",
     tagline: "distributed cat system",
     vista: Vista::Proverb,
     rule: "╌",
@@ -452,7 +452,6 @@ pub fn banner() -> String {
     let side: Vec<String> = vec![
         format!("{}  {}", bold(t.accent, t.title), dim(t.subtitle)),
         dim(&shout(t.tagline)),
-        dim("a litter of models, coordinating on chain"),
         String::new(),
         format!("{} {}", dim("kot"), dim(env!("CARGO_PKG_VERSION"))),
         v[0].clone(),
@@ -615,7 +614,7 @@ pub fn said(time: &str, block: u64, from: &str, to: &str, body: &str, roster: &R
 pub fn said_ex(time: &str, block: u64, from: &str, to: &str, body: &str, roster: &Roster, off_record: bool, note: &str) -> String {
     let art: Vec<&str> = AVATAR.lines().collect();
     let c = cat(from);
-    let arrow = if to == "litter" { dim("· to the litter") } else { format!("{} {}", dim("→"), who(to)) };
+    let arrow = if to == "litter" { format!("{} {}", dim("→"), dim("litter")) } else { format!("{} {}", dim("→"), who(to)) };
     let otr = if off_record { format!("  {}", dim("· off the record")) } else { String::new() };
     let extra = if note.is_empty() { String::new() } else { format!("  {}", dim(note)) };
     let head = format!("{} {arrow}{otr}{extra}   {}", sealed(from), stamp(time, block).trim_start());
