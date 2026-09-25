@@ -1165,3 +1165,44 @@ fn an_old_format_history_is_trimmed_on_load() {
     assert!(!said.contains(&body) && said.len() < 400, "{said}");
     assert_eq!(saved.history[0].1, "root said: build it");
 }
+
+// ── one lane for the host's files (meow, 2026-09-25: shredded hda.rs) ──
+
+/// Two calls in one response run in order, the second after the first has
+/// finished — a read after a slow write sees the write.
+#[tokio::test]
+async fn bash_and_file_calls_run_one_at_a_time_in_order() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f");
+    let slow_write = format!("sleep 0.4; echo written > {}", f.display());
+    let r = rig(vec![
+        calls(vec![("Bash", json!({"command": slow_write})), ("ReadFile", json!({"path": f.display().to_string()}))]),
+        text("ok"),
+    ])
+    .await;
+    r.wake("write then read");
+    r.until("both results", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("[#0 Bash]") && fed.contains("[#1 ReadFile]"), "{fed}");
+    assert!(fed.contains("written"), "the read ran after the write finished: {fed}");
+}
+
+/// A call from a later response waits for one still running from an
+/// earlier one — and is shown as queued, not stalled.
+#[tokio::test]
+async fn a_later_turns_call_waits_for_the_one_still_running() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("g");
+    let slow = format!("sleep 1; echo first > {}", f.display());
+    let append = format!("echo second >> {}; cat {}", f.display(), f.display());
+    let r = rig(vec![calls(vec![("Bash", json!({"command": slow, "timeout": 10}))]), calls(vec![("Bash", json!({"command": append})), ("Running", json!({}))]), text("ok"), text("ok")]).await;
+    r.wake("start the slow one");
+    r.until("first turn", |f, _| f.requests().len() == 1).await;
+    r.wake("now append");
+    r.until("the append's result", |f, _| f.all(f.requests().len() - 1).contains("[#2 Bash]") || f.requests().iter().enumerate().any(|(i, _)| f.fed(i).contains("first\nsecond"))).await;
+    let (fake, _) = r.finish().await;
+    let all: String = (0..fake.requests().len()).map(|i| fake.fed(i)).collect::<Vec<_>>().join("\n====\n");
+    assert!(all.contains("queued behind the calls before it"), "Running shows it waiting: {all}");
+    assert!(all.contains("first\nsecond"), "it ran after the slow one, not beside it: {all}");
+}

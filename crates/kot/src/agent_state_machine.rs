@@ -21,6 +21,14 @@
 //! - **Queries run on their own.** A query tool (`Bash`, `ReadFile`,
 //!   `Peers`, ...) is spawned, not awaited; its result lands in the inbox
 //!   and is fed to the model on a later turn, labelled with an id.
+//! - **One lane for the host's files.** `Bash`, `ReadFile` and `WriteFile`
+//!   run one at a time, in the order they were called, across turns
+//!   ([`AgentStateMachine::lane`]). Found live 2026-09-25: they all ran at
+//!   once, so meow's `sed -i` on `hda.rs` started while its previous turn's
+//!   edit-and-build script was still rewriting it, a note's `WriteFile`
+//!   raced the `reboot` beside it, and the files came out shredded — 12
+//!   overlaps in one evening's transcript. A queued call is shown as queued,
+//!   and its timeout and stall clock start only when it runs.
 //! - **Records are fire-and-forget.** A write (a chain extrinsic, a reply to
 //!   the operator) is spawned and shown, never fed back — confirmation, if
 //!   there is any, arrives later as a chain event like anything else.
@@ -250,6 +258,10 @@ they arrive; you don't have to reply in the same response you call a tool.\n\
 nothing comes back from them.\n\
 - Your work stops when you stop calling tools. If you say you'll do something next, call \
 its tool in that same response — a message alone doesn't start anything.\n\
+- Bash, ReadFile and WriteFile run one at a time, in the order you call them — across \
+responses too: one waits for the one before it to finish, so a later edit never races an \
+earlier script. Running shows a waiting one as queued. Put a long build last, or it holds \
+up everything after it.\n\
 - Bash waits 30 seconds unless you pass timeout (seconds, up to 3600). Give anything slow, \
 like a build, a big enough timeout, and tell whoever asked that it's running; its output \
 comes back when it finishes, however long that takes.\n\
@@ -284,7 +296,10 @@ pub fn shared_tools() -> Vec<Tool> {
 pub struct Live {
     out: std::sync::Mutex<Vec<u8>>,
     bytes: std::sync::atomic::AtomicU64,
-    started: Instant,
+    /// When it actually began: for a lane call, when its turn came.
+    started: std::sync::Mutex<Instant>,
+    /// Still waiting in the lane for the calls before it.
+    queued: std::sync::atomic::AtomicBool,
     last_output: std::sync::Mutex<Option<Instant>>,
     cancel: tokio::sync::Notify,
     /// A stall notice went out for the current silence; new output re-arms.
@@ -296,7 +311,8 @@ impl Live {
         Live {
             out: Default::default(),
             bytes: Default::default(),
-            started: Instant::now(),
+            started: std::sync::Mutex::new(Instant::now()),
+            queued: Default::default(),
             last_output: Default::default(),
             cancel: tokio::sync::Notify::new(),
             stall_noted: Default::default(),
@@ -334,9 +350,27 @@ impl Live {
         self.bytes.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// How long since it last printed — or since it started, if never.
+    /// Its turn in the lane came: the clocks start now.
+    fn begin(&self) {
+        *self.started.lock().unwrap() = Instant::now();
+        self.queued.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn is_queued(&self) -> bool {
+        self.queued.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    fn ran(&self) -> Duration {
+        self.started.lock().unwrap().elapsed()
+    }
+
+    /// How long since it last printed — or since it started, if never. Never
+    /// quiet while queued: waiting its turn isn't a stall.
     fn quiet(&self) -> Duration {
-        self.last_output.lock().unwrap().unwrap_or(self.started).elapsed()
+        if self.is_queued() {
+            return Duration::ZERO;
+        }
+        self.last_output.lock().unwrap().unwrap_or(*self.started.lock().unwrap()).elapsed()
     }
 
     fn last_output(&self) -> Option<Instant> {
@@ -436,6 +470,9 @@ struct AgentStateMachine<H: Host> {
     act: Activity,
     /// Each query in flight's buffer and cancel switch, by flight id.
     live: std::collections::HashMap<u64, Arc<Live>>,
+    /// Held by whichever `Bash`/`ReadFile`/`WriteFile` is running. Tokio's
+    /// mutex is fair, so calls take it in the order they were dispatched.
+    lane: Arc<tokio::sync::Mutex<()>>,
     /// Stall notices waiting for a turn.
     notices: Vec<String>,
     /// The next flight id.
@@ -502,6 +539,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         flights: 0,
         transcript,
         live: std::collections::HashMap::new(),
+        lane: Arc::new(tokio::sync::Mutex::new(())),
         notices: Vec::new(),
         idle_since: None,
         local_nudges: 0,
@@ -753,7 +791,7 @@ impl<H: Host> AgentStateMachine<H> {
             f.last_output = live.last_output().map(|t| now.saturating_sub(t.elapsed().as_millis() as u64)).unwrap_or(0);
             let quiet = live.quiet();
             if quiet >= stall && !live.stall_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                let ran = ui::human(live.started.elapsed().as_secs());
+                let ran = ui::human(live.ran().as_secs());
                 let heard = if live.bytes() == 0 { format!("no output at all in {ran}") } else { format!("no new output for {}", ui::human(quiet.as_secs())) };
                 let notice = format!(
                     "[r{} {} still running] {} — {ran} so far, {heard}. It may be stalled: Running r{} shows its \
@@ -825,7 +863,10 @@ impl<H: Host> AgentStateMachine<H> {
         let rows: Vec<String> = self
             .running_queries()
             .map(|(f, l)| {
-                let ran = activity::unix_ms().saturating_sub(f.since) / 1000;
+                if l.is_queued() {
+                    return format!("r{} {} {} — queued behind the calls before it", f.id, f.tool, f.arg);
+                }
+                let ran = l.ran().as_secs();
                 let out = if l.bytes() == 0 {
                     "no output yet".to_string()
                 } else {
@@ -1143,7 +1184,28 @@ impl<H: Host> AgentStateMachine<H> {
         let timed = move |out: ToolOut| out.meta(ui::millis(started.elapsed().as_millis() as u64));
         let live = Arc::new(Live::new());
         let d = match local_tool(c, live.clone()) {
-            Some(q) => Dispatch::Query(q),
+            Some(q) => {
+                // Into the lane: the call doesn't start (no child spawned, no
+                // file touched, no timeout ticking) until the one before it
+                // has finished. Its place is taken *here*, in dispatch order:
+                // a tokio lock joins the mutex's fair queue when first polled,
+                // and spawned tasks are first polled in no particular order —
+                // so poll it once now. Cancelling a queued call drops it out of
+                // the queue; whatever is running keeps the lane.
+                use futures_util::FutureExt as _;
+                let mut ticket = Box::pin(self.lane.clone().lock_owned());
+                let got = (&mut ticket).now_or_never();
+                live.queued.store(got.is_none(), std::sync::atomic::Ordering::Relaxed);
+                let live = live.clone();
+                Dispatch::Query(Box::pin(async move {
+                    let _turn = match got {
+                        Some(g) => g,
+                        None => ticket.await,
+                    };
+                    live.begin();
+                    q.await
+                }))
+            }
             None => self.host.dispatch(c),
         };
         if matches!(d, Dispatch::Unknown) {
@@ -1235,7 +1297,10 @@ impl<H: Host> AgentStateMachine<H> {
                     Some(w) => match self.running_queries().find(|(f, _)| f.id.to_string() == w) {
                         None => ToolOut::new(format!("r{w}"), false).meta("not running").body(self.still_running().unwrap_or_default()),
                         Some((f, l)) => {
-                            let ran = ui::human(l.started.elapsed().as_secs());
+                            if l.is_queued() {
+                                return ToolOut::new(format!("r{w}"), true).body(format!("r{} {} {} — queued: it runs when the calls before it finish.", f.id, f.tool, f.arg));
+                            }
+                            let ran = ui::human(l.ran().as_secs());
                             let head = format!("r{} {} {} — running {ran}, {} of output, last {} ago", f.id, f.tool, f.arg, ui::bytes(l.bytes() as usize), ui::human(l.quiet().as_secs()));
                             let body = if l.bytes() == 0 { "(no output yet)".to_string() } else { l.tail(RUNNING_TAIL) };
                             ToolOut::new(format!("r{w}"), true).body(format!("{head}\n{body}"))

@@ -1,6 +1,6 @@
 # Handoff
 
-**Latest: 2026-09-25, late night** — read the 2026-09-25 sections first: a kernel CoW bug that killed meow's kot, fixed; followers renamed *patrons*; GLM reasoning `low`; yuki/shiro asleep; writes carried off nodes that can call nobody; conversations that survive a restart; every tool on every wake; `akuma-litter` as the cats' git drop box; `MIOT_CONTEXT`. Older framing, kept: State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
+**Latest: 2026-09-26** — read "Tokens, racing tool calls, a multiline composer" first: why meow was sending ~75k tokens a turn and what bounds it now, GLM on `glm-5.3-flash` with a configured 1M window, `Bash`/`ReadFile`/`WriteFile` in one lane (meow's shredded files), a composer that grows, headers that don't break at 94 columns, and a WAV plus `wavplay` staged on meow's box. Then the 2026-09-25 sections: a kernel CoW bug that killed meow's kot, fixed; followers renamed *patrons*; GLM reasoning `low`; yuki/shiro asleep; writes carried off nodes that can call nobody; conversations that survive a restart; every tool on every wake; `akuma-litter` as the cats' git drop box; `MIOT_CONTEXT`. Older framing, kept: State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
@@ -747,6 +747,93 @@ automatic compaction needs a session id of its own first: `/clear` starts a
 session, compaction only prunes and snapshots, and cats key on the session.
 Not built yet (Next, item 0a).
 
+## Tokens, racing tool calls, a multiline composer (2026-09-25 night → 09-26)
+
+**meow's `∑ tok` was ~75k per turn and climbing.** `∑` is the sum of every
+turn's `prompt + completion`, and the prompt is the whole conversation,
+re-sent each turn, so `∑` grows roughly with the square of the conversation
+length. Each result fed back was capped at 3,000 chars, but it then stayed
+in history for good. Nothing ever compacted it because `Llm::context_window`
+only knew how to ask a llama-server (`/v1/models` → `meta.n_ctx`), so a GLM
+cat had no window: no budget warnings, no force-compaction. The transcript's
+`"window": null` confirmed it, and 181 KB of meow's 235 KB history was old
+tool output (restored across 45 restarts). Four fixes:
+
+1. **`--context-window` / `MIOT_CONTEXT_WINDOW`** (`Llm::with_context_window`).
+   `deploy.py` sets 1,000,000 for both GLM cats (Kirill's figure for the
+   model, not measured). At 1M the first warning is at 250k, so on its own
+   this changes little. Fix 2 is what bounds the context.
+2. **Old results age out** (`agent_state_machine.rs`, `RESULT_TURNS` = 6).
+   After 6 turns a fed row becomes a one-line stub in place: its call and
+   outcome, its length, `Inspect {"id": N}`. Result ids now carry on across a
+   restart: the history file is `{history, fresh, turns, next_id}`, so an old
+   `[#3 Bash]` never names a new result. A file in the old format (a bare
+   array) is trimmed on load to one line per result: meow's went from 235 KB
+   to 76 KB, and live it restored 208 messages with 91 trimmed.
+3. **`LocalTask` answers a change with the change** (`L1 is done. 1 open:
+   L2.`), not the whole list, which meow had in history dozens of times.
+4. **`∑ tok` counts `total − cached`.** Checked the same night: z.ai's coding
+   endpoint returns `prompt_tokens_details.cached_tokens`, and the transcript
+   now logs `cached_tokens` per turn.
+
+**The GLM cats moved to `glm-5.3-flash`, reasoning `low`** (`deploy.py`:
+`GLM_MODEL`, `GLM_REASONING`, now written as `MIOT_REASONING=low` rather than
+left to the default). tama was redeployed with it. meow's binary and config
+were staged with `NO_ENABLE=1` (no restart) and it picked them up on its own
+next reboot.
+
+**meow's "shredded" `lib.rs`/`hda.rs` were tool calls running at once.**
+meow blamed "duplicate-spawned tool calls", but the transcript has none:
+no turn repeated a call. What it has is 12 overlaps in one evening. Every
+query tool ran concurrently: calls in one response side by side, and later
+turns' calls beside an earlier one still running. Examples: a `sed -i` on
+`hda.rs` started while the previous turn's 22-second edit-and-build script
+was still rewriting it, and a note's `WriteFile` raced the
+`git add … && reboot -f` beside it. **Fixed:** `Bash`, `ReadFile` and
+`WriteFile` share one lane, one at a time, in call order, across turns
+(`AgentStateMachine::lane`). Each call takes its place in the fair mutex *at
+dispatch*, by polling the lock future once there, because a tokio lock joins
+the queue only when first polled and spawned tasks are first polled in no
+fixed order. A queued call shows as queued; its timeout and stall clock start
+when it runs; `Cancel` takes it out of the queue. The rules tell the model a
+long build holds up the file calls after it. Two tests
+(`tests/agent_state_machine.rs`): read-after-slow-write in one response, and
+a later turn's `Bash` waiting for one still running. **Not yet on meow or
+tama.** meow's own workaround (a lock dir, unique temp names) covers it
+meanwhile.
+
+**The REPL's composer is multiline**, as `docs/CLI.md` §2 always specified.
+Enter sends. `Ctrl-J`, `Alt-Enter` and `Shift-Enter` add a line (Shift-Enter
+only where the terminal speaks the kitty keyboard protocol; `RawGuard`
+enables it when supported). `Ctrl-J` used to *wipe* the draft: the textarea's
+own binding for it is emacs's kill-to-line-start. `Up`/`Down` move between
+lines and reach history only from the first/last line. A bracketed paste
+keeps its newlines instead of sending each line. The composer grows one row
+per line up to `DRAFT_ROWS_MAX` (10), then scrolls inside itself. Growing
+means a new `Viewport::Inline` (ratatui 0.30 fixes its height at
+construction), rebuilt only when the line count changes, anchored at its top
+row, inside one synchronized update. Checked in a pty against a solo node at
+24×100: typing repaints only the draft row, a new line moves the composer up
+exactly one row, a send ends identical to a one-line send.
+
+**Two log layouts fixed at Kirill's 94 columns.** A message header put name,
+`→ to`, the `↩ #parent · #tags` note and the timestamp on one unwrapped row,
+so meow's reply with three tags ran past the edge and the terminal split the
+timestamp. The timestamp now always has its own row. The note sits beside
+the name if it fits, else on rows of its own, broken only between tags
+(`ui::pack`). The `∑` row wraps between whole parts, and continuations hang
+under the first part, not at a bare `·` (`ui::obs_parts`). Tests:
+`ui::layout_at_94`.
+
+**Staged on meow's box for the HDA work:** `bootstrap/music/
+tokyo_rider_enter_omegashima.wav` (54 MB, 24-bit/44.1 kHz stereo, same path
+under `/src/github.com/netoneko/akuma`, gitignored there too), and
+`/bin/wavplay`, cross-built on the mac (`cargo build -p wavplay --target
+x86_64-unknown-none --release` in `../akuma/userspace`, as `amd64/mkdisk.sh`
+does). It runs, and stops at `cannot open /dev/dsp (is sound available?)`,
+which is correct until meow's driver registers the device. The 412 MB FLAC
+in `bootstrap/music/soundtrack/` was not staged (Kirill: one WAV is enough).
+
 ## Block seal times (2026-09-24)
 
 Every block body now ends with the primary's wall clock at seal time
@@ -1094,7 +1181,30 @@ when asked). `docs/LOCAL_SIM.md` has the full writeup.
   for `CSI n S` (scroll up), which `scrolling-regions` inserts use, so every
   insert renders as garbage over the old screen. To check what the REPL
   draws, drive it in a pty (answer its `CSI 6n` cursor query) and read the
-  raw bytes.
+  raw bytes. **Or teach it (2026-09-26):** subclass `pyte.Screen` with
+  `scroll_up`/`scroll_down` (cursor to the margin's bottom/top, `index()` /
+  `reverse_index()` n times, cursor back) and map `S`/`T` in a
+  `ByteStream` subclass's `csi` dict. Then its screen matched the REPL's
+  real output, and it answers `CSI 6n` and DA itself via
+  `write_process_input`.
+- **crossterm's `EventStream` holds the input reader's lock while it waits
+  for a key (2026-09-26).** Anything that reads a terminal reply off stdin
+  meanwhile (`cursor::position()`, so any new `Viewport::Inline` and an
+  inline `resize`) waits 2 s for that lock and fails. The composer's rebuild
+  avoids it by answering the one query from the known viewport row
+  (`client.rs` `PinnedBackend`). A window resize still goes through
+  `autoresize` and so probably still stalls; that was already the case
+  before the multiline work.
+- **`cargo test --lib` doesn't rebuild `target/debug/kot`.** A pty check
+  after a test run drove the old binary and "found" a regression. `cargo
+  build -p kot` first.
+- **`deploy.py`'s `put` to the metal box is capped by its 600 s command
+  timeout.** The box pulls about 0.6 MB/s from the mac, so anything over
+  ~350 MB dies partway, and a wget inside the ssh session dies with it
+  (keepalives drop under load too). For a big file, serve it yourself and
+  run `nohup sh -c 'wget …; md5sum … > /tmp/x.done' &` on the box, then
+  poll. The box can also reboot under you: meow reboots it as part of its
+  work.
 - **zram is RAM (2026-09-25).** On ryzen, "swap" is compressed memory, so
   swapping doesn't relieve pressure; the box thrashes instead of an OOM kill
   landing. Give memory-hungry services `MemoryMax` and `MemorySwapMax=0`.
@@ -1151,14 +1261,24 @@ Cheapest tests to separate the two:
 
 ## Next, in order
 
-**Open after 2026-09-25**, most pressing first:
+**Open after 2026-09-26**, most pressing first:
 
-- **meow's M1:** `hda::init()` goes into `amd64/src/multiboot2.rs` after
-  `xhci::quiesce_all()` (the trashcan's boot path; it's only in `main.rs`'s
-  `if have_pci` today). meow found this itself at day's end. Then its boot
-  capture should show `[HDA] 8086:8c20 bar0=0xf7210000 version=…`, and the
-  first push of `cats/meow/amd64-audio` to `akuma-litter` is the test of
-  whether a small push survives the box's git EBADF bug.
+- **Ship the tool lane to meow and tama.** Both run the binary from before
+  it (meow's is the 09-25 night build with aging and the context window).
+  `deploy.py up ryzen-linux-amd64`; for meow, `NO_ENABLE=1` to stage
+  without a restart, as before.
+- **meow's HDA work** has moved past M1 (it reported M6 and M7, CORB/RIRB
+  codec discovery, on 09-25 night; its own notes and commits have the
+  state). The end-to-end test is on the box already: once `/dev/dsp` exists,
+  `wavplay /src/github.com/netoneko/akuma/bootstrap/music/
+  tokyo_rider_enter_omegashima.wav`. The WAV is 44.1 kHz, so the driver's
+  `SNDCTL_DSP_SPEED` has to take that rate; 24-bit becomes 16 in `wavplay`.
+- **Composer, not done:** `docs/CLI.md` §2's "a second `Ctrl-C` within 1 s
+  exits" (today `Ctrl-C` only clears), and a multi-line message's local
+  echo, which shows its lines joined by spaces (the message keeps its
+  newlines).
+- **The window-resize stall** (Traps: `EventStream` holds the reader lock).
+  Answer `autoresize`'s cursor query the same way the composer rebuild does.
 - **Archive before any compaction.** A `/clear` or `kot compact` throws away
   every block since checkpoint 25498 except the end state, and cats'
   reasoning lives only in their transcripts. Kirill wants a timeline built

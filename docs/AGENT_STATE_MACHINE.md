@@ -106,6 +106,20 @@ EOF) drains every query and record still in flight, then returns.
   handled meanwhile. On timeout the shell is killed (`kill_on_drop`) and the
   model is told it can ask for longer. A child the shell forked may outlive
   it.
+- **One lane** (2026-09-26): `Bash`, `ReadFile` and `WriteFile` run one at
+  a time, in the order they were called, across turns too. Each call takes
+  its place in a fair mutex when it's dispatched, not when its task first
+  runs. Before this they all ran at once. meow's transcript for the evening
+  of 2026-09-25 shows 12 overlaps, including a `sed -i` on `hda.rs` that
+  started while the previous turn's edit-and-build script was still
+  rewriting that file, and a note's `WriteFile` racing the `reboot` beside
+  it. meow explained the shredded files as "duplicate-spawned" calls, but
+  nothing was duplicated. A queued call shows in `Running` and the
+  still-running list as "queued behind the calls before it". Its timeout
+  and stall clock start only when it runs, and `Cancel` removes it from
+  the queue. The cost is that a long build holds up every file call after
+  it, and the rules tell the model so. Chain and session tools (`Peers`,
+  `Running`, `Cancel`, `Inspect`, …) are not in the lane.
 - **Aged** (2026-09-25): a fed row stays in the conversation for
   `RESULT_TURNS` (6) turns. After that it's replaced in place by a one-line
   stub: its first line (the call and how it went), its length, and

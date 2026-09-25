@@ -121,10 +121,15 @@ The composer occupies N lines at the bottom. To print new output: clear the
 composer, write the lines, redraw the composer. Output above never moves and
 is never rewritten.
 
-As built (2026-09-25) it is three rows: **activity** (one phrase per cat —
-`活 meow ◌ 42s 3/5 · kuro ⚙2 Bash 1m03s · tama · ✗Bash`, from any node's
-`GET /activity`, redrawn every second), the **hairline** (node → primary ·
-head), and the **prompt**. Anything inserted above is word-wrapped to the
+As built (2026-09-25; the draft grows since 2026-09-26) it is: **activity**
+(one phrase per cat — `活 meow ◌ 42s 3/5 · kuro ⚙2 Bash 1m03s · tama ·
+✗Bash`, from any node's `GET /activity`, redrawn every second), the
+**hairline** (node → primary · head), and the **prompt**, with one row per
+line of the draft under it, up to 10.
+A message's header in the log puts the sender and `→ target` on its first
+row, a reply's `↩ #parent · #tags` beside them if it fits (else on rows of
+its own, broken only between tags), and the time and block on a row of
+their own, so nothing splits at the terminal's edge. Anything inserted above is word-wrapped to the
 terminal first, so a long line is never cut off at the edge (it used to be,
 which made artifacts unreadable).
 
@@ -145,8 +150,16 @@ The composer is a **multiline editor**, not a single-line prompt.
 | `Alt-Enter` / `Shift-Enter` | newline within the message |
 | `Ctrl-J` | newline (the terminal-independent fallback — many terminals do not distinguish `Shift-Enter`) |
 | `Up` / `Down` | move within the message when it is multiline; recall previous input when the cursor is at the first/last line |
-| `Ctrl-C` | clear the composer; a second within 1 s exits |
+| `Ctrl-C` | clear the composer; a second within 1 s exits (**not built**: today it only clears) |
 | `Ctrl-D` | exit on an empty composer |
+| paste | kept whole, newlines and all (bracketed paste) — never sent line by line |
+
+As built (2026-09-26, `client.rs` `Input`): all of the above except the
+second `Ctrl-C`. `Shift-Enter` arrives only where the terminal speaks the
+kitty keyboard protocol (kitty, WezTerm, Ghostty, recent iTerm2); `kot`
+turns it on when the terminal says it can. Elsewhere use `Ctrl-J` or
+`Alt-Enter`. The textarea's own `Ctrl-J` (kill to line start) is overridden:
+it wiped the draft before this.
 
 It grows as it needs to and scrolls internally past a cap (say 10 lines) so a
 paste of 400 lines does not eat the screen.

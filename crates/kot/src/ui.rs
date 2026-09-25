@@ -354,6 +354,28 @@ pub fn wrap(s: &str, width: usize) -> Vec<String> {
     out
 }
 
+/// Whole pieces packed into lines of at most `width` cells, `sep` between
+/// neighbours on a line and never at a line's start or end — a tag or a
+/// `42 tool calls` is never split, and a continuation never opens on a bare
+/// `·`. A piece wider than `width` gets a line to itself.
+pub fn pack(pieces: &[String], sep: &str, width: usize) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    for p in pieces {
+        if !cur.is_empty() && vcells(&cur) + vcells(sep) + vcells(p) > width {
+            out.push(std::mem::take(&mut cur));
+        }
+        if !cur.is_empty() {
+            cur.push_str(sep);
+        }
+        cur.push_str(p);
+    }
+    if !cur.is_empty() || out.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
 // ── the litter ──────────────────────────────────────────────────────────
 
 /// One colour per sender, forever — that is what makes the scroll readable.
@@ -557,6 +579,20 @@ pub fn obs(time: &str, block: u64, text: String) -> String {
         .join("\n")
 }
 
+/// [`obs`] for a list of parts after a lead (`meow ∑` then `34 turns`,
+/// `42 tool calls`, …): packed whole ([`pack`]), continuation lines hanging
+/// under the first part rather than under the lead.
+pub fn obs_parts(time: &str, block: u64, lead: &str, parts: &[String]) -> String {
+    let indent = STAMP_W + vcells(lead) + 1;
+    let width = term_width().saturating_sub(indent).max(20);
+    pack(parts, " · ", width)
+        .into_iter()
+        .enumerate()
+        .map(|(i, l)| if i == 0 { format!("{}{lead} {}", stamp(time, block), dim(&l)) } else { format!("{}{}", " ".repeat(indent), dim(&l)) })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// The verbs, each with a glyph and a colour so a scroll can be scanned by
 /// shape alone: progress, done, a demand, a poke. The words are the
 /// protocol's own; only the case is the skin's.
@@ -616,10 +652,24 @@ pub fn said_ex(time: &str, block: u64, from: &str, to: &str, body: &str, roster:
     let c = cat(from);
     let arrow = if to == "litter" { format!("{} {}", dim("→"), dim("litter")) } else { format!("{} {}", dim("→"), who(to)) };
     let otr = if off_record { format!("  {}", dim("· off the record")) } else { String::new() };
-    let extra = if note.is_empty() { String::new() } else { format!("  {}", dim(note)) };
-    let head = format!("{} {arrow}{otr}{extra}   {}", sealed(from), stamp(time, block).trim_start());
-    let mut rows: Vec<String> = vec![head];
     let width = term_width().saturating_sub(2 + 20 + 2 + 1).max(20);
+    // Who → whom first; a reply's `↩ #parent` and its tags beside it if they
+    // fit, else on rows of their own, broken only between tags. Then the
+    // time and block, always on a row of their own: sharing the first row,
+    // a reply with a few tags ran past the edge and the terminal broke the
+    // timestamp in half (found at 94 columns, 2026-09-26).
+    let who_row = format!("{} {arrow}{otr}", sealed(from));
+    let mut rows: Vec<String> = Vec::new();
+    if note.is_empty() {
+        rows.push(who_row);
+    } else if vcells(&who_row) + 2 + vcells(note) <= width {
+        rows.push(format!("{who_row}  {}", dim(note)));
+    } else {
+        rows.push(who_row);
+        let pieces: Vec<String> = note.split(" · ").map(str::to_string).collect();
+        rows.extend(pack(&pieces, " · ", width).into_iter().map(|l| dim(&l)));
+    }
+    rows.push(format!("{}  {}", dim(time), dim(&block_id(block))));
     rows.extend(wrap(body, width).into_iter().map(|l| tags(&l, roster)));
     let n = rows.len().max(art.len());
     let mut out = vec![String::new()];
@@ -951,6 +1001,11 @@ pub fn reply(caller: &str, body: &str) -> String {
 /// out when the reporter didn't count them apart (an older build), rather
 /// than shown as a misleading zero.
 pub fn stats_phrase(v: &serde_json::Value) -> String {
+    stats_parts(v).join(" · ")
+}
+
+/// [`stats_phrase`]'s pieces, each kept whole when the row wraps.
+pub fn stats_parts(v: &serde_json::Value) -> Vec<String> {
     let n = |f: &str| v[f].as_u64().unwrap_or(0);
     let plural = |k: u64, one: &str, many: &str| format!("{k} {}", if k == 1 { one } else { many });
     let mut parts = vec![plural(n("turns"), "turn", "turns"), plural(n("tool_calls"), "tool call", "tool calls")];
@@ -959,7 +1014,7 @@ pub fn stats_phrase(v: &serde_json::Value) -> String {
     }
     parts.push(format!("{} tok", thousands(n("tokens"))));
     parts.push(format!("{} thinking", human(n("ms") / 1000)));
-    parts.join(" · ")
+    parts
 }
 
 /// A side note from the loop itself — compaction, a budget warning, a
@@ -981,14 +1036,18 @@ fn key(k: &str, what: &str) -> String {
 /// and completion layered on top — not just what a tty's canonical mode
 /// gives for free.
 pub fn keys() -> String {
-    let col = |a: &str, b: &str| format!("      {a}{}{b}", " ".repeat(34usize.saturating_sub(vcells(a))));
+    // Wide enough for the widest left entry, and never less than two spaces
+    // between the columns: at 34 cells two entries ran into their right
+    // neighbour (`history back · forward⌃y yank`).
+    let col = |a: &str, b: &str| format!("      {a}{}{b}", " ".repeat(40usize.saturating_sub(vcells(a)).max(2)));
     let mut out = vec![String::new()];
     out.push(col(&key("⌃a  ⌃e", "start · end of line"), &key("⌃k", "kill to end")));
     out.push(col(&key("⌃b  ⌃f  ← →", "char back · forward"), &key("⌃w", "kill word back")));
-    out.push(col(&key("⌃p  ⌃n  ↑ ↓", "history back · forward"), &key("⌃y", "yank")));
+    out.push(col(&key("⌃p  ⌃n  ↑ ↓", "lines, then history"), &key("⌃y", "yank")));
     out.push(col(&key("⌃u", "undo"), &key("⌃r", "search history")));
     out.push(col(&key("⇥  ⇧⇥", "complete @name / cmd, cycle"), &key("⌃c", "clear the draft")));
     out.push(col(&key("⌃d", "delete forward, or quit if empty"), &key("⏎", "send")));
+    out.push(col(&key("⌃j  ⌥⏎  ⇧⏎", "new line"), &key("paste", "kept whole, never sent line by line")));
     out.push(String::new());
     out.push(format!("      {}", dim("say something → the litter, or @name a cat. /keys shows this again.")));
     out.push(String::new());
@@ -1155,11 +1214,7 @@ pub fn render(time: &str, block: u64, eff: &serde_json::Value, roster: &Roster, 
         // Cumulative, one per turn — the running meter of what a cat has
         // cost so far, so it reads as a tally rather than an event.
         "stats_reported" => {
-            obs(
-                time,
-                block,
-                format!("{} {} {}", who(&name_of(eff, "who", roster)), dim("∑"), dim(&stats_phrase(eff))),
-            )
+            obs_parts(time, block, &format!("{} {}", who(&name_of(eff, "who", roster)), dim("∑")), &stats_parts(eff))
         }
         // A reply and/or a tagged message — [`Effect::Message`]. Renders
         // like speech (it is), with the thread/tag note on the header.
@@ -1777,5 +1832,100 @@ mod directed_tests {
     fn directed_keeps_the_word_gap_whichever_theme_cases_it() {
         let r = strip_ansi(&directed("PlanNeeded"));
         assert!(r.to_uppercase().contains("PLAN NEEDED"), "{r}");
+    }
+}
+
+#[cfg(test)]
+mod layout_at_94 {
+    //! Kirill's terminal is 94 columns (`stty size`: 53 94). `term_width`
+    //! reads `COLUMNS` on every call, so this module's tests set it once and
+    //! share it; nothing else in the crate's tests sets it.
+    use super::*;
+
+    fn at_94() {
+        // SAFETY: set before any rendering here, and no test in this crate
+        // reads `COLUMNS` expecting anything else.
+        unsafe { std::env::set_var("COLUMNS", "94") };
+    }
+
+    fn rows(s: &str) -> Vec<String> {
+        s.lines().map(strip_ansi).collect()
+    }
+
+    /// meow's header from 2026-09-26: a reply and three tags ran past the
+    /// edge, and the terminal broke the timestamp across two lines.
+    #[test]
+    fn a_reply_with_tags_keeps_its_timestamp_whole_on_its_own_row() {
+        at_94();
+        let r = rows(&said_ex(
+            "09-25 21:55:12Z",
+            0x7318,
+            "meow",
+            "root",
+            "Confirmed — that's exactly the failure mode: my multi-step Bash scripts raced.",
+            &Roster::default(),
+            false,
+            "↩ #00007304 · #hda · #node-stability · #m7",
+        ));
+        for l in &r {
+            assert!(vcells(l) <= 94, "{} cells: {l:?}", vcells(l));
+        }
+        let stamp = r.iter().position(|l| l.contains("09-25 21:55:12Z")).expect("the stamp");
+        assert!(r[stamp].contains("0x7318") || r[stamp].contains("#29464"), "time and block together: {:?}", r[stamp]);
+        let head = r.iter().position(|l| l.contains("meow") && l.contains("root")).unwrap();
+        assert!(head < stamp && r.iter().take(stamp).any(|l| l.contains("#m7")), "{r:#?}");
+        println!("{}", r.join("\n"));
+    }
+
+    #[test]
+    fn many_tags_break_between_tags_never_inside_one() {
+        at_94();
+        let note = "↩ #1 · #alpha-long-tag · #beta-longer-tag · #gamma-even-longer-tag · #delta · #epsilon-tag";
+        let r = rows(&said_ex("09-25 21:55:12Z", 1, "meow", "root", "hi", &Roster::default(), false, note));
+        for l in &r {
+            assert!(vcells(l) <= 94, "{l:?}");
+            let t = l.trim_end();
+            assert!(!t.ends_with('·') && !t.trim_start().starts_with('·'), "a separator at an edge: {l:?}");
+        }
+        for tag in ["#alpha-long-tag", "#beta-longer-tag", "#gamma-even-longer-tag", "#epsilon-tag"] {
+            assert!(r.iter().any(|l| l.contains(tag)), "{tag} whole on one row: {r:#?}");
+        }
+        println!("{}", r.join("\n"));
+    }
+
+    /// `meow ∑ 34 turns · … · 24m53s thinking`: wraps between whole parts,
+    /// and a continuation hangs under the first part — not at a bare `·`.
+    #[test]
+    fn a_long_stats_row_wraps_between_parts_under_the_first() {
+        at_94();
+        let eff = serde_json::json!({"turns": 34, "tool_calls": 42, "messages": 25, "tokens": 235903u64, "ms": 1_493_000u64});
+        let r = rows(&obs_parts("09-25 21:55:12Z", 0x7318, "meow ∑", &stats_parts(&eff)));
+        println!("{}", r.join("\n"));
+        for l in &r {
+            assert!(vcells(l) <= 94, "{l:?}");
+        }
+        if r.len() > 1 {
+            let first = vcells(&r[0][..r[0].find("34 turns").unwrap()]);
+            for l in &r[1..] {
+                let lead = l.len() - l.trim_start().len();
+                assert_eq!(lead, first, "hangs under `34 turns`: {r:#?}");
+                assert!(!l.trim_start().starts_with('·'), "{l:?}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod keys_help {
+    use super::*;
+
+    /// Every row keeps at least two spaces between its columns, and fits 94.
+    #[test]
+    fn columns_never_run_together() {
+        for l in keys().lines().map(strip_ansi).filter(|l| l.trim_start().starts_with(['⌃', '⇥'])) {
+            let right = ["⌃k", "⌃w", "⌃y", "⌃r", "⌃c", "⏎ send", "paste"].iter().filter_map(|k| l.find(k)).min().expect(&l);
+            assert!(l[..right].ends_with("  "), "columns touch: {l:?}");
+            assert!(vcells(&l) <= 94, "{l:?}");
+        }
     }
 }

@@ -45,7 +45,10 @@ read that first, it is kept current and this file does not repeat it.
   `docs/FLEET.md`) and
   `Llm::glm` (z.ai **coding plan** endpoint, token from a file; reasoning
   effort `low` by default since 2026-09-25, `--reasoning`/`MIOT_REASONING`
-  to change it — `miot_llm::GLM_REASONING` has the measurements).
+  to change it — `miot_llm::GLM_REASONING` has the measurements). A hosted
+  model can't be asked its context window: `--context-window`/
+  `MIOT_CONTEXT_WINDOW` sets it (2026-09-26; without one a GLM cat never
+  compacted — HANDOFF, "Tokens, racing tool calls, a multiline composer").
 - `crates/kot` — **the one binary**, ships as `dist/<arch>/kot`. Polish for
   "cat". `kot run --as <name>` is a mesh node (`node.rs`) plus, given
   `--llm`/`--glm`, that cat's agent loop (`agent.rs`) in the same process,
@@ -187,6 +190,12 @@ read that first, it is kept current and this file does not repeat it.
   with a one-time "you were restarted" note (uptime included); before that
   every restart was total amnesia except the local task list, which is how
   meow ended up in a reboot loop. HANDOFF, "Why meow kept rebooting".
+  Since 2026-09-26 a fed tool result shrinks to a one-line stub after 6
+  turns (`Inspect` rereads it), and result ids carry on across a restart.
+- **A cat's `Bash`/`ReadFile`/`WriteFile` run one at a time, in call order,
+  across turns (2026-09-26).** Before that they all ran at once and meow's
+  edit scripts shredded its own files. A long build now holds up the file
+  calls after it; that's the trade. `docs/AGENT_STATE_MACHINE.md`, "One lane".
 - **`git push` from the metal Akuma box fails on a big pack** (EBADF in
   `pack-objects`, open kernel bug). `akuma-litter` is seeded from the mac so a
   cat's push is small. An Akuma ssh session has no `$HOME`: set

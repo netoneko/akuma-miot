@@ -1267,14 +1267,118 @@ struct ComposerState {
     activity: Vec<Seen>,
 }
 
-/// The activity row, the hairline, the prompt.
-const COMPOSER_HEIGHT: u16 = 3;
+/// Rows the draft gets before it scrolls inside itself — `docs/CLI.md` §2:
+/// "grows as it needs to and scrolls internally past a cap (say 10 lines) so
+/// a paste of 400 lines does not eat the screen".
+const DRAFT_ROWS_MAX: u16 = 10;
+
+/// The activity row, the hairline, then the draft: one row per line of it,
+/// up to [`DRAFT_ROWS_MAX`].
+fn composer_height(draft_rows: usize) -> u16 {
+    2 + (draft_rows.min(DRAFT_ROWS_MAX as usize) as u16).max(1)
+}
+
+type Term = Terminal<PinnedBackend>;
+
+/// `CrosstermBackend`, except that one cursor-position query can be answered
+/// from a position we already know instead of by asking the terminal.
+///
+/// Growing the composer means a new `Viewport::Inline` of another height —
+/// ratatui 0.30 fixes the height at construction — and constructing one asks
+/// the terminal where the cursor is (`cursor::position()`). That reads the
+/// answer off stdin through crossterm's shared input reader, which the
+/// `EventStream` we read keys from holds for as long as it waits for a key; the
+/// query gives up after 2 s and the rebuild fails. We know exactly where the
+/// viewport starts (the last frame's area), so we say so ([`regrow`]).
+struct PinnedBackend {
+    inner: CrosstermBackend<std::io::Stdout>,
+    next_cursor: Option<ratatui::layout::Position>,
+}
+
+impl PinnedBackend {
+    fn new() -> Self {
+        PinnedBackend { inner: CrosstermBackend::new(std::io::stdout()), next_cursor: None }
+    }
+}
+
+impl ratatui::backend::Backend for PinnedBackend {
+    type Error = std::io::Error;
+    fn draw<'a, I>(&mut self, content: I) -> std::io::Result<()>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.inner.draw(content)
+    }
+    fn append_lines(&mut self, n: u16) -> std::io::Result<()> {
+        self.inner.append_lines(n)
+    }
+    fn hide_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.hide_cursor()
+    }
+    fn show_cursor(&mut self) -> std::io::Result<()> {
+        self.inner.show_cursor()
+    }
+    fn get_cursor_position(&mut self) -> std::io::Result<ratatui::layout::Position> {
+        match self.next_cursor.take() {
+            Some(p) => Ok(p),
+            None => self.inner.get_cursor_position(),
+        }
+    }
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(&mut self, position: P) -> std::io::Result<()> {
+        self.inner.set_cursor_position(position)
+    }
+    fn clear(&mut self) -> std::io::Result<()> {
+        self.inner.clear()
+    }
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> std::io::Result<()> {
+        self.inner.clear_region(clear_type)
+    }
+    fn size(&self) -> std::io::Result<ratatui::layout::Size> {
+        self.inner.size()
+    }
+    fn window_size(&mut self) -> std::io::Result<ratatui::backend::WindowSize> {
+        self.inner.window_size()
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+    fn scroll_region_up(&mut self, region: std::ops::Range<u16>, line_count: u16) -> std::io::Result<()> {
+        self.inner.scroll_region_up(region, line_count)
+    }
+    fn scroll_region_down(&mut self, region: std::ops::Range<u16>, line_count: u16) -> std::io::Result<()> {
+        self.inner.scroll_region_down(region, line_count)
+    }
+}
+
+/// The composer at `height` rows, in place: clear from its top row (`top`,
+/// the last frame's) down, and start a new inline viewport there — which
+/// scrolls the screen up if there isn't room below. The top row stays put
+/// either way, so scrollback above never moves for a shrink; a shrink leaves
+/// blank rows under the composer, which the next insert above fills. Only
+/// ever called when the draft's line count changed, never per key. Nothing
+/// is flushed here: the clear goes out with the next frame's draw, inside
+/// one synchronized update (the caller's), so no terminal shows an empty
+/// composer in between. On failure the old viewport stays, still drawing
+/// (one row of draft then, scrolling inside itself).
+fn regrow(terminal: &mut Term, top: u16, height: u16) {
+    use ratatui::backend::{Backend, ClearType};
+    let at = ratatui::layout::Position { x: 0, y: top };
+    let b = terminal.backend_mut();
+    if b.set_cursor_position(at).and_then(|_| b.clear_region(ClearType::AfterCursor)).is_err() {
+        return;
+    }
+    let mut backend = PinnedBackend::new();
+    backend.next_cursor = Some(at);
+    if let Ok(t) = Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(height) }) {
+        *terminal = t;
+    }
+}
 
 /// Feeds one already-ANSI-colored block from `kot::ui` (possibly several
 /// `\n`-joined lines) into the inline viewport's scrollback, above the
 /// composer — `docs/CLI.md` §1's "clear its rows, print the new output
 /// above, draw it again", done by ratatui instead of by hand.
-fn insert_ansi(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, s: &str) {
+fn insert_ansi(terminal: &mut Term, s: &str) {
     if s.is_empty() {
         return;
     }
@@ -1359,15 +1463,36 @@ fn wrap_text(text: Text<'_>, cols: u16) -> Text<'static> {
 /// Raw mode, restored on drop (including an early return or a panic
 /// unwinding through here) so a crash never leaves the operator's shell
 /// broken.
-struct RawGuard;
+/// Raw mode, plus two things the composer needs from the terminal while it's
+/// on: bracketed paste — without it a pasted newline is an `Enter`, and a
+/// three-line paste sends three messages — and, where the terminal speaks the
+/// kitty keyboard protocol, disambiguated keys, which is the only way
+/// `Shift-Enter` arrives as anything but `Enter`. Both undone on drop.
+struct RawGuard {
+    enhanced: bool,
+}
 impl RawGuard {
     fn new() -> std::io::Result<Self> {
+        use crossterm::event::{EnableBracketedPaste, KeyboardEnhancementFlags, PushKeyboardEnhancementFlags};
         enable_raw_mode()?;
-        Ok(RawGuard)
+        // Asked before the `EventStream` exists: the answer is read off stdin.
+        let enhanced = crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
+        let mut out = std::io::stdout();
+        let _ = crossterm::execute!(out, EnableBracketedPaste);
+        if enhanced {
+            let _ = crossterm::execute!(out, PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES));
+        }
+        Ok(RawGuard { enhanced })
     }
 }
 impl Drop for RawGuard {
     fn drop(&mut self) {
+        use crossterm::event::{DisableBracketedPaste, PopKeyboardEnhancementFlags};
+        let mut out = std::io::stdout();
+        if self.enhanced {
+            let _ = crossterm::execute!(out, PopKeyboardEnhancementFlags);
+        }
+        let _ = crossterm::execute!(out, DisableBracketedPaste);
         let _ = disable_raw_mode();
     }
 }
@@ -1379,13 +1504,13 @@ enum Outcome {
     Quit,
 }
 
-/// The composer's draft. Always exactly one logical line — `Enter` is
-/// intercepted before it ever reaches the textarea — which is also why the
-/// composer's `Viewport::Inline` height can stay fixed: ratatui 0.30 fixes
-/// that height at construction, with no public way to grow it later.
+/// The composer's draft — multiline (`docs/CLI.md` §2): `Enter` sends,
+/// `Alt-Enter`/`Shift-Enter`/`Ctrl-J` start a new line, a paste keeps its
+/// newlines, and `Up`/`Down` move between lines before they reach history.
 /// `ratatui_textarea::TextArea` gives real emacs-style editing (kill/yank,
 /// word motion, undo) for free; history, backward search and `@name`/
-/// `/cmd` tab-completion are layered on top here.
+/// `/cmd` tab-completion are layered on top here. The viewport grows with
+/// it ([`regrow`]).
 struct Input {
     area: TextArea<'static>,
     history: Vec<String>,
@@ -1404,22 +1529,47 @@ impl Input {
         Input { area, history: Vec::new(), hist_idx: None, saved: None, tab: None }
     }
 
-    fn draft(&self) -> &str {
-        &self.area.lines()[0]
+    /// The whole draft, lines joined with `\n`.
+    fn draft(&self) -> String {
+        self.area.lines().join("\n")
+    }
+
+    /// The line the cursor is on — what completion looks at.
+    fn line(&self) -> &str {
+        &self.area.lines()[self.area.cursor().0]
+    }
+
+    fn rows(&self) -> usize {
+        self.area.lines().len()
     }
 
     fn cursor_chars(&self) -> usize {
         self.area.cursor().1
     }
 
+    /// A newline where the cursor is. Not the textarea's own binding for it:
+    /// its `Ctrl-J` is emacs's "kill to line start", which is how `Ctrl-J`
+    /// used to wipe the draft.
+    fn newline(&mut self) {
+        self.area.insert_newline();
+    }
+
+    /// A bracketed paste, newlines kept — any of `\r\n`, `\r`, `\n`.
+    fn paste(&mut self, s: &str) {
+        self.tab = None;
+        self.area.insert_str(s.replace("\r\n", "\n").replace('\r', "\n"));
+    }
+
     fn widget(&self) -> &TextArea<'static> {
         &self.area
     }
 
+    /// Replace the whole draft, cursor at its end. Through the textarea's own
+    /// edit (select all, insert over it), so undo and the kill ring survive.
     fn set_draft(&mut self, s: &str) {
-        self.area.move_cursor(CursorMove::Jump(0, 0));
-        self.area.delete_line_by_end();
+        self.area.select_all();
         self.area.insert_str(s);
+        self.area.cancel_selection();
     }
 
     fn history_back(&mut self) {
@@ -1427,7 +1577,7 @@ impl Input {
             return;
         }
         if self.hist_idx.is_none() {
-            self.saved = Some(self.draft().to_string());
+            self.saved = Some(self.draft());
             self.hist_idx = Some(self.history.len());
         }
         if let Some(i) = self.hist_idx {
@@ -1457,7 +1607,7 @@ impl Input {
     /// readline-style search (the query has no edit buffer of its own) —
     /// simpler, still gets you to an old line fast.
     fn search_history(&mut self) {
-        let query = self.draft().to_string();
+        let query = self.draft();
         if query.is_empty() {
             return;
         }
@@ -1475,13 +1625,13 @@ impl Input {
         }
     }
 
+    /// Chars `start..cursor` of the current line become `replacement`, the
+    /// cursor after it.
     fn replace_current_word(&mut self, start: usize, cursor: usize, replacement: &str) {
-        let draft = self.draft().to_string();
-        let before: String = draft.chars().take(start).collect();
-        let after: String = draft.chars().skip(cursor).collect();
-        let new_cursor = start + replacement.chars().count();
-        self.set_draft(&format!("{before}{replacement}{after}"));
-        self.area.move_cursor(CursorMove::Jump(0, new_cursor as u16));
+        let row = self.area.cursor().0;
+        self.area.move_cursor(CursorMove::Jump(row as u16, start as u16));
+        self.area.delete_str(cursor.saturating_sub(start));
+        self.area.insert_str(replacement);
     }
 
     /// `⇥`/`⇧⇥`: complete the `@name` or `/command` under the cursor,
@@ -1498,7 +1648,7 @@ impl Input {
             self.replace_current_word(start, cursor, &repl);
             return;
         }
-        let draft = self.draft().to_string();
+        let draft = self.line().to_string();
         let cursor = self.cursor_chars();
         let (start, word) = current_word(&draft, cursor);
         if word.is_empty() {
@@ -1539,7 +1689,17 @@ impl Input {
             self.tab = None;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let first_row = self.area.cursor().0 == 0;
+        let last_row = self.area.cursor().0 + 1 >= self.rows();
         match key.code {
+            KeyCode::Enter if key.modifiers.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => {
+                self.newline();
+                Outcome::None
+            }
+            KeyCode::Char('j') if ctrl => {
+                self.newline();
+                Outcome::None
+            }
             KeyCode::Enter => {
                 let line = self.draft().trim().to_string();
                 if line.is_empty() {
@@ -1565,20 +1725,22 @@ impl Input {
                 self.saved = None;
                 Outcome::None
             }
-            KeyCode::Up => {
-                self.history_back();
+            // Within a multiline draft, a line up or down; history from its
+            // first or last line.
+            KeyCode::Up | KeyCode::Char('p') if (key.code == KeyCode::Up || ctrl) => {
+                if first_row {
+                    self.history_back();
+                } else {
+                    self.area.move_cursor(CursorMove::Up);
+                }
                 Outcome::None
             }
-            KeyCode::Char('p') if ctrl => {
-                self.history_back();
-                Outcome::None
-            }
-            KeyCode::Down => {
-                self.history_forward();
-                Outcome::None
-            }
-            KeyCode::Char('n') if ctrl => {
-                self.history_forward();
+            KeyCode::Down | KeyCode::Char('n') if (key.code == KeyCode::Down || ctrl) => {
+                if last_row {
+                    self.history_forward();
+                } else {
+                    self.area.move_cursor(CursorMove::Down);
+                }
                 Outcome::None
             }
             KeyCode::Char('r') if ctrl => {
@@ -1971,8 +2133,8 @@ pub async fn repl(mut c: Client) {
             return;
         }
     };
-    let backend = CrosstermBackend::new(std::io::stdout());
-    let mut terminal = match Terminal::with_options(backend, TerminalOptions { viewport: Viewport::Inline(COMPOSER_HEIGHT) }) {
+    let mut height = composer_height(1);
+    let mut terminal = match Terminal::with_options(PinnedBackend::new(), TerminalOptions { viewport: Viewport::Inline(height) }) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("  terminal: {e}");
@@ -1998,6 +2160,9 @@ pub async fn repl(mut c: Client) {
     // line arrives or a key is pressed.
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(1_000));
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    // The composer's top row, as of the last frame — where `regrow` puts
+    // the resized one.
+    let mut top = 0u16;
 
     loop {
         let quit = tokio::select! {
@@ -2009,6 +2174,7 @@ pub async fn repl(mut c: Client) {
                     Outcome::Submit(line) => run_command(&mut c, &line, &tx, &state).await,
                     Outcome::None => false,
                 },
+                Some(Ok(Event::Paste(s))) => { input.paste(&s); false }
                 Some(Ok(Event::Resize(_, _))) => { let _ = terminal.autoresize(); false }
                 Some(Ok(_)) => false,
                 Some(Err(_)) | None => true,
@@ -2016,6 +2182,16 @@ pub async fn repl(mut c: Client) {
         };
         if quit {
             break;
+        }
+        let want = composer_height(input.rows());
+        let regrown = want != height;
+        if regrown {
+            // The clear, the new viewport and its first frame as one
+            // screen update, where the terminal supports synchronized output
+            // (others ignore the sequence).
+            let _ = crossterm::queue!(std::io::stdout(), crossterm::terminal::BeginSynchronizedUpdate);
+            regrow(&mut terminal, top, want);
+            height = want;
         }
 
         let (node, primary, head, sealing, activity) = {
@@ -2030,21 +2206,107 @@ pub async fn repl(mut c: Client) {
         let prompt_w = ui::vcells(&prompt) as u16;
         let _ = terminal.draw(|f| {
             let area = f.area();
-            let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)]).split(area);
+            top = area.y;
+            let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Min(1)]).split(area);
             let activity_text: Text = activity.as_str().into_text().unwrap_or_else(|_| Text::raw(activity.clone()));
             f.render_widget(Paragraph::new(activity_text), rows[0]);
             let status_text: Text = status.as_str().into_text().unwrap_or_else(|_| Text::raw(status.clone()));
             f.render_widget(Paragraph::new(status_text), rows[1]);
+            // The prompt on the draft's first row; its other lines line up
+            // under the first, not under the prompt.
             let cols = Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(1)]).split(rows[2]);
             let prompt_text: Text = prompt.as_str().into_text().unwrap_or_else(|_| Text::raw(prompt.clone()));
-            f.render_widget(Paragraph::new(prompt_text), cols[0]);
+            f.render_widget(Paragraph::new(prompt_text), cols[0].intersection(ratatui::layout::Rect { height: 1, ..cols[0] }));
             f.render_widget(input.widget(), cols[1]);
         });
+        if regrown {
+            let _ = crossterm::execute!(std::io::stdout(), crossterm::terminal::EndSynchronizedUpdate);
+        }
     }
 
     drop(terminal);
     drop(guard);
     println!("\n  {}", ui::dim("bye."));
+}
+
+#[cfg(test)]
+mod input_tests {
+    use super::{composer_height, Input, Outcome, DRAFT_ROWS_MAX};
+    use crate::common::Roster;
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    fn key(i: &mut Input, code: KeyCode, m: KeyModifiers) -> Option<String> {
+        match i.handle(KeyEvent::new(code, m), &Roster::default()) {
+            Outcome::Submit(s) => Some(s),
+            _ => None,
+        }
+    }
+    fn typed(i: &mut Input, s: &str) {
+        for c in s.chars() {
+            key(i, KeyCode::Char(c), KeyModifiers::NONE);
+        }
+    }
+
+    /// Found live 2026-09-26: `Ctrl-J` wiped the draft — the textarea's own
+    /// binding for it is "kill to line start".
+    #[test]
+    fn ctrl_j_alt_and_shift_enter_are_newlines_and_enter_sends_the_lot() {
+        let mut i = Input::new();
+        typed(&mut i, "one");
+        key(&mut i, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        typed(&mut i, "two");
+        key(&mut i, KeyCode::Enter, KeyModifiers::ALT);
+        typed(&mut i, "three");
+        key(&mut i, KeyCode::Enter, KeyModifiers::SHIFT);
+        typed(&mut i, "four");
+        assert_eq!(i.rows(), 4);
+        assert_eq!(key(&mut i, KeyCode::Enter, KeyModifiers::NONE).as_deref(), Some("one\ntwo\nthree\nfour"));
+        assert_eq!((i.rows(), i.draft()), (1, String::new()), "sent: an empty one-line draft again");
+    }
+
+    #[test]
+    fn up_and_down_move_between_lines_before_they_reach_history() {
+        let mut i = Input::new();
+        typed(&mut i, "old");
+        key(&mut i, KeyCode::Enter, KeyModifiers::NONE);
+        typed(&mut i, "a");
+        key(&mut i, KeyCode::Char('j'), KeyModifiers::CONTROL);
+        typed(&mut i, "b");
+        key(&mut i, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(i.draft(), "a\nb", "a line up, not history");
+        assert_eq!(i.area.cursor().0, 0);
+        key(&mut i, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!(i.draft(), "old", "from the first line: history");
+        key(&mut i, KeyCode::Down, KeyModifiers::NONE);
+        assert_eq!(i.draft(), "a\nb", "and back to the draft being written");
+    }
+
+    #[test]
+    fn a_paste_keeps_its_newlines_and_does_not_send() {
+        let mut i = Input::new();
+        i.paste("l1\r\nl2\rl3\nl4");
+        assert_eq!(i.draft(), "l1\nl2\nl3\nl4");
+        assert_eq!(key(&mut i, KeyCode::Enter, KeyModifiers::NONE).as_deref(), Some("l1\nl2\nl3\nl4"));
+    }
+
+    #[test]
+    fn a_recalled_multiline_message_comes_back_whole() {
+        let mut i = Input::new();
+        i.paste("x\ny");
+        key(&mut i, KeyCode::Enter, KeyModifiers::NONE);
+        key(&mut i, KeyCode::Up, KeyModifiers::NONE);
+        assert_eq!((i.draft(), i.rows()), ("x\ny".to_string(), 2));
+    }
+
+    /// The composer grows one row per line and stops at the cap — a 400-line
+    /// paste scrolls inside a 10-row box.
+    #[test]
+    fn the_composer_height_is_capped() {
+        assert_eq!(composer_height(0), 3);
+        assert_eq!(composer_height(1), 3);
+        assert_eq!(composer_height(4), 6);
+        assert_eq!(composer_height(400), 2 + DRAFT_ROWS_MAX);
+    }
 }
 
 #[cfg(test)]
