@@ -235,12 +235,21 @@ pub struct Node {
     /// `TX_STATUS_CAP`, oldest evicted first via `tx_status_order`.
     tx_status: HashMap<H256, TxState>,
     tx_status_order: VecDeque<H256>,
+    /// Extrinsics this node took from a polled peer's queue and handed on
+    /// (applied, forwarded, or queued here in turn), newest last, bounded by
+    /// [`CARRIED_KEEP`]. Announced on every status this node sends, so the
+    /// peer that offered them stops offering. See [`StatusWire::pending`].
+    carried: VecDeque<H256>,
 }
 
 /// See [`Node::mempool`].
 struct MempoolEntry {
     bytes: Vec<u8>,
     inserted_at: u64,
+    /// A peer that polls us said it took this one on (`StatusWire::carried`).
+    /// It stays only so `mempool_round` can still learn it sealed, which is
+    /// what `/tx/{hash}` answers from; it is no longer offered or re-sent.
+    carried: bool,
 }
 
 /// See [`Node::tx_status`]. `Copy` so `advance` can flip `Applied` entries
@@ -280,7 +289,25 @@ struct StatusWire {
     status: Status,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     activity: Option<CarriedActivity>,
+    /// Extrinsics this node queued for want of a route to the primary
+    /// (`Node::mempool`), hex, oldest first, at most [`CARRY_PER_POLL`] — so
+    /// a peer that polls it can take them the rest of the way. A node that
+    /// can't call out has no other way to get a write off itself: its own
+    /// `mempool_round` only reaches peers *it* can call, and for the AWS pair
+    /// against a home primary that's each other (2026-09-25).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pending: Vec<String>,
+    /// Hashes of extrinsics this node took from a peer's `pending` and
+    /// handed on (`Node::carried`), hex — so that peer drops them from its
+    /// queue instead of offering them on every poll until they expire.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    carried: Vec<String>,
 }
+
+/// How many queued extrinsics one status answer offers ([`StatusWire::pending`]).
+const CARRY_PER_POLL: usize = 16;
+/// How many carried hashes a node keeps announcing ([`StatusWire::carried`]).
+const CARRIED_KEEP: usize = 64;
 
 /// A record on the wire between nodes: how old it is as it leaves.
 #[derive(Serialize, Deserialize)]
@@ -552,6 +579,7 @@ impl Node {
             mempool_order: VecDeque::new(),
             tx_status: HashMap::new(),
             tx_status_order: VecDeque::new(),
+            carried: VecDeque::new(),
         };
         if !node.store.is_empty() {
             println!(
@@ -572,7 +600,16 @@ impl Node {
     fn status_wire(&self) -> StatusWire {
         let status = self.mesh.status(self.store.head(), &miot_keys::to_hex(&self.identity.account()));
         let activity = self.activity.as_ref().map(|(got, a)| CarriedActivity { age_ms: got.elapsed().as_millis() as u64, activity: a.clone() });
-        StatusWire { status, activity }
+        let pending = self
+            .mempool_order
+            .iter()
+            .filter_map(|h| self.mempool.get(h))
+            .filter(|e| !e.carried)
+            .take(CARRY_PER_POLL)
+            .map(|e| hex::encode(&e.bytes))
+            .collect();
+        let carried = self.carried.iter().map(|h| hex::encode(h.as_bytes())).collect();
+        StatusWire { status, activity, pending, carried }
     }
 
     /// A peer's cat's record, from a status `signer` sent (or answered
@@ -600,6 +637,12 @@ impl Node {
 
     pub fn is_producing(&self) -> bool {
         self.producing
+    }
+
+    /// Queued extrinsics this node still offers to whoever polls it — not yet
+    /// taken on by a carrier (see `StatusWire::pending`). For tests.
+    pub fn mempool_offered(&self) -> usize {
+        self.mempool.values().filter(|e| !e.carried).count()
     }
 
     /// Who mesh-internal traffic is allowed to come from: genesis `members`
@@ -726,7 +769,7 @@ impl Node {
             }
         }
         self.mempool_order.push_back(hash);
-        self.mempool.insert(hash, MempoolEntry { bytes, inserted_at: unix_ms() });
+        self.mempool.insert(hash, MempoolEntry { bytes, inserted_at: unix_ms(), carried: false });
         self.set_tx_status(hash, TxState::Pending);
     }
 
@@ -1040,12 +1083,14 @@ pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
         got.push(x);
     }
 
+    let mut offered: Vec<Vec<u8>> = Vec::new();
     let req = {
         let mut n = shared.lock().await;
         let now = n.now_ms();
         for (r, st) in got {
-            if let Some((signer, wire)) = st {
+            if let Some((signer, mut wire)) = st {
                 n.take_peer_activity(&signer, &wire);
+                offered.extend(std::mem::take(&mut wire.pending).iter().filter_map(|x| hex::decode(x).ok()));
                 n.mesh.on_status(&r, wire.status, now);
             }
         }
@@ -1059,8 +1104,37 @@ pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
     for route in pushes {
         tokio::spawn(push_session(shared.clone(), route));
     }
+    carry_offered(shared, offered).await;
     if let Some(req) = req {
         campaign(shared, req, timeout).await;
+    }
+}
+
+/// Take the rest of the way what a polled peer couldn't send itself
+/// ([`StatusWire::pending`]): each through the same door as a `/submit` here
+/// (the signer check, then apply, forward to the primary, or queue), once.
+/// Only answers from members get this far — `mesh_round` verified the signer
+/// against the trusted set — and each extrinsic's own signature still decides
+/// who it's from.
+async fn carry_offered(shared: &Shared, offered: Vec<Vec<u8>>) {
+    for bytes in offered {
+        let hash = tx_hash(&bytes);
+        {
+            let n = shared.lock().await;
+            if n.carried.contains(&hash) || n.mempool.contains_key(&hash) {
+                continue;
+            }
+        }
+        let (code, _) = accept_extrinsic(shared, Bytes::from(bytes)).await;
+        // A refusal is final too: the chain's answer won't change on a retry,
+        // so the offering node may as well stop offering it.
+        if code.is_success() || code == StatusCode::UNPROCESSABLE_ENTITY || code == StatusCode::BAD_REQUEST {
+            let mut n = shared.lock().await;
+            if n.carried.len() >= CARRIED_KEEP {
+                n.carried.pop_front();
+            }
+            n.carried.push_back(hash);
+        }
     }
 }
 
@@ -1825,6 +1899,13 @@ async fn mesh_status_post(AxState(n): AxState<Shared>, headers: HeaderMap, body:
     // the caller still gets our answer, which is all the old GET gave it.
     if let Ok(wire) = serde_json::from_slice::<StatusWire>(&body) {
         if wire.status.account == miot_keys::to_hex(&signer) {
+            // What the poller took from our queue on an earlier poll is its
+            // to deliver now: stop offering it.
+            for h in wire.carried.iter().filter_map(|h| hex::decode(h).ok()).filter(|b| b.len() == 32) {
+                if let Some(e) = n.mempool.get_mut(&H256::from_slice(&h)) {
+                    e.carried = true;
+                }
+            }
             n.take_peer_activity(&signer, &wire);
             let now = n.now_ms();
             n.mesh.on_inbound(wire.status, now);
@@ -2271,11 +2352,20 @@ pub async fn mempool_round(shared: &Shared) {
         if n.mempool.is_empty() {
             return;
         }
-        let entries: Vec<(H256, Vec<u8>)> = n.mempool.iter().map(|(h, e)| (*h, e.bytes.clone())).collect();
+        let entries: Vec<(H256, Vec<u8>, bool)> = n.mempool.iter().map(|(h, e)| (*h, e.bytes.clone(), e.carried)).collect();
         (entries, n.mesh.routes().to_vec(), n.http.clone(), n.identity)
     };
-    for (hash, bytes) in entries {
-        match route(shared).await {
+    for (hash, bytes, carried) in entries {
+        let route = route(shared).await;
+        // Someone else is delivering it. With a route of our own there is
+        // nothing left for us to do (`/tx` routes the question from here);
+        // without one we still ask reachable peers whether it sealed, below,
+        // but never send it again.
+        if carried && !matches!(route, Route::Nobody(_)) {
+            shared.lock().await.mempool.remove(&hash);
+            continue;
+        }
+        match route {
             Route::Here => {
                 let Ok(uxt) = UncheckedExtrinsic::decode(&mut &bytes[..]) else {
                     shared.lock().await.mempool.remove(&hash); // can't apply what we can't decode
@@ -2333,7 +2423,7 @@ pub async fn mempool_round(shared: &Shared) {
                 // no point re-submitting the same bytes again this tick,
                 // only re-checking next tick.
                 let already_applied = matches!(shared.lock().await.tx_status.get(&hash), Some(TxState::Applied { .. }));
-                if !already_applied {
+                if !already_applied && !carried {
                     for peer in &peers {
                         let _ = http.post(format!("{peer}/mempool/relay")).body(bytes.clone()).send().await;
                     }

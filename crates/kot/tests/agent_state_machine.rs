@@ -130,6 +130,10 @@ struct Seen {
     stall: Option<Duration>,
     /// `Host::local_nag_after` — the default (minutes) unless a test is about it.
     local_nag: Option<Duration>,
+    /// `Host::history_path` — none unless a test is about restarts.
+    history: Option<std::path::PathBuf>,
+    /// `Host::restart_note`.
+    restart: Option<String>,
 }
 
 struct TestHost(Arc<Mutex<Seen>>);
@@ -202,6 +206,12 @@ impl Host for TestHost {
     }
     fn reminder(&self) -> Option<String> {
         self.0.lock().unwrap().reminder.clone()
+    }
+    fn history_path(&self) -> Option<std::path::PathBuf> {
+        self.0.lock().unwrap().history.clone()
+    }
+    fn restart_note(&self) -> Option<String> {
+        self.0.lock().unwrap().restart.clone()
     }
     fn stall_after(&self) -> Duration {
         self.0.lock().unwrap().stall.unwrap_or(agent_state_machine::STALL_AFTER)
@@ -1019,4 +1029,68 @@ async fn a_write_in_flight_is_not_listed_to_the_model() {
     assert!(fake.fed(2).contains("Nothing is running."), "{}", fake.fed(2));
     // The operator's live view still had it in flight.
     assert!(seen.lock().unwrap().activity.iter().any(|a| a.running.iter().any(|f| f.tool == "SlowSay")));
+}
+
+// ── restarts (meow, 2026-09-25: no memory, rebooted in a loop) ──────────
+
+fn with_history(path: &std::path::Path) -> Seen {
+    Seen { history: Some(path.to_path_buf()), restart: Some("RESTART-NOTE: you were restarted".into()), ..Seen::default() }
+}
+
+/// What a cat learned before its process restarted is in the first request
+/// after, the restart is said once, and only in that first turn.
+#[tokio::test]
+async fn a_restart_picks_the_conversation_back_up_and_says_so_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tama.history.7.json");
+
+    let r = rig_seen(vec![text("noted: the repo is /src/akuma, reboot next")], with_history(&path)).await;
+    r.wake("the repo is at /src/akuma; build, then reboot");
+    r.until("first life", |f, _| f.requests().len() == 1).await;
+    r.finish().await;
+    assert!(path.exists(), "the conversation was saved");
+
+    // The same cat, restarted: a fresh machine, the same path.
+    let r = rig_seen(vec![text("the reboot already happened"), text("ok")], with_history(&path)).await;
+    r.wake("did the reboot happen?");
+    r.until("second life", |f, _| f.requests().len() == 1).await;
+    r.wake("anything else?");
+    r.until("second turn", |f, _| f.requests().len() == 2).await;
+    let (fake, seen) = r.finish().await;
+    let first = fake.all(0);
+    assert!(first.contains("the repo is at /src/akuma"), "what it was told before: {first}");
+    assert!(first.contains("noted: the repo is /src/akuma"), "what it said before: {first}");
+    assert!(fake.fed(0).contains("RESTART-NOTE"), "the restart is said in the first turn: {}", fake.fed(0));
+    assert!(!fake.fed(1).contains("RESTART-NOTE"), "and only there: {}", fake.fed(1));
+    assert!(seen.lock().unwrap().shown.iter().any(|l| l.contains("restored")), "the operator sees it too");
+}
+
+/// A reset (the chain's checkpoint moved) forgets the saved conversation as
+/// well as the live one: a restart after it starts clean, with no note.
+#[tokio::test]
+async fn a_reset_clears_the_saved_conversation() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tama.history.7.json");
+    let r = rig_seen(vec![text("a")], with_history(&path)).await;
+    r.wake("secret-before-reset");
+    r.until("first", |f, _| f.requests().len() == 1).await;
+    r.tx.as_ref().unwrap().send(Inbound::Reset("checkpoint moved".into())).unwrap();
+    r.finish().await;
+
+    let r = rig_seen(vec![text("b")], with_history(&path)).await;
+    r.wake("fresh");
+    r.until("after", |f, _| f.requests().len() == 1).await;
+    let (fake, _) = r.finish().await;
+    assert!(!fake.all(0).contains("secret-before-reset"), "{}", fake.all(0));
+    assert!(!fake.fed(0).contains("RESTART-NOTE"), "nothing was restored, so nothing to say");
+}
+
+/// No path, no persistence: `kot chat`, and every host that doesn't opt in.
+#[tokio::test]
+async fn no_history_path_keeps_nothing() {
+    let r = rig(vec![text("a")]).await;
+    r.wake("hello");
+    r.until("first", |f, _| f.requests().len() == 1).await;
+    let (_, seen) = r.finish().await;
+    assert!(!seen.lock().unwrap().shown.iter().any(|l| l.contains("restored")));
 }

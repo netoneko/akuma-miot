@@ -109,6 +109,10 @@ read that first, it is kept current and this file does not repeat it.
   `/tx/{hash}` learns "sealed" by asking a reachable peer rather than
   re-deriving it from a synced block (which carries only effects, not
   extrinsics). Diagrams; read before changing `node.rs::route`/`mempool_round`.
+- `docs/GIT_HOME.md` — the requested git home for the litter (a repo the
+  cats push their own branches to, Kirill pulls from): the options, the
+  recommendation, what's still Kirill's call, and `MIOT_CONTEXT`, the shared
+  system-prompt files that tell every cat where the source is. 2026-09-25.
 - `docs/KEY_MANAGEMENT.md` — what one account's key now backs (chain writes,
   every read, the TLS connection itself), the dev-seed footgun in `kot`'s own
   CLI defaults, and the genesis-generation procedure (`deploy.py`/`deploy.sh

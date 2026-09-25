@@ -61,6 +61,11 @@ impl LocalTasks {
         t
     }
 
+    /// The checkpoint epoch this list belongs to — the session it's part of.
+    pub fn epoch(&self) -> u64 {
+        self.epoch
+    }
+
     /// The chain moved to `epoch`: a new session, an empty list.
     pub fn reset(&mut self, epoch: u64) {
         if epoch != self.epoch {

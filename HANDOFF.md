@@ -652,9 +652,19 @@ sora, kuro, and yuki/shiro via `push-kot.sh` + `kotctl`. Not mimi: its guest
 takes TCP on :4444 and never answers the ssh handshake. **yuki and shiro run
 `asleep`** (`kot run --asleep`, `kotctl llm <name> asleep`): no model, every
 DM or `@name` answered `*<name> is currently asleep*` (`no_ack`, and never to a
-`no_ack` message, so two sleeping cats can't talk forever). Their replies sit
-in their own mempool while a home cat leads: the AWS pair still has no route
-home (the router forwards). Patron lists went out with it (kuro, sora, mimi's
+`no_ack` message, so two sleeping cats can't talk forever). Their first reply
+sat in yuki's own mempool while a home cat led, which Kirill rightly
+questioned: home *polls* the AWS pair every second. The mempool only drained
+by its node calling out (`mempool_round`), and yuki can call only shiro. Fixed
+in code, same evening, not yet rolled out: a status answer now carries up to
+16 queued extrinsics (`StatusWire::pending`), the poller submits them through
+the same door as `/submit` (`carry_offered`), and says so on its next poll
+(`carried`), after which the offering node stops offering but keeps asking
+whether it sealed. `tests/mempool.rs`
+`a_node_that_can_call_nobody_gets_its_write_carried_by_whoever_polls_it` —
+negative-controlled: without the carry, the write never lands. The router
+forwards would still make the AWS pair full members; this makes their writes
+work without them. Patron lists went out with it (kuro, sora, mimi's
 config, and `/etc/kot/patrons` on AWS).
 
 **Keys.** `../akuma/target` was cleaned and took `amd64-ssh-test-key` with it,
@@ -662,6 +672,53 @@ which was every way into the metal box and sora's guest. The box takes
 `~/.ssh/id_ed25519` (added to `~/.ssh/config`, old line kept). sora's guest
 got a new deploy key, `~/.akuma/kot/fcguest.ssh-key`, appended to the image's
 `/etc/sshd/authorized_keys` with the VM stopped; `deploy.py` uses it first.
+
+## Why meow kept rebooting, and cats now remember (2026-09-25, night)
+
+meow was burning GLM tokens on a reboot loop. Two causes, both found by
+reading its own files on the box:
+
+1. **No memory across a restart.** A cat's session kept only the checkpoint
+   epoch, the event cursor and `question`; the conversation started empty
+   every time (the transcript is written, never read). Its local task list
+   *did* survive, and held `L16 [doing] reboot -f` — a task that can't be
+   marked done before the reboot that ends the process. So every start found
+   an open reboot, re-explored the repo, and rebooted. **Fixed:** the
+   conversation is saved after every turn to
+   `~/.akuma/kot/<name>.history.<epoch>.json` (epoch-keyed like the session,
+   cleared on a reset, written atomically) and restored at start, with a
+   one-time note: you were restarted, how long ago your last turn was, how
+   long the machine has been up (`/proc/uptime`), check before redoing a
+   build, install or reboot. With nothing to restore, a cat still gets the
+   uptime note (`Host::start_note`). Tests in `tests/agent_state_machine.rs`
+   (restore + note once; reset clears it; no path keeps nothing), the first
+   negative-controlled. Seen live: meow's first thought after the rollout was
+   "My process just restarted", and it checked uptime instead of rebooting.
+2. **It was chasing a line the kernel never prints.** meow's note to itself
+   (`/root/hda-verify-note.txt`) said to reboot and read `dmesg` at once,
+   because the `[HDA]` boot line washes out of the ring. But the line isn't
+   there even a minute after boot: M1's discovery isn't reached, or finds
+   nothing and says nothing. That's M1's bug to fix in `../akuma`, not a
+   reason to reboot. (The BKL dedup does keep the boot banner in the ring for
+   20+ minutes now.)
+
+Also this round: **every cat gets every tool on every wake.** Tools were split
+by wake kind, and a threaded `message` fell into "task", which has no
+`SendMessage`: tama answered a thread by publishing an artifact "because
+SendMessage isn't in my current toolset". Kirill: "just always give them all
+the tools". And the litter all took **root's "leave yourself a task to build
+M2"** as their own — it was a broadcast; a direct message (`/dm meow`) would
+have reached only meow.
+
+**`git push` from the metal box fails on a big pack** (an Akuma kernel bug,
+open): meow's first push to the empty `akuma-litter` died with `send-pack:
+unexpected disconnect while reading sideband packet` / `fatal: close failed
+on standard output: Bad file descriptor` from git's `pack-objects` child. The
+repo was then seeded from the mac with `akuma`'s `main` and `even-more-cats`,
+so a cat's push carries only its own commits. Reads work (`git ls-remote
+litter`, as root with `HOME=/root` — an Akuma ssh session has no `$HOME`,
+which reads as "could not read Username"). Whether a small push survives the
+same bug is what meow's next push will show.
 
 ## Compaction: what a window would cost (measured 2026-09-25)
 

@@ -159,6 +159,11 @@ struct RunArgs {
     llm: LlmArgs,
     #[arg(long, env = "MIOT_PERSONA")]
     persona: Option<String>,
+    /// Extra system-prompt sections after the persona: comma-separated files
+    /// or directories (every *.md, sorted). Shared facts — where the source
+    /// is, what the projects are. docs/GIT_HOME.md §3.
+    #[arg(long, env = "MIOT_CONTEXT", default_value = "")]
+    context: String,
     /// Root: an authorized_keys line, 64-hex account, or dev seed. Genesis.
     #[arg(long, env = "MIOT_ROOT_PUBKEY", default_value = "1")]
     root: String,
@@ -204,6 +209,18 @@ struct ChatArgs {
     llm: LlmArgs,
     #[arg(long, env = "MIOT_PERSONA")]
     persona: Option<String>,
+    /// As `run --context`.
+    #[arg(long, env = "MIOT_CONTEXT", default_value = "")]
+    context: String,
+}
+
+/// The persona plus every `--context` section; each unreadable path said once.
+fn with_context(persona: String, spec: &str, name: &str) -> String {
+    let (extra, problems) = common::load_context(spec);
+    for p in &problems {
+        eprintln!("[{name}] --context: {p} (skipped)");
+    }
+    persona + &extra
 }
 
 /// What a cat thinks with — shared by `run` and `chat`, so a service unit
@@ -357,6 +374,7 @@ async fn run(cli: &Cli, a: &RunArgs) {
                 .as_deref()
                 .and_then(|p| std::fs::read_to_string(expand_home(p)).ok())
                 .unwrap_or_else(|| format!("You are {name}, a cat in the Akuma Miot litter."));
+            let persona = with_context(persona, &a.context, &name);
             let cfg = agent::AgentConfig {
                 name: name.clone(),
                 identity,
@@ -393,6 +411,7 @@ async fn main() {
                 .as_deref()
                 .and_then(|p| std::fs::read_to_string(expand_home(p)).ok())
                 .unwrap_or_else(|| format!("You are {name}, a cat, talking directly to your operator — no task, no chain, just conversation."));
+            let persona = with_context(persona, &a.context, &name);
             chat::run(chat::ChatConfig { name, llm, persona }).await;
         }
         Some(Cmd::Id { comment }) => {

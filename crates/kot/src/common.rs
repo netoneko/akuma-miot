@@ -163,6 +163,45 @@ pub fn expand_home(p: &str) -> PathBuf {
     }
 }
 
+/// Extra system-prompt sections from `--context`/`MIOT_CONTEXT`: a
+/// comma-separated list of files or directories (a directory contributes
+/// every `*.md` in it, sorted by name). Each becomes a `## <file stem>` section,
+/// in the order given. Facts every cat shares — where the source lives, what
+/// the projects are (`docs/GIT_HOME.md` §3) — go here instead of into seven
+/// personas. Returns the text to append after the persona, and one line per
+/// path that couldn't be read: reported, never fatal, so a missing file costs
+/// a section rather than the cat.
+pub fn load_context(spec: &str) -> (String, Vec<String>) {
+    let mut files: Vec<PathBuf> = Vec::new();
+    let mut problems = Vec::new();
+    for p in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        let path = expand_home(p);
+        if path.is_dir() {
+            let mut md: Vec<PathBuf> = std::fs::read_dir(&path)
+                .map(|rd| rd.filter_map(|e| e.ok().map(|e| e.path())).filter(|f| f.extension().is_some_and(|x| x == "md")).collect())
+                .unwrap_or_default();
+            md.sort();
+            if md.is_empty() {
+                problems.push(format!("{}: no *.md in it", path.display()));
+            }
+            files.extend(md);
+        } else {
+            files.push(path);
+        }
+    }
+    let mut out = String::new();
+    for f in files {
+        match std::fs::read_to_string(&f) {
+            Ok(text) => {
+                let title = f.file_stem().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                out.push_str(&format!("\n\n## {title}\n\n{}", text.trim()));
+            }
+            Err(e) => problems.push(format!("{}: {e}", f.display())),
+        }
+    }
+    (out, problems)
+}
+
 /// `MIOT_ROOT_PUBKEY`-style: an `authorized_keys` line, or 64 hex chars (an
 /// `AccountId32`), or a small-int dev seed. Accepting all three in one place
 /// is what lets one flag replace the old `MIOT_ROOT`/`MIOT_ROOT_PUBKEY` pair.
@@ -249,6 +288,31 @@ impl EventCursor {
             self.in_block = 1;
         }
         true
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::load_context;
+
+    #[test]
+    fn files_and_directories_become_sections_in_order_and_gaps_are_reported() {
+        let d = tempfile::tempdir().unwrap();
+        let shared = d.path().join("shared");
+        std::fs::create_dir(&shared).unwrap();
+        std::fs::write(shared.join("b-rules.md"), "no main\n").unwrap();
+        std::fs::write(shared.join("a-projects.md"), "  akuma, akuma-miot  ").unwrap();
+        std::fs::write(shared.join("notes.txt"), "not markdown").unwrap();
+        let one = d.path().join("git.md");
+        std::fs::write(&one, "git.akuma.sh").unwrap();
+        let missing = d.path().join("gone.md");
+        let spec = format!("{}, {} ,{}", one.display(), shared.display(), missing.display());
+
+        let (text, problems) = load_context(&spec);
+        assert_eq!(text, "\n\n## git\n\ngit.akuma.sh\n\n## a-projects\n\nakuma, akuma-miot\n\n## b-rules\n\nno main");
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(problems[0].contains("gone.md"));
+        assert_eq!(load_context(""), (String::new(), vec![]), "unset is nothing at all");
     }
 }
 

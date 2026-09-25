@@ -189,6 +189,29 @@ pub trait Host: Send + Sync + 'static {
     /// The live record changed — a cat sends it to its node. Called often
     /// (every step); coalescing is the host's business.
     fn activity(&self, _a: &Activity) {}
+    /// Where to keep the conversation across a restart of this process.
+    /// `None`: it starts empty every time (`kot chat`). A cat's path carries
+    /// the checkpoint epoch, so a conversation from before the chain moved on
+    /// is never picked back up. Found live 2026-09-25: meow restarted with no
+    /// memory at all, found its own open "reboot -f" task, and rebooted
+    /// again — dozens of times, re-exploring the repo in GLM tokens on each.
+    fn history_path(&self) -> Option<PathBuf> {
+        None
+    }
+    /// Told to the model once, in the first turn after its conversation was
+    /// restored from [`Host::history_path`]: that it was restarted, and
+    /// anything the host knows about why (how long the machine has been up).
+    fn restart_note(&self) -> Option<String> {
+        None
+    }
+    /// Told once, in the first turn, when there was *no* conversation to
+    /// restore: what the host knows about the machine it woke up on. For the
+    /// first start after an upgrade, a wiped history, or a new session — a
+    /// cat's local task list survives those, and an open "reboot" in it must
+    /// not read as still to do.
+    fn start_note(&self) -> Option<String> {
+        None
+    }
     /// Where to append the JSONL transcript — every turn's prompt,
     /// reasoning, text and calls, every result and record in full. `None`:
     /// no transcript.
@@ -393,6 +416,9 @@ struct AgentStateMachine<H: Host> {
     /// Since when we've been continuously idle (no query, no record in
     /// flight) — `None` while working. Drives the local-task nudge.
     idle_since: Option<Instant>,
+    /// Said once, in the next turn: the conversation was restored after a
+    /// restart ([`Host::restart_note`]).
+    restart_note: Option<String>,
     /// Consecutive local-task nudges sent with no query started in between —
     /// bounded by [`MAX_LOCAL_TASK_NUDGES`], reset by [`AgentStateMachine::turn`]
     /// the moment a turn actually starts one.
@@ -448,7 +474,19 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         notices: Vec::new(),
         idle_since: None,
         local_nudges: 0,
+        restart_note: None,
     };
+    if let Some(path) = m.host.history_path() {
+        let restored = load_history(&path);
+        if !restored.is_empty() {
+            m.host.show(ui::note(&format!("restored {} message(s) of conversation from {}", restored.len(), path.display())));
+            m.log(serde_json::json!({"t": "restored", "messages": restored.len()}));
+            m.history = restored;
+            m.restart_note = Some(m.host.restart_note().unwrap_or_else(|| RESTARTED.to_string()));
+        } else {
+            m.restart_note = m.host.start_note();
+        }
+    }
     // Checks running calls for silence, and refreshes their output figures
     // in the live record — and, the same way, catches an idle cat with open
     // local tasks within a quarter of its nag threshold. Never more than
@@ -474,6 +512,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
                 was_idle = false;
                 m.idle_since = None;
                 m.turn(Vec::new(), Vec::new(), true, &mut inbox).await;
+                m.persist();
                 continue;
             }
         }
@@ -561,10 +600,20 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         was_idle = false;
         m.idle_since = None;
         m.turn(wakes, results, false, &mut inbox).await;
+        m.persist();
     }
 }
 
 impl<H: Host> AgentStateMachine<H> {
+    /// The conversation to [`Host::history_path`], if the host keeps one.
+    /// Best effort: a write that fails costs the next restart its memory,
+    /// never this turn.
+    fn persist(&self) {
+        if let Some(path) = self.host.history_path() {
+            save_history(&path, &self.history);
+        }
+    }
+
     /// One inbound item into the batch being assembled. A reset empties the
     /// batch too: wakes and results gathered ahead of it belong to the
     /// session it just ended.
@@ -576,6 +625,8 @@ impl<H: Host> AgentStateMachine<H> {
                 self.log(serde_json::json!({"t": "reset", "why": why}));
                 self.session += 1;
                 self.history.clear();
+                self.restart_note = None;
+                self.persist();
                 self.warned_tier = 0;
                 self.pending_warning = None;
                 self.followups = 0;
@@ -809,6 +860,7 @@ impl<H: Host> AgentStateMachine<H> {
         if !self.notices.is_empty() {
             msg.push(std::mem::take(&mut self.notices).join("\n"));
         }
+        msg.extend(self.restart_note.take());
         msg.extend(self.still_running());
         if check {
             msg.push(CHECK_IN.to_string());
@@ -1268,6 +1320,44 @@ fn pct_used(total_tokens: u32, window: Option<u32>) -> Option<u32> {
 
 /// One extra call, no tools, asking the model to summarize itself — for
 /// force-compaction.
+/// The note a restored conversation gets when the host has nothing better to
+/// say ([`Host::restart_note`]).
+const RESTARTED: &str = "(You were restarted. The conversation above is from before it. \
+    Anything you started then that was still running is gone, and anything that \
+    needed a restart — a reboot, a reinstall — has happened. Check before redoing it.)";
+
+/// `[["user", "…"], ["assistant", "…"]]` — the conversation as JSON. An
+/// unreadable or malformed file is an empty conversation: starting fresh is
+/// what a cat did before this existed, so it's always a safe fallback.
+pub fn load_history(path: &std::path::Path) -> Vec<(Speaker, String)> {
+    let Ok(text) = std::fs::read_to_string(path) else { return Vec::new() };
+    let Ok(rows) = serde_json::from_str::<Vec<(String, String)>>(&text) else { return Vec::new() };
+    rows.into_iter()
+        .filter_map(|(who, said)| match who.as_str() {
+            "user" => Some((Speaker::User, said)),
+            "assistant" => Some((Speaker::Assistant, said)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// [`load_history`]'s inverse, written to a temp file and renamed, so a crash
+/// mid-write leaves the previous conversation rather than half of one.
+pub fn save_history(path: &std::path::Path, history: &[(Speaker, String)]) {
+    let rows: Vec<(&str, &str)> = history
+        .iter()
+        .map(|(who, said)| (if *who == Speaker::User { "user" } else { "assistant" }, said.as_str()))
+        .collect();
+    let Ok(text) = serde_json::to_string(&rows) else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.new");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path);
+    }
+}
+
 async fn summarize(llm: &Llm, system: &str, history: &[(Speaker, String)]) -> String {
     let ask = "Summarize this conversation so far for your own future reference — what was asked, \
                what you found or did, what's still open. Plain text, no tools, as concise as it can \

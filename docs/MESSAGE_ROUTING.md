@@ -151,16 +151,26 @@ that *does* have one, via whatever peers this node's own config lists as
 reachable. Proven for the general case (two peers, one with a route and one
 without, relaying through each other) by `crates/kot/tests/mempool.rs`.
 
-**Doesn't fix:** a node with *zero* reachable peers has nothing to relay
-through, TTL or not — the mechanism needs one working link somewhere in the
-graph, it doesn't conjure one. That's exactly yuki and shiro's situation
-today: every home member is unreachable *to* them, so a write they accept
-just sits queued until it expires, unless AWS itself wins an election in the
-meantime (then `route()` is `Here` and it applies directly, no relay needed).
-Nothing here is a substitute for the router forwards
-(`docs/runbooks/deploy-aws-node.md` §1) — it's what makes a write survive
-*some* asymmetric gaps in the graph, not this specific one, which needs an
-actual route to exist before anything can relay across it.
+**Also fixes, since 2026-09-25 (evening): a node that can call nobody.**
+That was yuki and shiro against a home primary: every home member is
+unreachable *to* them, so a queued write sat until it expired. But reachability
+there only fails one way. Home polls them every second, so the exchange that
+already crosses the gap carries the write back. A status answer includes up to
+16 queued extrinsics (`StatusWire::pending`). The poller submits each one
+through `accept_extrinsic`, the same door as `/submit`, signer check included,
+and names the hashes it took in its next poll (`StatusWire::carried`). The
+offering node then stops offering them, but keeps asking reachable peers
+whether they sealed, because that is what its `/tx/{hash}` answers from.
+Several pollers may all take the same write; the first applies it and the rest
+get a stale nonce, which counts as delivered. Proven by
+`a_node_that_can_call_nobody_gets_its_write_carried_by_whoever_polls_it`
+(`crates/kot/tests/mempool.rs`), and without the carry that test's write never
+lands.
+
+**Still doesn't fix:** the AWS pair being real members. They follow by push,
+they can't pull, and a write *to* them waits one poll interval to leave.
+The router forwards (`docs/runbooks/deploy-aws-node.md` §1) remain the
+real fix. This is what makes writes survive until then.
 
 **Not persisted, not replicated.** Both `Node::mempool` and `Node::tx_status`
 are in-memory and node-local. A restart, a demotion, or a term change loses

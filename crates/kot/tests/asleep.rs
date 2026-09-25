@@ -2,7 +2,7 @@
 //! The loop around this is a poll and a `say`; the rule is what can go wrong
 //! (a reply to every broadcast, or two sleeping cats answering each other).
 
-use kot::agent::{asleep_owes_reply, asleep_reply};
+use kot::agent::{asleep_owes_reply, asleep_reply, wake_kind};
 use serde_json::json;
 
 const ME: &str = "aa";
@@ -45,4 +45,14 @@ fn no_reply_to_itself_to_no_ack_or_to_anything_else() {
     assert_eq!(asleep_owes_reply("yuki", ME, &task, Some(ME)), None, "work is ignored, not answered");
     let dm_elsewhere = said(ROOT, Some("cc"), "for someone else", false);
     assert_eq!(asleep_owes_reply("yuki", ME, &dm_elsewhere, Some("cc")), None);
+}
+
+/// Not about sleeping, but the same "who's talking to me" question: a threaded
+/// message is a conversation, so it gets the tools a reply needs.
+#[test]
+fn a_thread_message_gets_the_chat_tools_like_a_said() {
+    assert_eq!(wake_kind("said"), "said");
+    assert_eq!(wake_kind("message"), "said", "tama had no SendMessage for a thread reply");
+    assert_eq!(wake_kind("assigned"), "task");
+    assert_eq!(wake_kind("nudge"), "task");
 }

@@ -197,3 +197,53 @@ async fn a_node_with_no_route_to_the_primary_relays_through_a_peer_it_can_reach(
     beta.abort();
     gamma.abort();
 }
+
+/// The AWS pair as it really is: the node with the write can call **nobody**
+/// (its only peer is on the same side of the NAT, here a dead address), and
+/// no one pushes a mempool. Before, the write sat there until it expired.
+/// Now the peers polling it take it off its hands (`StatusWire::pending`),
+/// submit it, and say so on the next poll (`carried`), which empties its
+/// queue.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_node_that_can_call_nobody_gets_its_write_carried_by_whoever_polls_it() {
+    let http = trusted_client();
+    let root = Identity::from_seed(&[1; 32]);
+    let dir_a = tempfile::tempdir().unwrap();
+    let dir_b = tempfile::tempdir().unwrap();
+    let dir_g = tempfile::tempdir().unwrap();
+    let (port_a, port_b, port_g) = (free_port(), free_port(), free_port());
+    let alpha = node::start(cfg(1, "alpha", port_a, vec![url(port_b), url(port_g)], dir_a.path().join("db"))).await.unwrap();
+    let beta = node::start(cfg(2, "beta", port_b, vec![url(port_a), url(port_g)], dir_b.path().join("db"))).await.unwrap();
+    primary(&[&alpha, &beta], Duration::from_secs(10)).await;
+    let gamma = node::start(cfg(3, "gamma", port_g, vec![url(free_port())], dir_g.path().join("db"))).await.unwrap();
+    let gamma_url = url(port_g);
+    tokio::time::sleep(Duration::from_millis(800)).await;
+
+    let m = meta(&http, &gamma_url, &root).await;
+    let n = nonce(&http, &gamma_url, &root).await;
+    let call = RuntimeCall::Litter(pallet_litter::Call::open { text: "carried off gamma".into() });
+    let uxt = client::sign(&root, call, n, &m);
+    let r = http.post(format!("{gamma_url}/submit")).body(uxt.encode()).send().await.unwrap();
+    let body: serde_json::Value = r.json().await.unwrap();
+    assert_eq!(body["status"], "pending", "gamma can't forward, so it queues: {body:?}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let (a, g) = (task_texts(&http, &url(port_a), &root).await, task_texts(&http, &gamma_url, &root).await);
+        if a.contains(&"carried off gamma".to_string()) && g.contains(&"carried off gamma".to_string()) {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < deadline, "never carried: alpha={a:?} gamma={g:?}");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    // And gamma stops offering it once a carrier says it has it.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while gamma.shared.lock().await.mempool_offered() != 0 {
+        assert!(tokio::time::Instant::now() < deadline, "gamma kept offering the carried write");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    alpha.abort();
+    beta.abort();
+    gamma.abort();
+}

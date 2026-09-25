@@ -506,7 +506,7 @@ impl Cat {
             }
             _ => return None,
         };
-        Some((p, if t == "said" { "said" } else { "task" }))
+        Some((p, wake_kind(t)))
     }
 
     /// A node-backed read — a query in `agent_state_machine`'s terms: it runs on its own
@@ -844,8 +844,14 @@ impl Host for CatHost {
     fn name(&self) -> &str {
         &self.0.name
     }
-    fn tools(&self, kind: &'static str) -> Vec<miot_llm::Tool> {
-        let mut t = if kind == "said" { miot_llm::chat_tools() } else { task_tools() };
+    /// Every tool, whatever woke it (Kirill, 2026-09-25: "just always give
+    /// them all the tools"). Splitting them by wake kind kept a cat from
+    /// doing the obvious thing: answering a thread without `SendMessage`
+    /// (tama), or touching a task from a chat. The task set already carries
+    /// the local and note tools, so the union is it plus `SendMessage`.
+    fn tools(&self, _kind: &'static str) -> Vec<miot_llm::Tool> {
+        let mut t = vec![miot_llm::send_message_tool()];
+        t.extend(task_tools());
         t.push(miot_llm::local_task_tool());
         t
     }
@@ -883,6 +889,42 @@ impl Host for CatHost {
 
     fn reminder(&self) -> Option<String> {
         self.0.local.lock().unwrap().reminder()
+    }
+
+    /// `~/.akuma/kot/<name>.history.<epoch>.json`: the conversation, so a
+    /// restart (a crash, a redeploy, the reboot a kernel build ends in) picks
+    /// up where the cat was. The epoch is the session's: after a checkpoint
+    /// moves, the old file is simply never looked for again.
+    fn history_path(&self) -> Option<PathBuf> {
+        let epoch = self.0.local.lock().unwrap().epoch();
+        Some(kot_dir().join(format!("{}.history.{epoch}.json", self.0.name)))
+    }
+
+    fn restart_note(&self) -> Option<String> {
+        let up = uptime_note();
+        let last = self
+            .history_path()
+            .and_then(|p| std::fs::metadata(p).ok())
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.elapsed().ok())
+            .map(|d| format!(" Your last turn before the restart was {} ago.", human_secs(d.as_secs())))
+            .unwrap_or_default();
+        Some(format!(
+            "(You were restarted: your process started again, and the conversation above is from before that.{last}{up} \
+             Anything that was still running is gone. Check where things stand before redoing anything — \
+             especially a build, an install or a reboot.)"
+        ))
+    }
+
+    fn start_note(&self) -> Option<String> {
+        let up = uptime_note();
+        (!up.is_empty()).then(|| {
+            format!(
+                "(Your process just started, with no conversation from before it.{up} \
+                 Your local task list may still show work from before: check where things \
+                 stand before redoing anything — especially a build, an install or a reboot.)"
+            )
+        })
     }
 
     /// `~/.akuma/kot/<name>.transcript.jsonl` — next to the session file.
@@ -993,6 +1035,38 @@ fn new_cat(name: &str, identity: Identity, node: String, roster: Roster) -> Arc<
         activity: tokio::sync::watch::channel(None).0,
         local: std::sync::Mutex::new(LocalTasks::default()),
     })
+}
+
+/// " This machine has been up 12m — …", from `/proc/uptime` (Linux and Akuma
+/// both have it); empty where it can't be read.
+fn uptime_note() -> String {
+    std::fs::read_to_string("/proc/uptime")
+        .ok()
+        .and_then(|s| s.split_whitespace().next().and_then(|x| x.parse::<f64>().ok()))
+        .map(|secs| format!(" This machine has been up {} — if a reboot was the last thing you did, it happened.", human_secs(secs as u64)))
+        .unwrap_or_default()
+}
+
+/// `75s`, `12m`, `3h05m` — for a note a model reads.
+fn human_secs(s: u64) -> String {
+    match s {
+        0..=119 => format!("{s}s"),
+        120..=7199 => format!("{}m", s / 60),
+        _ => format!("{}h{:02}m", s / 3600, (s % 3600) / 60),
+    }
+}
+
+/// Which tool set a wake gets (`CatHost::tools`): someone talking to the cat
+/// gets the chat tools, `SendMessage` among them; anything else gets the task
+/// tools. A threaded `message` (`post`) is someone talking, just as a `said`
+/// is. It used to fall through to "task", which has no `SendMessage` — found
+/// live 2026-09-25, tama answering a thread by publishing an artifact, "because
+/// SendMessage isn't in my current toolset".
+pub fn wake_kind(effect_type: &str) -> &'static str {
+    match effect_type {
+        "said" | "message" => "said",
+        _ => "task",
+    }
 }
 
 /// The reply an asleep cat sends — see [`run_asleep`].

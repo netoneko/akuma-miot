@@ -209,8 +209,9 @@ def route(frm: str, to: str) -> str:
 
 
 # ---- transports ---------------------------------------------------------------
-def on(a: Agent, cmd: str) -> str:
-    """Run `cmd` as root on `a`'s host over its shape's transport, return stdout."""
+def on(a: Agent, cmd: str, stdin: str | None = None) -> str:
+    """Run `cmd` as root on `a`'s host over its shape's transport, return stdout.
+    `stdin`, if given, is fed to it: how a secret travels (see `put_secret`)."""
     if a.shape == "akuma":
         argv = ["ssh", "-o", "BatchMode=yes", "akuma", cmd]
         # Generous, same reason as fcguest below: measured live 2026-09-25,
@@ -252,9 +253,9 @@ def on(a: Agent, cmd: str) -> str:
         die(f"{a.name}: shape {a.shape} not deployable yet")
 
     if DRY_RUN:
-        say(f"[dry-run] on {a.name}: {cmd}")
+        say(f"[dry-run] on {a.name}: {cmd}" + (" (+stdin)" if stdin is not None else ""))
         return ""
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout)
+    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=stdin)
     if r.returncode != 0:
         die(f"{a.name}: {' '.join(argv[:2])}...: {cmd!r} failed (exit {r.returncode}): {r.stderr.strip() or r.stdout.strip()}")
     return r.stdout
@@ -340,6 +341,51 @@ def ship_binary(a: Agent) -> None:
     on(a, "chmod 755 /root/kot/bin/kot")
     persona = ROOT / "crates/kot/personas" / f"{a.persona}.md"
     put(a, persona, "/root/kot/persona.md")
+    ship_context(a)
+    ship_github_token(a)
+
+
+# Shared system-prompt sections every cat reads after its persona
+# (`kot run --context`, docs/GIT_HOME.md §3): where the code is, where to push.
+CONTEXT_DIR = ROOT / "overlays/deploy/context"
+
+
+def ship_context(a: Agent) -> None:
+    """`overlays/deploy/context/*.md` to `/root/kot/context/`, replacing what
+    was there, so a file removed here stops being read there. `env_for` points
+    `MIOT_CONTEXT` at the directory."""
+    on(a, "rm -rf /root/kot/context && mkdir -p /root/kot/context")
+    for f in sorted(CONTEXT_DIR.glob("*.md")):
+        put(a, f, f"/root/kot/context/{f.name}")
+
+
+def put_secret(a: Agent, content: str, dst: str) -> None:
+    """A small secret to `dst` (mode 600) over the shape's own ssh/limactl
+    channel, as stdin. Never `put`: for the Akuma shapes that serves the file
+    over plain HTTP on the LAN while the box fetches it. A secret is far under
+    the 1 MiB an ssh exec channel stalls at (HANDOFF traps)."""
+    on(a, f"umask 077; cat > {dst}.new && mv {dst}.new {dst} && chmod 600 {dst}", stdin=content)
+
+
+def ship_github_token(a: Agent) -> None:
+    """This cat's GitHub access, if it has any: `~/.akuma/kot/<persona>.github_token`
+    on the mac, a fine-grained token scoped to `netoneko/akuma-litter` alone
+    (docs/GIT_HOME.md). Installed as the root user's git credential store,
+    commits signed off as `<persona> <<persona>@akuma.sh>`. No token, nothing
+    changes — a cat without one simply can't push."""
+    token_file = Path.home() / ".akuma/kot" / f"{a.persona}.github_token"
+    if not token_file.exists():
+        return
+    # sora's guest (an Akuma image) has no git at all: nothing to configure,
+    # and a token there would be a credential with no use. Say so and move on.
+    if not DRY_RUN and on(a, "command -v git >/dev/null 2>&1 && echo yes || echo no").strip() != "yes":
+        say(f"{a.name}: no git on this host — {token_file.name} not installed")
+        return
+    token = token_file.read_text().strip()
+    put_secret(a, f"https://{a.persona}:{token}@github.com\n", "/root/.git-credentials")
+    on(a, "HOME=/root git config --global credential.helper store")
+    on(a, f"HOME=/root git config --global user.name {a.persona}")
+    on(a, f"HOME=/root git config --global user.email {a.persona}@akuma.sh")
 
 
 def account_of(a: Agent) -> str:
@@ -437,11 +483,15 @@ def env_for(name: str) -> str:
 
     lines = [
         f"MIOT_NAME={a.name}",
+        # git (the cat's `Bash`) finds its credential store and identity
+        # through $HOME, which neither a root systemd unit nor herd sets.
+        "HOME=/root",
         "MIOT_PORT=9944",
         "MIOT_DB=/root/kot/db/kot.db",
         f"MIOT_PEERS={peers}",
         "MIOT_SEED_FILE=/root/kot/id_ed25519.seed",
         "MIOT_PERSONA=/root/kot/persona.md",
+        "MIOT_CONTEXT=/root/kot/context",
         f"MIOT_MODEL={a.model}",
     ]
     if a.llm == "glm":
