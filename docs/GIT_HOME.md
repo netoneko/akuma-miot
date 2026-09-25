@@ -18,8 +18,16 @@
   identity to `<cat> <<cat>@akuma.sh>`. Deploy keys were tried first and
   dropped: Akuma's own `ssh` wants a raw 32-byte key and stops at an
   interactive host-key prompt, where HTTPS git just works on the metal box.
-- **Still to do:** the tokens (Kirill), a rollout, `overlays/deploy/context/
-  projects.md` (§3), and a `litter` remote in each cat's working checkout.
+- **Done by the end of 2026-09-25:** tokens for meow, tama, kuro and sora
+  (sora's guest has no git, so its token isn't installed); deployed as
+  `/root/.git-credentials`; `overlays/deploy/context/projects.md` and
+  `00-teahouse.md` live on every home cat via `MIOT_CONTEXT`; meow added the
+  `litter` remote itself. The repo is seeded with `akuma`'s `main` and
+  `even-more-cats` from the mac, because the first push from the metal box —
+  the whole history — died inside git with EBADF (an Akuma bug), and a seeded
+  repo makes a cat's push only its own commits.
+- **Still to do:** a first successful push from a cat, and the tokens'
+  expiry (whatever Kirill chose) remembered before it bites.
 
 The original status, before the decision: requested, not built; §3's
 mechanism (`MIOT_CONTEXT`) built and waiting on the repo's address.

@@ -253,6 +253,51 @@ nspawn containers. Every link is mTLS.
 Not shown: all seven on the same build at the same moment. meow was powered
 off overnight, and mimi and sora were down when the last rollout landed.
 
+## Crashes, a kernel fix, and cats that remember (2026-09-25)
+
+What ran, with the numbers that settled each question. The story is in
+HANDOFF's 2026-09-25 sections.
+
+- **kot on the metal box died 7 times in ~45 min** (16:09–16:55 UTC, counted
+  from the transcript's `start` records), each while starting a `Bash` tool
+  call. Captured in `dmesg` by polling every 8 s: `tokio … state.rs:120
+  assertion failed: next.is_notified()` → SIGABRT (herd: code 134), or a
+  ring-3 write to `cr2=0x8` → SIGSEGV (code 139), two of them on the same
+  `cr3=0x609b4000`.
+- **Reproducer, no LLM:** 4 tokio workers spawning `/bin/sh -c` as the `Bash`
+  tool does. Old kernel (`4b97af7e`): a worker thread vanished silently and the
+  process wedged at **19,250 spawns** (~2 min). Fixed kernel (`90af5e2c`, one
+  all-cores TLB flush in the amd64 CoW break): **21,507 spawns in 180 s,
+  clean**, 0 faults, 0 signal kills. The kernel self-test on the boot after
+  meow's next build: **751 passed, 0 failed** (it had been 748/3).
+- **`[BKL] stuck` spam:** before, the 64 KiB `dmesg` ring held ~16 s; after
+  deduplicating per stuck hold, the boot banner was still in it 23 min later.
+- **GLM reasoning effort** (coding endpoint, glm-5.3, one two-sentence Rust
+  question): provider default 520 reasoning tokens / 12.9 s; `medium` 128 /
+  6.7 s; `low` 33 / 4.2 s. A trivial question: 101 at default, 0 at `low`. Now
+  the default. A live DM turn at `low`: 5.2 s, 55 output tokens.
+- **meow's restarts:** 39 kot starts in its transcript over its life, and a
+  reboot loop on the metal box. Cause: no conversation survived a restart,
+  and an open `reboot -f` local task did. After conversation persistence
+  (2026-09-25 night), meow's first thought on a restart was "My process just
+  restarted" and it checked uptime instead of rebooting.
+- **Feature delivery, end to end:** M0 (a PCI audio predicate) went code →
+  commit (`meow <meow@akuma.sh>`) → kbuild on the box (2m25s) → install →
+  boot. M1 (HDA discovery) built and booted three times with no `[HDA]` line:
+  the call is wired only into the QEMU/Firecracker boot path (`main.rs`), and
+  the trashcan boots through `multiboot2.rs`. meow's boot-time capture service
+  (its own idea) showed the controller in the census, `00:1b.0 8086:8c20
+  bar0=0xf7210000`, and no discovery line. At the end of the day meow had
+  found the cause after root asked it to check; the fix was not yet in.
+- **Rollout:** `c614703` / `10d5136` builds on meow, tama, sora, kuro,
+  yuki, shiro; mimi's guest never answered ssh (TCP on :4444 accepted, no
+  handshake). All six live at one head (28056), elections terms 29 → 32.
+
+Not shown: a cat's push to `akuma-litter` from the metal box. It failed inside
+git (`pack-objects`: `close failed on standard output: Bad file descriptor`)
+on the first, whole-history push; after seeding the repo from the mac, the
+small push hadn't been retried yet.
+
 ## Honest gaps
 
 - **No signatures yet.** The live loop calls `RuntimeOrigin::signed(x)`

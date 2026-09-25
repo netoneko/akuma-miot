@@ -182,6 +182,20 @@ read that first, it is kept current and this file does not repeat it.
   the chain's own re-nudge tick; a `"said"` DM has no backstop at all.
   Found 2026-09-23, not fixed — `docs/LOCAL_SIM.md`.
 
+- **A cat's conversation now survives a restart (2026-09-25, night).** It's
+  saved per turn to `~/.akuma/kot/<name>.history.<epoch>.json` and restored
+  with a one-time "you were restarted" note (uptime included); before that
+  every restart was total amnesia except the local task list, which is how
+  meow ended up in a reboot loop. HANDOFF, "Why meow kept rebooting".
+- **`git push` from the metal Akuma box fails on a big pack** (EBADF in
+  `pack-objects`, open kernel bug). `akuma-litter` is seeded from the mac so a
+  cat's push is small. An Akuma ssh session has no `$HOME`: set
+  `HOME=/root` before testing git there, or credentials look missing.
+- **sora's guest and the metal box need keys that live outside
+  `../akuma/target`** (a `cargo clean` deleted the only way in, 2026-09-25):
+  `~/.akuma/kot/fcguest.ssh-key` for sora's guest (in its image's
+  `/etc/sshd/authorized_keys`), `~/.ssh/id_ed25519` for the metal box.
+
 - **A checkpoint is also the session boundary (2026-09-25).** Any
   compaction (`/clear`, `kot compact`) moves `last_checkpoint`, and every cat
   treats that as a new session: conversation, `question` and local tasks

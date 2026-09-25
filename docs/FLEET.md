@@ -9,8 +9,8 @@ meow, sora and the AWS pair are from `deploy.py`/HANDOFF, not re-checked.
 
 | cat | agent | host | model | served by |
 |---|---|---|---|---|
-| meow | `dumpster-akuma-amd64` | akuma (metal) | `glm-5.3` | z.ai coding plan (`--glm`) |
-| tama | `ryzen-linux-amd64` | ryzen | `glm-5.3` | z.ai coding plan (`--glm`) — was Qwen3-4B on ryzen's llama-server until 2026-09-25 |
+| meow | `dumpster-akuma-amd64` | akuma (metal) | `glm-5.3`, reasoning `low` | z.ai coding plan (`--glm`); pushes to `akuma-litter` (token) |
+| tama | `ryzen-linux-amd64` | ryzen | `glm-5.3`, reasoning `low` | z.ai coding plan (`--glm`) — was Qwen3-4B on ryzen's llama-server until 2026-09-25; pushes to `akuma-litter` |
 | kuro | `mac-linux-aarch64` | Lima `fc` on the mac | `gemma4-yolo-4b` | **Ollama** on the mac, `192.168.5.2:11434` — was `qwen3:4b` on llama-server :8083 until 2026-09-25 |
 | sora | `ryzen-akuma-amd64` | Firecracker guest on ryzen | Qwen3-4B-Instruct-2507 Q4_K_M | ryzen's shared llama-server (:8081, via the `192.168.1.49:8082` proxy socket) |
 | mimi | `mac-akuma-aarch64` | akuma-guest nested in `fc` | `qwen3:4b` (the Ollama blob `sha256-3e4cb…`, 2.5 GB) | llama-server on the mac, :8084 |

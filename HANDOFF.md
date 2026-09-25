@@ -1,6 +1,6 @@
 # Handoff
 
-State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
+**Latest: 2026-09-25, late night** — read the 2026-09-25 sections first: a kernel CoW bug that killed meow's kot, fixed; followers renamed *patrons*; GLM reasoning `low`; yuki/shiro asleep; writes carried off nodes that can call nobody; conversations that survive a restart; every tool on every wake; `akuma-litter` as the cats' git drop box; `MIOT_CONTEXT`. Older framing, kept: State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
@@ -337,7 +337,7 @@ an empty answer is erased from history); results are fed head and tail;
 was started by the node that wanted something: a follower GETs
 `/mesh/status` and `/chain/*`, a candidate POSTs `/mesh/vote`, and the
 primary never calls anyone. yuki and shiro reach home only through
-87.71.28.157:9944-9948, whose router forwards were probably never set up
+<private ip>:9944-9948, whose router forwards were probably never set up
 (closed from AWS on all five, including tama's unchanged address). Home
 could call *them* the whole time, but a status GET teaches the callee
 nothing, and a vote request says "I'm running", not "I won". So whenever a
@@ -1150,6 +1150,37 @@ Cheapest tests to separate the two:
    smaller log), and see whether the failure point moves.
 
 ## Next, in order
+
+**Open after 2026-09-25**, most pressing first:
+
+- **meow's M1:** `hda::init()` goes into `amd64/src/multiboot2.rs` after
+  `xhci::quiesce_all()` (the trashcan's boot path; it's only in `main.rs`'s
+  `if have_pci` today). meow found this itself at day's end. Then its boot
+  capture should show `[HDA] 8086:8c20 bar0=0xf7210000 version=…`, and the
+  first push of `cats/meow/amd64-audio` to `akuma-litter` is the test of
+  whether a small push survives the box's git EBADF bug.
+- **Archive before any compaction.** A `/clear` or `kot compact` throws away
+  every block since checkpoint 25498 except the end state, and cats'
+  reasoning lives only in their transcripts. Kirill wants a timeline built
+  from this chain: export `kot log` and each cat's transcript somewhere
+  durable first.
+- **mimi's guest** (Firecracker nested in `fc`): TCP on :4444, no ssh
+  handshake, all day. Left alone — another agent owns its kernel side.
+- **The AWS router forwards** (`docs/runbooks/deploy-aws-node.md` §1): the
+  poll-carry makes yuki/shiro's writes land, but they're still followers by
+  push only.
+- **neobeav as a patron** needs a key `kot` can sign with (a kot seed), or
+  `kot id` learning to read/write OpenSSH ed25519 keys, which would also let
+  a cat's git identity be its chain identity.
+- **Git on Akuma:** `pack-objects` dies with EBADF on a large pipe write
+  (~26 MB, meow's own measurement). A kernel bug to chase in `../akuma`.
+- **Box hygiene:** `sync` (x86_64 162) is ENOSYS; the `[unregister] stale
+  tid` guard fires hundreds of times under spawn load (defended, noisy).
+- **GitHub tokens** for meow/tama/kuro/sora expire on whatever date Kirill
+  chose; a cat's push fails quietly after that until a new one is deployed.
+
+**Older items, as they were:**
+
 
 0a. **A session id apart from the checkpoint, then automatic compaction**
    (2026-09-25; measured above, "Compaction: what a window would cost").
