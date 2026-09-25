@@ -479,3 +479,122 @@ fn stats_variants_keep_their_indices() {
     assert_eq!(old[0], 13, "StatsReported must stay variant 13 (as committed before StatsReported2) — it's in every block on disk");
     assert_eq!(new[0], 14);
 }
+
+// ── messaging: votes, comments, epochs ──────────────────────────────────
+
+use miot_primitives::{ArtifactId, MessageId};
+
+/// One voter, one side: voting the other way moves them, repeating their
+/// own side withdraws.
+#[test]
+fn votes_toggle_and_move() {
+    let art = ArtifactId::Note(7);
+    new_test_ext().execute_with(|| {
+        assert_ok!(Litter::vote(RuntimeOrigin::signed(TAMA), art, true));
+        assert_ok!(Litter::vote(RuntimeOrigin::signed(KURO), art, true));
+        assert_eq!(Litter::tally(art).up, vec![TAMA, KURO]);
+        // TAMA changes their mind — moved, not doubled.
+        assert_ok!(Litter::vote(RuntimeOrigin::signed(TAMA), art, false));
+        assert_eq!(Litter::tally(art).up, vec![KURO]);
+        assert_eq!(Litter::tally(art).down, vec![TAMA]);
+        // KURO repeats their own side — a withdrawal.
+        assert_ok!(Litter::vote(RuntimeOrigin::signed(KURO), art, true));
+        assert!(Litter::tally(art).up.is_empty());
+        // The effect rode along, so a replica folds to the same place.
+        let fx = effects();
+        assert_eq!(fx.iter().filter(|e| matches!(e, Effect::Voted { .. })).count(), 4, "{fx:?}");
+    });
+}
+
+/// A comment on an artifact lands in that artifact's thread — chain
+/// storage, keyed by the current epoch — and `replay_effect` folds it the
+/// same way, so a replica's thread matches the producer's.
+#[test]
+fn artifact_comments_pack_under_the_artifact_and_replay() {
+    let art = ArtifactId::Task(TaskId::parent(1));
+    new_test_ext().execute_with(|| {
+        assert_ok!(Litter::post(
+            RuntimeOrigin::signed(TAMA),
+            MessageId(0xdead_beef),
+            None,
+            "the conclusion section overstates this".into(),
+            None,
+            Some(art),
+            vec![],
+            false,
+            false,
+        ));
+        let thread = Litter::comments(art);
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0].who, TAMA);
+        assert_eq!(thread[0].body, "the conclusion section overstates this");
+        // Replicas fold the effect, not the call.
+        let fx = effects();
+        Litter::replay_effect(&fx.last().unwrap().clone(), 1);
+        assert_eq!(Litter::comments(art).len(), 2, "replay must land in the same thread");
+    });
+}
+
+/// Each epoch gains its own comment *section* — stamped on the entry, not
+/// used as a key, so the whole thread stays one storage read and nothing
+/// is lost at a boundary (`docs/MESSAGING.md`).
+#[test]
+fn compaction_opens_a_fresh_comment_section() {
+    let art = ArtifactId::Note(3);
+    new_test_ext().execute_with(|| {
+        assert_ok!(Litter::post(
+            RuntimeOrigin::signed(TAMA),
+            MessageId(1),
+            None,
+            "epoch 0 note".into(),
+            None,
+            Some(art),
+            vec![],
+            false,
+            false,
+        ));
+        assert_eq!(Litter::epoch(), 0);
+        assert_eq!(Litter::comments(art).len(), 1);
+        // `request_compaction` is the operator's epoch boundary.
+        assert_ok!(Litter::request_compaction(RuntimeOrigin::signed(ROOT)));
+        assert_eq!(Litter::epoch(), 1);
+        assert_ok!(Litter::post(
+            RuntimeOrigin::signed(KURO),
+            MessageId(2),
+            None,
+            "epoch 1 note".into(),
+            None,
+            Some(art),
+            vec![],
+            false,
+            false,
+        ));
+        // Both survive, each stamped with its session.
+        let thread = Litter::comments(art);
+        assert_eq!(thread.iter().map(|c| c.epoch).collect::<Vec<_>>(), [0, 1]);
+        assert_eq!(thread.last().unwrap().body, "epoch 1 note");
+        // `clear_all` is the other boundary.
+        assert_ok!(Litter::clear_all(RuntimeOrigin::signed(ROOT)));
+        assert_eq!(Litter::epoch(), 2);
+        // Non-root cannot turn the epoch.
+        assert_noop!(
+            Litter::request_compaction(RuntimeOrigin::signed(TAMA)),
+            Error::<Test>::NotAuthorized
+        );
+    });
+}
+
+/// Same claim as `stats_variants_keep_their_indices`, for the messaging
+/// variants: appended, never spliced.
+#[test]
+fn messaging_variants_are_appended_in_order() {
+    use codec::Encode;
+    let said = Effect::<u64>::Said { from: 1, to: None, body: String::new(), from_root: false, no_ack: false, off_record: false }.encode();
+    assert_eq!(said[0], 3, "Said must stay variant 3 — it's in every block on disk");
+    let message = Effect::<u64>::Message { id: MessageId(0), from: 1, to: None, body: String::new(), parent: None, artifact_id: None, tags: vec![], from_root: false, no_ack: false, off_record: false }.encode();
+    let reacted = Effect::<u64>::Reacted { who: 1, target: MessageId(0), emoji: String::new() }.encode();
+    let voted = Effect::<u64>::Voted { who: 1, artifact: ArtifactId::Note(0), up: true }.encode();
+    assert_eq!(message[0], 15);
+    assert_eq!(reacted[0], 16);
+    assert_eq!(voted[0], 17);
+}

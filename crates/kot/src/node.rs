@@ -2274,30 +2274,34 @@ fn tally_json(v: &pallet_litter::Tally<AccountId>) -> serde_json::Value {
     serde_json::json!({"up": hexes(&v.up), "down": hexes(&v.down)})
 }
 
-/// The current epoch's comment thread under an artifact, as wire JSON —
-/// who/when/body, names resolved by the client. Only this epoch's section:
-/// each epoch naturally gains its own (`docs/MESSAGING.md`).
-fn comments_json(n: &mut Node, a: miot_primitives::ArtifactId) -> serde_json::Value {
+/// An artifact's comment thread, as wire JSON — who/when/epoch/body, names
+/// resolved by the client. The whole thread comes back in one read (the
+/// epoch is stamped on each comment, not used as a key); `epoch` filters
+/// the view to one session, default is everything.
+fn comments_json(n: &mut Node, a: miot_primitives::ArtifactId, epoch: Option<u32>) -> serde_json::Value {
     serde_json::Value::Array(
         n.ext
             .execute_with(|| Litter::comments(a))
             .into_iter()
-            .map(|c| serde_json::json!({"who": miot_keys::to_hex(&c.who), "at": c.at, "body": c.body}))
+            .filter(|c| epoch.is_none_or(|e| c.epoch == e))
+            .map(|c| serde_json::json!({"who": miot_keys::to_hex(&c.who), "at": c.at, "epoch": c.epoch, "body": c.body}))
             .collect(),
     )
 }
 
-async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, Query(query): Query<std::collections::HashMap<String, String>>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
     }
     let task = parse_task(&id).map(miot_primitives::ArtifactId::Task);
-    let cm = task.as_ref().map(|aid| comments_json(&mut n, *aid));
-    let a = task.and_then(|t| {
+    let epoch: Option<u32> = query.get("epoch").and_then(|e| e.parse().ok());
+    let cm = task.as_ref().map(|aid| comments_json(&mut n, *aid, epoch));
+    let a = task.and_then(|aid| {
+        let miot_primitives::ArtifactId::Task(t) = aid else { unreachable!() };
         n.ext.execute_with(|| {
             let a = Litter::artifact(t)?;
-            let v = Litter::tally(t);
+            let v = Litter::tally(aid);
             Some((a, v))
         })
     });
@@ -2311,13 +2315,14 @@ async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: 
 /// A standalone artifact — [`Effect::StandaloneArtifact`], no task behind it.
 /// `id` is its own counter, never a `TaskId`, so this is a separate route
 /// from `/artifact`.
-async fn standalone_artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: HeaderMap) -> Response {
+async fn standalone_artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, Query(query): Query<std::collections::HashMap<String, String>>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
     }
     let note = id.parse::<u32>().ok().map(miot_primitives::ArtifactId::Note);
-    let cm = note.as_ref().map(|aid| comments_json(&mut n, *aid));
+    let epoch: Option<u32> = query.get("epoch").and_then(|e| e.parse().ok());
+    let cm = note.as_ref().map(|aid| comments_json(&mut n, *aid, epoch));
     let a = note.and_then(|aid| {
         let miot_primitives::ArtifactId::Note(id) = aid else { unreachable!() };
         n.ext.execute_with(|| {

@@ -431,13 +431,19 @@ pub struct MessageId(pub u64);
 
 impl MessageId {
     /// Parse the 8-hex-digit short form (with or without a `#`/`0x`), or a
-    /// decimal — however a human copied it out of a UI.
+    /// decimal — however a human copied it out of a UI. Digits-only input
+    /// reads as decimal; anything with hex letters reads as hex.
     pub fn parse(s: &str) -> Option<Self> {
         let s = s.trim().trim_start_matches(['#', '0', 'x']).trim_start_matches("x");
-        u64::from_str_radix(s, 16)
-            .or_else(|_| s.parse())
-            .ok()
-            .map(MessageId)
+        if s.is_empty() {
+            return None;
+        }
+        let v = if s.chars().all(|c| c.is_ascii_digit()) {
+            s.parse().ok()?
+        } else {
+            u64::from_str_radix(s, 16).ok()?
+        };
+        Some(MessageId(v))
     }
 }
 
@@ -769,3 +775,22 @@ mod tests {
         assert_eq!(t, "aaaaaaaa");
     }
 }
+    #[test]
+    fn message_and_artifact_ids_parse_as_they_render() {
+        // MessageId renders 8 hex digits; parse takes that, decimal, and
+        // the decorated forms a human copies out of a UI.
+        let id = MessageId(0x9f2c_1ab0);
+        assert_eq!(alloc::format!("{id}"), "9f2c1ab0");
+        assert_eq!(MessageId::parse("9f2c1ab0"), Some(id));
+        assert_eq!(MessageId::parse("#9f2c1ab0"), Some(id));
+        assert_eq!(MessageId::parse("0x9f2c1ab0"), Some(id));
+        assert_eq!(MessageId::parse("2670467760"), Some(id));
+        assert_eq!(MessageId::parse("nope"), None);
+        // ArtifactId round-trips through the same strings /artifacts shows.
+        assert_eq!(ArtifactId::parse("t5"), Some(ArtifactId::Task(TaskId::parent(5))));
+        assert_eq!(ArtifactId::parse("T5.1"), Some(ArtifactId::Task(TaskId::sub(5, 1))));
+        assert_eq!(ArtifactId::parse("7"), Some(ArtifactId::Note(7)));
+        assert_eq!(alloc::format!("{}", ArtifactId::parse("t5").unwrap()), "t5");
+        assert_eq!(alloc::format!("{}", ArtifactId::parse("7").unwrap()), "7");
+        assert_eq!(ArtifactId::parse("t"), None);
+    }

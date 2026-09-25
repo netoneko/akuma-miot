@@ -362,8 +362,10 @@ impl Client {
         }
     }
 
-    /// Votes and the current epoch's comments, under an artifact body —
-    /// the shared tail of `print_artifact`/`print_note`.
+    /// Votes and the comment thread, under an artifact body — the shared
+    /// tail of `print_artifact`/`print_note`. Comments are grouped by the
+    /// epoch they were made in: each session gets its own section, but
+    /// nothing is ever dropped — older sections read back in full.
     fn print_feedback(&self, a: &serde_json::Value) {
         let (ups, downs) = (
             a["votes"]["up"].as_array().map(Vec::len).unwrap_or(0),
@@ -372,10 +374,16 @@ impl Client {
         if ups + downs > 0 {
             println!("\n▲ {ups}  ▼ {downs}");
         }
-        let comments = a["comments"].as_array();
-        if comments.is_some_and(|c| !c.is_empty()) {
-            println!("\n--- comments (this epoch) ---");
-            for c in comments.unwrap() {
+        let comments = a["comments"].as_array().unwrap_or(&Vec::new()).clone();
+        if !comments.is_empty() {
+            println!("\n--- comments ---");
+            let mut last_epoch: Option<u32> = None;
+            for c in &comments {
+                let epoch = c["epoch"].as_u64().unwrap_or(0) as u32;
+                if last_epoch != Some(epoch) {
+                    println!("{}", ui::dim(&format!("  epoch {epoch}")));
+                    last_epoch = Some(epoch);
+                }
                 let who = c["who"]
                     .as_str()
                     .and_then(|h| miot_keys::from_hex(h).ok())

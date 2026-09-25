@@ -252,33 +252,38 @@ pub mod pallet {
     /// `/clear` while the artifact it belongs to survived. Votes made the
     /// same trade ([`Votes`]); reactions didn't (they're ephemeral social
     /// gloss by design).
+    /// `epoch` is stamped on the comment, not used as a storage key: one
+    /// `get(artifact)` returns the whole thread across every epoch — no
+    /// scanning — and "which section" is a view the reader draws.
     #[derive(Debug, Clone, PartialEq, Eq, codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo)]
     pub struct Comment<AccountId> {
         pub who: AccountId,
         pub at: BlockNumber,
+        /// The session the comment was made in — see [`Epoch`].
+        pub epoch: u32,
         pub body: String,
     }
 
-    /// How far back an artifact's thread goes. A sliding window, oldest
-    /// dropped first — same philosophy as the nudge budget: unbounded
-    /// growth is a loop that pays forever, and the log itself still holds
-    /// the early thread until the next compaction.
-    pub const COMMENT_KEEP: usize = 32;
+    /// How far back an artifact's thread goes, oldest dropped first — same
+    /// philosophy as the nudge budget: unbounded growth is a loop that
+    /// pays forever, and the log itself still holds the early thread until
+    /// the next compaction. Generous enough that an artifact's whole life
+    /// usually fits.
+    pub const COMMENT_KEEP: usize = 64;
 
     /// The current epoch — the session bounded by a compaction. Bumped by
     /// [`Pallet::clear_all`] and [`Pallet::request_compaction`], the two
     /// calls that make the node snapshot and shrink the block log, so the
     /// counter itself rides every compaction snapshot: a replica folding
     /// effects after a rewind lands on the same epoch the primary did.
-    /// Nothing here is valid *across* an epoch boundary — messages' live
-    /// window is exactly one epoch — which is why artifact comments are
-    /// keyed by it (see [`Comments`]): each epoch naturally gains its own
-    /// comment section, and no thread grows eternal under an artifact.
+    /// Messages only need to live within one epoch (their threads don't
+    /// reach past it); artifact comments outlive that — see [`Comments`],
+    /// which stamps the epoch rather than keying by it.
     #[pallet::storage]
     pub type Epoch<T: Config> = StorageValue<_, u32, ValueQuery>;
 
     #[pallet::storage]
-    pub type Comments<T: Config> = StorageDoubleMap<_, Blake2_128Concat, ArtifactId, Blake2_128Concat, u32, Vec<Comment<T::AccountId>>, ValueQuery>;
+    pub type Comments<T: Config> = StorageMap<_, Blake2_128Concat, ArtifactId, Vec<Comment<T::AccountId>>, ValueQuery>;
 
     /// Who is in this litter, by name: `(name, account)`, in genesis order.
     /// Written once at genesis and never changed by any call — membership is
@@ -621,15 +626,16 @@ pub mod pallet {
             let state = Litter::<T>::get();
             let from_root = Self::authority_of(&who, &state) == miot_primitives::Authority::Root;
             // A comment on an artifact joins that artifact's thread — chain
-            // storage, keyed by the current epoch (`docs/MESSAGING.md`).
-            // The effect still rides below, so replays land in the same
-            // thread and live readers see it in `/events`.
+            // storage, keyed by the artifact alone so one read gets the
+            // whole thread; the epoch is stamped on the entry, not put in
+            // the key. The effect still rides below, so replays land in
+            // the same thread and live readers see it in `/events`.
             if let Some(a) = &artifact_id {
                 let now: BlockNumber =
                     frame_system::Pallet::<T>::block_number().unique_saturated_into();
                 let epoch = Epoch::<T>::get();
-                Comments::<T>::mutate(a, epoch, |v| {
-                    v.push(Comment { who: who.clone(), at: now, body: body.clone() });
+                Comments::<T>::mutate(a, |v| {
+                    v.push(Comment { who: who.clone(), at: now, epoch, body: body.clone() });
                     if v.len() > COMMENT_KEEP {
                         v.remove(0);
                     }
@@ -762,8 +768,8 @@ pub mod pallet {
                 // The comment half of `post` — the same insert the primary
                 // executed, against the same (snapshot-carried) epoch.
                 let epoch = Epoch::<T>::get();
-                Comments::<T>::mutate(a, epoch, |v| {
-                    v.push(Comment { who: from.clone(), at: now, body: body.clone() });
+                Comments::<T>::mutate(a, |v| {
+                    v.push(Comment { who: from.clone(), at: now, epoch, body: body.clone() });
                     if v.len() > COMMENT_KEEP {
                         v.remove(0);
                     }
@@ -786,10 +792,12 @@ pub mod pallet {
             Votes::<T>::get(artifact)
         }
 
-        /// The current epoch's comment thread under an artifact — the only
-        /// one that exists as far as this session is concerned.
+        /// An artifact's comment thread, every epoch, oldest first — one
+        /// storage read. The epoch on each entry tells the reader which
+        /// session said it; nothing is ever deleted here except by the
+        /// sliding [`COMMENT_KEEP`] window.
         pub fn comments(artifact: ArtifactId) -> Vec<Comment<T::AccountId>> {
-            Comments::<T>::get(artifact, Epoch::<T>::get())
+            Comments::<T>::get(artifact)
         }
 
         /// The current epoch — session bounded by the last compaction.

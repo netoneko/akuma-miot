@@ -550,7 +550,37 @@ impl Cat {
                     Ok(r) => match r.json::<serde_json::Value>().await {
                         Ok(v) if v.get("found").and_then(|f| f.as_bool()) == Some(true) => {
                             let body = v.get("body").and_then(|b| b.as_str()).unwrap_or("");
-                            ToolOut::new(id, true).meta(ui::bytes(body.len())).body(body)
+                            // The artifact's social layer rides with it:
+                            // the tally, then the comment thread (all
+                            // epochs, each stamped). One read, nothing to
+                            // search for.
+                            let mut out = String::from(body);
+                            let (ups, downs) = (
+                                v["votes"]["up"].as_array().map(Vec::len).unwrap_or(0),
+                                v["votes"]["down"].as_array().map(Vec::len).unwrap_or(0),
+                            );
+                            if ups + downs > 0 {
+                                out.push_str(&format!("\n\n[▲ {ups} ▼ {downs}]"));
+                            }
+                            let comments = v["comments"].as_array().unwrap_or(&Vec::new()).clone();
+                            if !comments.is_empty() {
+                                out.push_str("\n\n--- comments ---");
+                                let mut last_epoch: Option<u64> = None;
+                                for cm in &comments {
+                                    let epoch = cm["epoch"].as_u64().unwrap_or(0);
+                                    if last_epoch != Some(epoch) {
+                                        out.push_str(&format!("\n[epoch {epoch}]"));
+                                        last_epoch = Some(epoch);
+                                    }
+                                    let who = cm["who"]
+                                        .as_str()
+                                        .and_then(|h| miot_keys::from_hex(h).ok())
+                                        .map(|a| self.roster.name_of(&a))
+                                        .unwrap_or_else(|| "?".into());
+                                    out.push_str(&format!("\n{who}: {}", cm["body"].as_str().unwrap_or("")));
+                                }
+                            }
+                            ToolOut::new(id, true).meta(ui::bytes(body.len())).body(out)
                         }
                         Ok(_) => ToolOut::new(id, false).meta("no such artifact"),
                         Err(e) => ToolOut::new(id, false).meta("bad response").body(e.to_string()),
@@ -789,11 +819,6 @@ impl Cat {
                 let flags = if flags.is_empty() { String::new() } else { format!("  ({})", flags.join(", ")) };
                 let tags_s = if tags.is_empty() { String::new() } else { format!("  ({})", tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ")) };
                 (call, format!("→ {who}  {body}{flags}{tags_s}"))
-            }
-            "Vote" => {
-                // Handled before this match: a vote plus its optional
-                // comment are two chain writes, and the match yields one.
-                unreachable!("Vote is handled before the call-building match")
             }
             "Artifact" => {
                 let text = c.str("text").unwrap_or_default();
