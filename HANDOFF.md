@@ -625,6 +625,44 @@ good, the scrollback goes quiet even though writes still land.
 `reasoning_effort`, measured: 520 reasoning tokens / 12.9 s at the default,
 33 / 4.2 s at `low`, on one two-sentence question.
 
+## meow kept dying mid-`Bash`: a kernel CoW bug, fixed (2026-09-25, evening)
+
+Seven kot deaths in 45 minutes on the trashcan, each as meow started a `Bash`
+tool call. Caught in `dmesg` by polling it every 8 s (the BKL spam rolls the
+64 KiB ring in ~16 s): `tokio … state.rs:120 assertion failed:
+next.is_notified()` → SIGABRT, or a ring-3 write to `cr2=0x8` → SIGSEGV. Cause,
+in `../akuma` `amd64/src/idt.rs` `cow_write_fault`: musl's `posix_spawn` is
+served on amd64 as a **CoW fork**, and the Copy arm of the CoW break remapped
+the page and freed the old frame after a *local* `invlpg` only. A kot thread on
+another core kept reading the old frame through its stale TLB entry, then a
+recycled one. AArch64's break has always flushed `AllCores`. Fix: one
+`flush_tlb_page(page, AllCores)` before the old frame can go (`../akuma`
+`a33988d5`, merged on the box as `90af5e2c`, booted). Proof, no LLM involved:
+a four-worker tokio program spawning `/bin/sh -c` like the `Bash` tool
+(`spawnrepro`) lost a worker thread and wedged at ~19k spawns on the old
+kernel; on the fixed one, 21,507 spawns in 180 s, clean. Same commit
+deduplicates `[BKL] stuck` (one line per hold, a reprint every 8th fold so
+`j4_selfhost_campaign.py` still sees a storm). Still open on the box: the
+self-test's 3 `spawn` fd-table failures (predate this), `sync` (x86_64 162)
+returning ENOSYS, and `[unregister] … stale tid` guard lines (379 in one
+reproducer run; defended, noisy).
+
+**Rollout the same evening**, `6a98e872` everywhere reachable: meow, tama,
+sora, kuro, and yuki/shiro via `push-kot.sh` + `kotctl`. Not mimi: its guest
+takes TCP on :4444 and never answers the ssh handshake. **yuki and shiro run
+`asleep`** (`kot run --asleep`, `kotctl llm <name> asleep`): no model, every
+DM or `@name` answered `*<name> is currently asleep*` (`no_ack`, and never to a
+`no_ack` message, so two sleeping cats can't talk forever). Their replies sit
+in their own mempool while a home cat leads: the AWS pair still has no route
+home (the router forwards). Patron lists went out with it (kuro, sora, mimi's
+config, and `/etc/kot/patrons` on AWS).
+
+**Keys.** `../akuma/target` was cleaned and took `amd64-ssh-test-key` with it,
+which was every way into the metal box and sora's guest. The box takes
+`~/.ssh/id_ed25519` (added to `~/.ssh/config`, old line kept). sora's guest
+got a new deploy key, `~/.akuma/kot/fcguest.ssh-key`, appended to the image's
+`/etc/sshd/authorized_keys` with the VM stopped; `deploy.py` uses it first.
+
 ## Compaction: what a window would cost (measured 2026-09-25)
 
 A node keeps the current state and the last 4,096 events in memory

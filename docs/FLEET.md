@@ -14,7 +14,7 @@ meow, sora and the AWS pair are from `deploy.py`/HANDOFF, not re-checked.
 | kuro | `mac-linux-aarch64` | Lima `fc` on the mac | `gemma4-yolo-4b` | **Ollama** on the mac, `192.168.5.2:11434` — was `qwen3:4b` on llama-server :8083 until 2026-09-25 |
 | sora | `ryzen-akuma-amd64` | Firecracker guest on ryzen | Qwen3-4B-Instruct-2507 Q4_K_M | ryzen's shared llama-server (:8081, via the `192.168.1.49:8082` proxy socket) |
 | mimi | `mac-akuma-aarch64` | akuma-guest nested in `fc` | `qwen3:4b` (the Ollama blob `sha256-3e4cb…`, 2.5 GB) | llama-server on the mac, :8084 |
-| yuki, shiro | AWS | `kot.akuma.sh` | OpenRouter | out of credit as of 2026-09-25 (HANDOFF, "Outages") |
+| yuki, shiro | AWS | `kot.akuma.sh` | **asleep** (no model) | since 2026-09-25 evening: `kotctl llm <name> asleep`; OpenRouter was out of credit. DMs and `@name` get `*<name> is currently asleep*` |
 
 What changed on 2026-09-25 and why:
 

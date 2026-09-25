@@ -97,7 +97,7 @@ class Agent:
     host: str
     arch: str  # x86_64 | aarch64
     persona: str
-    llm: str  # a base URL, or "glm"
+    llm: str  # a base URL, "glm", or "asleep" (no model, answers DMs "*… is currently asleep*")
     model: str
 
 
@@ -238,8 +238,13 @@ def on(a: Agent, cmd: str) -> str:
         if a.name == "mac-akuma-aarch64":
             argv = ["ssh", *opts, "-p", "4444", "root@localhost", cmd]
         elif a.name == "ryzen-akuma-amd64":
-            # The amd64 image's sshd trusts mkdisk.sh's test key only.
-            key = AKUMA_REPO / "target/x86_64-unknown-none/release/amd64-ssh-test-key"
+            # The amd64 image's sshd trusts what its `/etc/sshd/authorized_keys`
+            # lists: mkdisk.sh's test key, and — since 2026-09-25, when a
+            # `cargo clean` in ../akuma deleted that key and with it every way
+            # in — a deploy key kept outside any build tree.
+            key = Path.home() / ".akuma/kot/fcguest.ssh-key"
+            if not key.exists():
+                key = AKUMA_REPO / "target/x86_64-unknown-none/release/amd64-ssh-test-key"
             argv = ["ssh", *opts, "-p", "2222", "-i", str(key), "root@192.168.1.50", cmd]
         else:
             die(f"{a.name}: fcguest shape has no route defined")
@@ -441,6 +446,9 @@ def env_for(name: str) -> str:
     ]
     if a.llm == "glm":
         lines += ["MIOT_GLM=true", "MIOT_GLM_TOKEN_FILE=/root/kot/zai.token"]
+    elif a.llm == "asleep":
+        # No model: every DM or @name gets "*<name> is currently asleep*".
+        lines.append("MIOT_ASLEEP=true")
     else:
         lines.append(f"MIOT_LLM={a.llm}")
     lines += [
