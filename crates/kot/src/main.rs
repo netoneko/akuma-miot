@@ -180,6 +180,17 @@ struct RunArgs {
     election_min_ms: u64,
     #[arg(long, env = "MIOT_ELECTION_MAX_MS", default_value_t = 20_000)]
     election_max_ms: u64,
+    /// Accounts outside the roster allowed to follow from this node —
+    /// `name=pub:<64 hex>,...`. They read (status, block log, client GETs);
+    /// they never vote, push blocks or count toward the quorum. Not genesis:
+    /// set it on just the nodes a follower talks to.
+    #[arg(long, env = "MIOT_FOLLOWERS", default_value = "")]
+    followers: String,
+    /// Run as a follower: pull the chain, never campaign or vote, never
+    /// produce. For a node whose key isn't in the roster; the members it
+    /// polls must list it in their --followers.
+    #[arg(long, env = "MIOT_FOLLOWER")]
+    follower: bool,
 }
 
 #[derive(Args)]
@@ -213,6 +224,11 @@ struct LlmArgs {
     /// default with --openrouter: an OpenRouter model is a spending choice.
     #[arg(long, env = "MIOT_MODEL")]
     model: Option<String>,
+    /// How hard the model thinks per turn: none|minimal|low|medium|high, or
+    /// `default` to leave it to the provider. Unset: `low` with --glm
+    /// (`miot_llm::GLM_REASONING`), the provider's own default otherwise.
+    #[arg(long, env = "MIOT_REASONING")]
+    reasoning: Option<String>,
 }
 
 fn read_token(flag: &str, file: &str) -> String {
@@ -221,6 +237,14 @@ fn read_token(flag: &str, file: &str) -> String {
 }
 
 fn build_llm(a: &LlmArgs) -> Option<miot_llm::Llm> {
+    let llm = build_llm_for(a)?;
+    Some(match &a.reasoning {
+        Some(e) => llm.with_reasoning(e).unwrap_or_else(|e| die(format!("--reasoning: {e}"))),
+        None => llm,
+    })
+}
+
+fn build_llm_for(a: &LlmArgs) -> Option<miot_llm::Llm> {
     let model = a.model.as_deref();
     if let Some(url) = &a.llm {
         return Some(miot_llm::Llm::local(url, model.unwrap_or("qwen3:4b")));
@@ -287,6 +311,12 @@ async fn run(cli: &Cli, a: &RunArgs) {
     let root = account(&a.root);
     roster.check_genesis(&root).unwrap_or_else(|e| die(format!("--roster: {e}")));
     let leader = roster.account(&a.leader).unwrap_or_else(|| account(&a.leader));
+    let followers = Roster::parse(&a.followers).unwrap_or_else(|e| die(format!("--followers: {e}")));
+    for (f, acct) in &followers.0 {
+        if roster.0.iter().any(|(_, m)| m == acct) || *acct == root || *acct == leader {
+            die(format!("--followers: {f} is already a genesis member; a member doesn't need to be a follower"));
+        }
+    }
     let cfg = node::NodeConfig {
         name: name.clone(),
         identity,
@@ -301,6 +331,8 @@ async fn run(cli: &Cli, a: &RunArgs) {
         sync_ms: a.sync_ms,
         poll_ms: a.poll_ms,
         timing: miot_mesh::Timing { election_min_ms: a.election_min_ms, election_max_ms: a.election_max_ms },
+        followers: followers.0,
+        learner: a.follower,
     };
     let running = node::start(cfg).await.unwrap_or_else(|e| die(e));
 

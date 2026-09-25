@@ -245,6 +245,73 @@ on the path can pose as a node to a client. It can't relay the client to a
 real node, since that needs a member's key to pass the node's pin. Revisit
 when a client ever runs somewhere the path isn't the operator's.
 
+## Followers: readers outside the roster, 2026-09-25
+
+Every gate above used to be one set, the genesis accounts. A friend of the
+operator who wants to *watch* the chain from another network would have
+needed a roster entry, which is a new genesis: every node restarted onto a
+fresh chain at once. Followers are the smaller thing that was actually
+wanted.
+
+- **On the members: `--followers` / `MIOT_FOLLOWERS`**, `name=pub:<64 hex>,…`.
+  Per-node config, not genesis, so it rolls out node by node and can be
+  left off some (the GLM cats, 2026-09-25). A listed account is a *reader*
+  (`Node::is_reader`): the TLS handshake (`server_config` gets
+  `reader_accounts`), `/mesh/status` (GET and POST), `/chain/{head,blocks,
+  checkpoint}`, and every client-facing GET via `require_client_auth`.
+  Still members-only: `/mesh/vote`, `/chain/push`, `/activity` POST.
+- **A follower's status never reaches the election.** `mesh_status_post`
+  answers a follower like anyone (that's how it learns who leads), notes
+  what it sent in `follower_seen` for `kot peers` (a `followers` list in
+  `/mesh/peers`), and returns before `Mesh::on_inbound`. A follower
+  claiming to lead changes nothing. It isn't in anyone's `MIOT_PEERS`, so
+  it isn't in anyone's quorum either.
+- **Writes are refused by the chain, not the door.** `/submit` has no
+  envelope gate (the extrinsic's signature is the authority), so a follower
+  can reach it, but its account was never given `providers` at genesis, so
+  `CheckNonce` answers `Invalid(Payment)`: the same refusal any stranger's
+  extrinsic gets. Checked in `tests/follower.rs`, to a member directly and
+  forwarded by the follower's own node.
+- **On the follower: `--follower` / `MIOT_FOLLOWER=true`** makes its
+  `Mesh` a learner (`miot-mesh`, "Learners"): it never campaigns and never
+  votes, so it never produces, not even with no peers. Its own key is
+  always a reader on its own node, so its operator's `kot` works against it.
+- **It pulls from whoever it can reach.** A member pulls only from the
+  primary. A follower on another network usually can't reach the primary
+  (home has no router forwards; the AWS pair is what faces the internet),
+  and nobody pushes to it, so `Mesh::pull_sources` gives a learner every
+  fresh member in the current term that follows a leader: the leader
+  first, then the furthest along. It stays on one source while that source
+  is still valid, rather than switching every time two replicas swap by a
+  block. `tests/follower.rs` runs it with the primary unreachable. With
+  leader-only pulling it sat at head 0.
+
+The limit: a follower keeps up only while it can reach some member that
+lists it. With the GLM cats left off the list, a follower that reaches only
+meow or tama gets refused at the handshake.
+
+Running one, for the friend. Same genesis as the mesh (`kot roster` or
+`/roster` gives `MIOT_ROSTER`; `MIOT_ROOT_PUBKEY` and `MIOT_LEADER` from the
+operator), and only the members they can reach as peers. **The key must be
+one `kot` can sign with**: their node proves it in every handshake, and `kot`
+can't read an OpenSSH private key (`CLAUDE.md`, "Known gaps"). An
+`ssh-ed25519` public line is fine for the operator to list, but the friend's
+node then has nothing to sign with. The first account added this way,
+neobeav's, is exactly that. So the friend makes a `kot` seed and sends its
+public half:
+
+```bash
+kot id --seed-file ~/.akuma/kot/friend.seed        # prints the hex the operator adds to FOLLOWERS
+MIOT_ROSTER=... MIOT_ROOT_PUBKEY="ssh-ed25519 ..." MIOT_LEADER=... \
+kot run --as neobeav --seed-file ~/.akuma/kot/friend.seed --follower \
+  --peers https://kot.akuma.sh:9441,https://kot.akuma.sh:9442 --db ~/kot-follower.db
+kot --node https://127.0.0.1:9944 --seed-file ~/.akuma/kot/friend.seed log --follow
+```
+
+The operator adds an account in `overlays/deploy/deploy.py` (`FOLLOWERS`,
+applied to `FOLLOWERS_ON` by `deploy.py up`) and, for the AWS pair, one line
+in `/etc/kot/followers` there, then `kotctl sync`.
+
 ## Rejected alternatives
 
 - **`sc-network`/`rust-libp2p`** (what Polkadot actually uses) — Kademlia

@@ -21,7 +21,7 @@
 
 use genai::adapter::AdapterKind;
 pub use genai::chat::Tool;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 use std::time::Instant;
@@ -97,7 +97,19 @@ pub struct Llm {
     /// remaining limit, and with no cap it assumes the model's maximum (65k
     /// for qwen3-coder), refusing with 402 long before the budget is spent.
     max_tokens: Option<u32>,
+    /// How hard a reasoning model thinks per turn, sent as
+    /// `reasoning_effort`. `None` leaves it to the provider. [`Llm::glm`]
+    /// starts at [`GLM_REASONING`]; [`Llm::with_reasoning`] overrides.
+    reasoning: Option<ReasoningEffort>,
 }
+
+/// [`Llm::glm`]'s default effort. Measured 2026-09-25 on the coding
+/// endpoint, glm-5.3, one two-sentence Rust question: provider default 520
+/// reasoning tokens / 12.9 s, `medium` 128 / 6.7 s, `low` 33 / 4.2 s (a
+/// trivial question: 101 tokens by default, 0 at `low`). z.ai honors the
+/// OpenAI-style field. A cat's turn is mostly a tool call, and GLM at full
+/// effort outthinks the job — Kirill: "it's too powerful".
+pub const GLM_REASONING: &str = "low";
 
 /// [`Llm::openrouter`]'s cap. A cat's turn is a tool call or a few lines;
 /// 4096 is generous for that and keeps the worst case a small fraction of a
@@ -135,6 +147,7 @@ impl Llm {
             http: reqwest::Client::new(),
             context_window: tokio::sync::OnceCell::new(),
             max_tokens: None,
+            reasoning: None,
         }
     }
 
@@ -149,6 +162,7 @@ impl Llm {
             http: reqwest::Client::new(),
             context_window: tokio::sync::OnceCell::new(),
             max_tokens: None,
+            reasoning: None,
         }
     }
 
@@ -168,7 +182,26 @@ impl Llm {
             })
             .build();
         let model = if model.contains("::") { model.to_string() } else { format!("zai-coding::{model}") };
-        Llm { client, label: model.clone(), model, base_url: None, http: reqwest::Client::new(), context_window: tokio::sync::OnceCell::new(), max_tokens: None }
+        Llm {
+            client,
+            label: model.clone(),
+            model,
+            base_url: None,
+            http: reqwest::Client::new(),
+            context_window: tokio::sync::OnceCell::new(),
+            max_tokens: None,
+            reasoning: ReasoningEffort::from_keyword(GLM_REASONING),
+        }
+    }
+
+    /// Set the reasoning effort: `none`, `minimal`, `low`, `medium`, `high`,
+    /// or `default` to send nothing and leave it to the provider.
+    pub fn with_reasoning(mut self, effort: &str) -> Result<Self, String> {
+        self.reasoning = match effort.trim().to_ascii_lowercase().as_str() {
+            "default" => None,
+            e => Some(ReasoningEffort::from_keyword(e).ok_or_else(|| format!("reasoning effort {effort:?}: none|minimal|low|medium|high|default"))?),
+        };
+        Ok(self)
     }
 
     /// Any model on OpenRouter (`moonshotai/kimi-k2`, `qwen/qwen3-coder`, …),
@@ -199,6 +232,7 @@ impl Llm {
             http: reqwest::Client::new(),
             context_window: tokio::sync::OnceCell::new(),
             max_tokens: Some(OPENROUTER_MAX_TOKENS),
+            reasoning: None,
         }
     }
 
@@ -222,6 +256,11 @@ impl Llm {
         &self.label
     }
 
+    /// The reasoning effort sent with each turn, if any — for the startup line.
+    pub fn reasoning(&self) -> Option<&'static str> {
+        self.reasoning.as_ref().and_then(|e| e.as_keyword())
+    }
+
     pub async fn turn(&self, system: &str, user: &str, tools: Vec<Tool>) -> Result<Turn, String> {
         self.converse(system, &[(Speaker::User, user.to_string())], tools).await
     }
@@ -241,6 +280,9 @@ impl Llm {
         let mut opts = ChatOptions::default().with_normalize_reasoning_content(true);
         if let Some(n) = self.max_tokens {
             opts = opts.with_max_tokens(n);
+        }
+        if let Some(e) = &self.reasoning {
+            opts = opts.with_reasoning_effort(e.clone());
         }
         let res = self
             .client
@@ -628,3 +670,6 @@ pub fn task_tools() -> Vec<Tool> {
     tools.extend(note_tools());
     tools
 }
+
+#[cfg(test)]
+mod tests;

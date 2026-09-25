@@ -42,6 +42,8 @@ fn cfg(who: u8, port: u16, peers: Vec<String>, db: std::path::PathBuf) -> NodeCo
         sync_ms: 100,
         poll_ms: 100,
         timing: miot_mesh::Timing { election_min_ms: 600, election_max_ms: 1200 },
+        followers: vec![],
+        learner: false,
     }
 }
 

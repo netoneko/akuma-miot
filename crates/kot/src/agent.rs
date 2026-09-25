@@ -994,7 +994,8 @@ pub async fn run(cfg: AgentConfig) {
         local: std::sync::Mutex::new(LocalTasks::default()),
     });
     let name = cat.name.clone();
-    println!("{}", ui::note(&format!("{name} id={} node={} llm={}", miot_keys::short(&account), cat.node, cfg.llm.label())));
+    let reasoning = cfg.llm.reasoning().map(|e| format!(" reasoning={e}")).unwrap_or_default();
+    println!("{}", ui::note(&format!("{name} id={} node={} llm={}{reasoning}", miot_keys::short(&account), cat.node, cfg.llm.label())));
 
     let head = loop {
         match cat.head().await {

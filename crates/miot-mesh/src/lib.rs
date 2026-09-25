@@ -67,6 +67,25 @@
 //!
 //! One operator's trusted swarm: nobody lies about their term or head.
 //! Nothing here defends against a member that does.
+//!
+//! # Learners
+//!
+//! A node outside the genesis roster can still follow the chain: a
+//! **learner** ([`Mesh::learner`], Raft's non-voting member). It polls and
+//! follows like anyone else, but never campaigns and never votes, so it
+//! can't lead and can't sway who does. The members on the other side keep
+//! it out of the election too: it isn't in their routes, so it's not in
+//! their quorum, and `kot`'s node never feeds its status to [`Mesh`] at all.
+//! Why it exists: friends of the operator who want to watch the chain from
+//! a different network without a new genesis (2026-09-25).
+//!
+//! A learner on another network usually can't reach the leader at all,
+//! only whichever members face the internet, and nobody pushes to it. So it
+//! doesn't insist on the leader: [`Mesh::pull_sources`] names every member
+//! it can reach that is in the current term and follows a leader, the
+//! leader first, then furthest along. A replica's log is the leader's, a
+//! pull interval behind, and a rewind reaches it the same way it reaches
+//! the replica.
 
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
@@ -184,6 +203,8 @@ pub struct Mesh {
     /// Leader only: routes that have needed a push this term. They get one
     /// whenever they differ, without waiting out another window.
     pushed: BTreeSet<Route>,
+    /// Never campaigns, never votes. See the module doc's "Learners".
+    learner: bool,
 }
 
 impl Mesh {
@@ -210,9 +231,20 @@ impl Mesh {
             heard: BTreeMap::new(),
             lagging: BTreeMap::new(),
             pushed: BTreeSet::new(),
+            learner: false,
         };
         m.reset_deadline(now);
         m
+    }
+
+    /// This node only follows: it never campaigns and never votes, so it
+    /// never leads — not even alone, with no routes.
+    pub fn learner(mut self) -> Self {
+        self.learner = true;
+        self
+    }
+    pub fn is_learner(&self) -> bool {
+        self.learner
     }
 
     pub fn name(&self) -> &str {
@@ -304,7 +336,7 @@ impl Mesh {
             }
             return None;
         }
-        if now < self.deadline {
+        if self.learner || now < self.deadline {
             return None;
         }
         self.campaign(now, head)
@@ -420,6 +452,11 @@ impl Mesh {
             // Our leader stepped down. Keep the deadline running; don't reset it.
             self.leader = None;
             self.leader_route = None;
+        } else if self.learner && self.leader.is_none() && st.term == self.hard.term && st.role == Role::Follower {
+            // A learner that can't reach the leader still learns its name
+            // from a member that follows it — for display; it pulls from
+            // that member (`pull_sources`).
+            self.leader = st.leader;
         }
     }
 
@@ -464,9 +501,31 @@ impl Mesh {
         out
     }
 
+    /// Where to pull blocks from, best first. A member pulls only from the
+    /// leader. A learner takes the leader if it can reach it, and otherwise
+    /// any member it has heard from in the last election window that's in
+    /// the current term and follows someone, furthest along first.
+    pub fn pull_sources(&self, now: u64) -> Vec<Route> {
+        if !self.learner {
+            return self.leader_route.iter().cloned().collect();
+        }
+        let fresh = |at: u64| now.saturating_sub(at) <= self.timing.election_min_ms;
+        let mut out: Vec<(bool, u64, Route)> = self
+            .seen
+            .iter()
+            .filter(|(_, (at, st))| fresh(*at) && st.term == self.hard.term && st.leader.is_some())
+            .map(|(r, (_, st))| (st.role == Role::Leader, st.head, r.clone()))
+            .collect();
+        out.sort_by(|a, b| (b.0, b.1).cmp(&(a.0, a.1)));
+        out.into_iter().map(|(_, _, r)| r).collect()
+    }
+
     /// Answer a vote request. `head` is this node's own.
     pub fn on_vote_request(&mut self, req: &VoteRequest, now: u64, head: u64) -> VoteReply {
         let deny = |m: &Self| VoteReply { term: m.hard.term, granted: false };
+        if self.learner {
+            return deny(self);
+        }
         // Stickiness: never help depose a leader we can still hear, and a
         // leader never votes against itself. If it really is cut off,
         // check-quorum retires it on its own.

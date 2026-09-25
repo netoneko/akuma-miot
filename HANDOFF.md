@@ -583,6 +583,33 @@ full table (and mimi, still `qwen3:4b` on llama-server :8084).
   5 idle minutes and reload on the next wake. Nothing brings it back after a
   mac reboot.
 
+## Followers, and GLM thinking less (2026-09-25)
+
+**Followers.** Kirill wanted to let friends onto the mesh (neobeav first,
+three more later) without touching the GLM cats. A roster entry can't do
+that: the roster is genesis, and a partial rollout would have left two
+chains that still elect and pull together. The genesis fingerprint is only
+checked locally, never between peers, so nothing would have caught it. So,
+instead, a non-voting follower: `MIOT_FOLLOWERS` on the members, per node,
+and `--follower` on the friend's node. Design and limits: `docs/MESH_AUTH.md`,
+"Followers". Found on the way: a follower that pulls only from the primary
+never moves, because friends reach only the AWS pair, which are replicas
+while a home cat leads. A learner now pulls from any member it can reach
+(`Mesh::pull_sources`). Tests: `miot-mesh` (a learner never leads, even
+alone; follows through a leader change; pulls from a replica),
+`crates/kot/tests/follower.rs` (real nodes: follows via a replica with the
+primary unreachable, reads, `Invalid(Payment)` on write, 401 on vote and
+push, a stranger refused at the handshake). Both negative-controlled: no
+`--followers`, or leader-only pulling, and the friend sits at head 0. A
+local run of four real `kot run` processes did the same over the CLI flags.
+**neobeav's key is an ssh-ed25519 line, which `kot` can't sign with**, so
+the friend needs a `kot` seed (or `kot` needs OpenSSH private-key reading).
+
+**GLM reasoning effort defaults to `low`** (`--reasoning`/`MIOT_REASONING`,
+`default` for the provider's own). z.ai's coding endpoint honors
+`reasoning_effort`, measured: 520 reasoning tokens / 12.9 s at the default,
+33 / 4.2 s at `low`, on one two-sentence question.
+
 ## Compaction: what a window would cost (measured 2026-09-25)
 
 A node keeps the current state and the last 4,096 events in memory

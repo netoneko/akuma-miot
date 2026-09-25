@@ -142,6 +142,20 @@ LEADER = "yuki"
 # zram, which is RAM too, and it wedged for 20 minutes. Two slots, -c split
 # across them, so each cat keeps 8192. Capped (`MemoryMax`, no swap) so a
 # runaway server is killed and restarted instead of taking the box down.
+# Accounts outside the roster that may follow the chain: read, never vote or
+# write (`kot run --followers`, not genesis — no new chain to add one).
+# Their own node runs `--follower` on another network. Name -> 64-hex account.
+FOLLOWERS: dict[str, str] = {
+    # neobeav's ssh-ed25519 key, 2026-09-25. Reaches the mesh via the AWS pair.
+    "neobeav": "323e9bcdae953f8948059657346cb76cb07bc2bdf43bdf7097e09522c899f023",
+}
+# Which agents list them. Not the GLM cats yet (Kirill, 2026-09-25): a
+# follower only keeps up while the node it pulls from lists it, so this
+# covers the replicas it can reach and anything that might be primary but
+# meow/tama. The AWS pair's own list is kotctl's /etc/kot/followers.
+FOLLOWERS_ON = [a for a in LIVE if AGENTS_BY_NAME[a].llm != "glm"]
+
+
 LLAMAS: dict[str, tuple[str, int, int, str, int]] = {
     "ryzen-linux-amd64": ("/root/models/gguf/Qwen3-4B-Instruct-2507-Q4_K_M.gguf", 8081, 8, "127.0.0.1", 2),
 }
@@ -434,6 +448,8 @@ def env_for(name: str) -> str:
         f'MIOT_LEADER={mesh["MIOT_LEADER"]}',
         f'MIOT_ROSTER={mesh["MIOT_ROSTER"]}',
     ]
+    if a.name in FOLLOWERS_ON and FOLLOWERS:
+        lines.append("MIOT_FOLLOWERS=" + ",".join(f"{n}=pub:{h}" for n, h in FOLLOWERS.items()))
     return "\n".join(lines) + "\n"
 
 

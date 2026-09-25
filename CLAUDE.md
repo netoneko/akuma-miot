@@ -43,7 +43,9 @@ read that first, it is kept current and this file does not repeat it.
   OpenAI-compatible server — llama-server, never ollama in the fleet, with one
   deliberate exception: kuro on Ollama's `gemma4-yolo-4b` since 2026-09-25,
   `docs/FLEET.md`) and
-  `Llm::glm` (z.ai **coding plan** endpoint, token from a file).
+  `Llm::glm` (z.ai **coding plan** endpoint, token from a file; reasoning
+  effort `low` by default since 2026-09-25, `--reasoning`/`MIOT_REASONING`
+  to change it — `miot_llm::GLM_REASONING` has the measurements).
 - `crates/kot` — **the one binary**, ships as `dist/<arch>/kot`. Polish for
   "cat". `kot run --as <name>` is a mesh node (`node.rs`) plus, given
   `--llm`/`--glm`, that cat's agent loop (`agent.rs`) in the same process,
@@ -124,6 +126,11 @@ read that first, it is kept current and this file does not repeat it.
   either is a coordinated restart, not an operation. A block log remembers
   the genesis it was built under and refuses a different one.
   No joint consensus — fine for one operator, not for anything else.
+  **Followers are the exception that isn't genesis (2026-09-25):** an
+  account in a member's `MIOT_FOLLOWERS` may read and pull but never vote
+  or write, and its own node runs `--follower` (a learner that pulls from
+  any member it can reach). Per node, so it rolls out without a new chain.
+  `docs/MESH_AUTH.md`, "Followers".
 - **An operator's client doesn't pin the node (2026-09-23).** `kot`'s
   client reads the roster from whichever node it connects to (`/roster`)
   and trusts that node's cert as presented (`tls::client_config_any_node`);

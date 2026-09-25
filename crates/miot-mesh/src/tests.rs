@@ -456,3 +456,86 @@ fn push_targets_names_only_the_stuck_peer() {
     let targets = s.nodes[l].push_targets(now, head);
     assert!(!targets.contains(&name(other)), "a pulling peer is never a target: {targets:?}");
 }
+
+// ── learners (a friend's node, outside the roster, 2026-09-25) ──
+
+/// A learner alone — no routes, so a quorum of one — would lead itself in
+/// one timeout if it were a member. It never does.
+#[test]
+fn a_learner_alone_never_leads_itself() {
+    let mut m = Mesh::new("f".into(), vec![], Timing::default(), Hard::default(), 0, 1).learner();
+    for t in (0..60_000).step_by(STEP_MS as usize) {
+        assert_eq!(m.tick(t, 0), None);
+    }
+    assert_eq!(m.role(), Role::Follower);
+    assert_eq!(m.term(), 0, "no campaign, so no term of its own");
+}
+
+/// A learner polling a live mesh follows its leader, follows the next one
+/// when that leader dies, never campaigns, and never grants a vote — and
+/// the members, which don't know it exists, elect exactly as without it.
+#[test]
+fn a_learner_follows_through_a_leader_change_and_never_campaigns() {
+    let mut s = Sim::new(3);
+    let routes: Vec<Route> = (0..3).map(name).collect();
+    let mut f = Mesh::new("f".into(), routes, Timing::default(), Hard::default(), 0, 7).learner();
+    let mut poll = |s: &Sim, f: &mut Mesh| {
+        for b in 0..3 {
+            if s.alive[b] {
+                f.on_status(&name(b), s.nodes[b].status(s.heads[b], ""), s.now);
+            }
+        }
+        assert_eq!(f.tick(s.now, 0), None, "a learner never campaigns");
+    };
+
+    let first = s.settle(20_000);
+    for _ in 0..50 {
+        s.step();
+        poll(&s, &mut f);
+    }
+    assert_eq!(f.leader(), Some(s.nodes[first].name()));
+    assert_eq!(f.leader_route(), Some(name(first).as_str()), "a route: it pulls");
+
+    s.alive[first] = false;
+    let second = s.settle(20_000);
+    for _ in 0..50 {
+        s.step();
+        poll(&s, &mut f);
+    }
+    assert_eq!(f.leader(), Some(s.nodes[second].name()));
+    assert_eq!(f.term(), s.nodes[second].term(), "it adopts the members' term, never makes its own");
+    assert_eq!(f.role(), Role::Follower);
+
+    let req = VoteRequest { term: f.term() + 1, candidate: "n9".into(), head: 1_000, head_term: f.term(), pre: false };
+    let (now, t) = (s.now + 60_000, f.term());
+    assert!(!f.on_vote_request(&req, now, 0).granted, "a learner never votes");
+    assert_eq!(f.term(), t, "and a refused request changes nothing");
+}
+
+/// A learner that can reach only a replica — the leader is behind someone
+/// else's router — still has somewhere to pull from, and knows who leads.
+#[test]
+fn a_learner_that_cannot_reach_the_leader_pulls_from_a_replica() {
+    let mut s = Sim::new(3);
+    let l = s.settle(20_000);
+    s.run(3_000);
+    let replicas: Vec<usize> = (0..3).filter(|&i| i != l).collect();
+    let routes: Vec<Route> = replicas.iter().map(|&i| name(i)).collect();
+    let mut f = Mesh::new("f".into(), routes, Timing::default(), Hard::default(), 0, 7).learner();
+    for _ in 0..30 {
+        s.step();
+        for &b in &replicas {
+            f.on_status(&name(b), s.nodes[b].status(s.heads[b], ""), s.now);
+        }
+        assert_eq!(f.tick(s.now, 0), None);
+    }
+    assert_eq!(f.leader(), Some(s.nodes[l].name()), "learned from a replica");
+    assert_eq!(f.leader_route(), None, "no route to the leader itself");
+    let src = f.pull_sources(s.now);
+    assert_eq!(src.len(), 2, "both replicas: {src:?}");
+    assert!(src.iter().all(|r| replicas.contains(&idx(r))));
+
+    // A member still pulls from the leader and nobody else.
+    let member = replicas[0];
+    assert_eq!(s.nodes[member].pull_sources(s.now), vec![name(l)]);
+}

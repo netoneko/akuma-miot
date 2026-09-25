@@ -23,6 +23,13 @@
 //! — a private chain, so an unsigned or stranger-signed request gets a plain
 //! 401, nothing served. See "mesh auth" further down and `docs/MESH_AUTH.md`.
 //!
+//! **Followers** (`--followers`, not genesis) are the one exception: accounts
+//! outside the roster this node lets *read* — the TLS handshake, the status
+//! poll, the block log, the client reads (`is_reader`). Never `/mesh/vote`,
+//! never `/chain/push`, and a follower's status never reaches the election.
+//! Their own node runs as a learner (`--follower`, [`Mesh::learner`]). So a
+//! friend on another network can follow the chain with no new genesis.
+//!
 //! | | |
 //! |---|---|
 //! | `POST /submit` | a signed extrinsic; checked, dispatched into the *currently open* block (forwarded to the primary from a replica) — its own signature is the gate, no envelope needed |
@@ -116,6 +123,13 @@ pub struct NodeConfig {
     /// How often every node polls every peer's `/mesh/status`.
     pub poll_ms: u64,
     pub timing: Timing,
+    /// Accounts outside the roster allowed to follow from this node: read,
+    /// never vote or write. Per node, not genesis, so it can change with a
+    /// restart of just the nodes a follower talks to. See the module doc.
+    pub followers: Vec<(String, AccountId)>,
+    /// This node is a follower itself: it never campaigns and never votes
+    /// ([`Mesh::learner`]), so it never produces.
+    pub learner: bool,
 }
 
 /// Six seconds — the Polkadot default, and a round number to reason in.
@@ -169,6 +183,11 @@ pub struct Node {
     genesis_roster: Vec<(String, AccountId)>,
     /// The roster's accounts — what [`catnip`] and every trust check use.
     members: Vec<AccountId>,
+    /// `--followers`, by name. Readers, not members: see [`Node::is_reader`].
+    followers: Vec<(String, AccountId)>,
+    /// When each follower last polled us, and the status it sent — kept
+    /// here for `kot peers` only, never handed to [`Mesh`].
+    follower_seen: BTreeMap<String, (u64, Status)>,
     /// This node's own keypair — signs outgoing mesh-internal traffic.
     identity: Identity,
     mesh: Mesh,
@@ -436,6 +455,18 @@ fn trusted_accounts(members: &[AccountId], root: &AccountId, leader: &AccountId)
     v
 }
 
+/// [`Node::is_reader`]'s set, before a `Node` exists — what the TLS
+/// listener accepts a handshake from.
+fn reader_accounts(cfg: &NodeConfig) -> Vec<AccountId> {
+    let mut v = trusted_accounts(&members_of(&cfg.roster), &cfg.root, &cfg.leader);
+    for a in cfg.followers.iter().map(|(_, a)| a.clone()).chain([cfg.identity.account()]) {
+        if !v.contains(&a) {
+            v.push(a);
+        }
+    }
+    v
+}
+
 /// The full storage trie — `Store::compact`'s opaque `state` blob.
 #[derive(Encode, Decode)]
 struct Snapshot {
@@ -453,7 +484,10 @@ impl Node {
             None => Hard::default(),
         };
         let seed = cfg.name.bytes().fold(0xcbf2_9ce4_8422_2325u64, |h, b| (h ^ b as u64).wrapping_mul(0x100_0000_01b3));
-        let mesh = Mesh::new(cfg.name.clone(), cfg.peers.clone(), cfg.timing, hard, 0, seed);
+        let mut mesh = Mesh::new(cfg.name.clone(), cfg.peers.clone(), cfg.timing, hard, 0, seed);
+        if cfg.learner {
+            mesh = mesh.learner();
+        }
         let fingerprint = genesis_fingerprint(&cfg.root, &cfg.leader, &cfg.roster);
         match store.aux(AUX_GENESIS).map_err(|e| e.to_string())? {
             Some(had) if had == fingerprint => {}
@@ -487,6 +521,8 @@ impl Node {
             genesis_leader: cfg.leader.clone(),
             genesis_roster: cfg.roster.clone(),
             members: members_of(&cfg.roster),
+            followers: cfg.followers.clone(),
+            follower_seen: BTreeMap::new(),
             identity: cfg.identity,
             mesh,
             producing: false,
@@ -579,6 +615,15 @@ impl Node {
     /// for a snapshot ([`PeerAuth`]) that outlives the lock.
     fn trusted_set(&self) -> Vec<AccountId> {
         trusted_accounts(&self.members, &self.genesis_root, &self.genesis_leader)
+    }
+
+    /// Who may *read* from this node: every trusted signer, plus
+    /// `--followers`, plus this node's own key — a learner isn't in the
+    /// roster, and its operator's `kot` signs as it. Reading is the status
+    /// poll, the block log and the client-facing GETs. Voting, pushing
+    /// blocks and posting activity stay [`is_trusted_signer`]-only.
+    fn is_reader(&self, a: &AccountId) -> bool {
+        self.is_trusted_signer(a) || *a == self.identity.account() || self.followers.iter().any(|(_, f)| f == a)
     }
 
     /// The whole litter table, SCALE-encoded — counters `/tasks` doesn't
@@ -862,14 +907,19 @@ impl Node {
             println!("[mesh] {} no longer primary (term {}); rebuilding from the store", self.mesh.name(), self.mesh.term());
             self.reload_from_store();
         }
-        let route = self.mesh.leader_route().map(str::to_string);
+        // A member pulls from the leader. A learner pulls from any member
+        // it can reach (`Mesh::pull_sources`), and keeps the one it has
+        // while that's still a source, so two replicas trading places by a
+        // block don't make it switch (and reconcile) every round.
+        let sources = self.mesh.pull_sources(self.now_ms());
+        let route = match &self.peer {
+            Some(p) if self.mesh.is_learner() && sources.contains(p) => Some(p.clone()),
+            _ => sources.into_iter().next(),
+        };
         if route != self.peer {
             if let Some(r) = &route {
-                println!(
-                    "[mesh] following {} at {r} (term {})",
-                    self.mesh.leader().unwrap_or("?"),
-                    self.mesh.term()
-                );
+                let via = if self.mesh.leader_route() == Some(r.as_str()) { "at" } else { "via a replica at" };
+                println!("[mesh] following {} {via} {r} (term {})", self.mesh.leader().unwrap_or("?"), self.mesh.term());
                 self.needs_reconcile = true;
             }
             self.peer = route;
@@ -1609,10 +1659,10 @@ fn unauthorized(why: &'static str) -> Response {
 
 /// The gate every client-facing handler opens with: `bytes` (the raw query
 /// string, or `b""` for a parameterless GET) must carry a trusted member's
-/// signature. Same check `is_trusted_signer` gives mesh traffic — reads
-/// aren't a separate, looser trust boundary.
+/// signature — a member's, or a follower's (`is_reader`): every gate this
+/// opens is a read.
 fn require_client_auth(n: &Node, headers: &HeaderMap, bytes: &[u8]) -> Result<(), Response> {
-    verify_headers(headers, bytes, |a| n.is_trusted_signer(a)).map(|_| ()).map_err(unauthorized)
+    verify_headers(headers, bytes, |a| n.is_reader(a)).map(|_| ()).map_err(unauthorized)
 }
 
 // ---------------------------------------------------------------- HTTP
@@ -1686,8 +1736,7 @@ pub async fn start(cfg: NodeConfig) -> Result<Running, String> {
     );
     let shared: Shared = Arc::new(Mutex::new(node));
     let tcp = tokio::net::TcpListener::bind((cfg.bind.as_str(), cfg.port)).await.map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
-    let trusted = trusted_accounts(&members_of(&cfg.roster), &cfg.root, &cfg.leader);
-    let listener = tls::TlsListener::new(tcp, tls::server_config(&cfg.identity, trusted));
+    let listener = tls::TlsListener::new(tcp, tls::server_config(&cfg.identity, reader_accounts(&cfg)));
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let mut tasks = Vec::new();
 
@@ -1742,7 +1791,7 @@ pub async fn start(cfg: NodeConfig) -> Result<Running, String> {
 
 async fn mesh_status(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let n = n.lock().await;
-    if let Err(why) = verify_headers(&headers, b"", |a| n.is_trusted_signer(a)) {
+    if let Err(why) = verify_headers(&headers, b"", |a| n.is_reader(a)) {
         return unauthorized(why);
     }
     signed_json(&n.identity, StatusCode::OK, &n.status_wire())
@@ -1753,10 +1802,21 @@ async fn mesh_status(AxState(n): AxState<Shared>, headers: HeaderMap) -> Respons
 /// hears from us (`Mesh::on_inbound`).
 async fn mesh_status_post(AxState(n): AxState<Shared>, headers: HeaderMap, body: Bytes) -> Response {
     let mut n = n.lock().await;
-    let signer = match verify_headers(&headers, &body, |a| n.is_trusted_signer(a)) {
+    let signer = match verify_headers(&headers, &body, |a| n.is_reader(a)) {
         Ok(a) => a,
         Err(why) => return unauthorized(why),
     };
+    // A follower gets our answer — that's how it learns who leads — but
+    // what it says about itself is only noted for `kot peers`: it's not a
+    // member, so it has no say in the election, even if it claimed to lead.
+    if !n.is_trusted_signer(&signer) {
+        if let Ok(wire) = serde_json::from_slice::<StatusWire>(&body) {
+            let now = n.now_ms();
+            let name = n.followers.iter().find(|(_, a)| *a == signer).map(|(name, _)| name.clone());
+            n.follower_seen.insert(name.unwrap_or_else(|| miot_keys::to_hex(&signer)), (now, wire.status));
+        }
+        return signed_json(&n.identity, StatusCode::OK, &n.status_wire());
+    }
     // A status that doesn't name its own signer is ignored, not refused:
     // the caller still gets our answer, which is all the old GET gave it.
     if let Ok(wire) = serde_json::from_slice::<StatusWire>(&body) {
@@ -1857,6 +1917,8 @@ async fn mesh_peers(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response
         .collect();
     Json(serde_json::json!({
         "inbound": inbound,
+        "followers": n.follower_seen.iter().map(|(name, (at, st))| serde_json::json!({"name": name, "seen_ms_ago": now.saturating_sub(*at), "head": st.head})).collect::<Vec<_>>(),
+        "learner": n.mesh.is_learner(),
         "me": n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account())),
         "quorum": n.mesh.quorum(),
         "producing": n.producing,
@@ -1869,7 +1931,7 @@ async fn mesh_peers(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response
 
 async fn chain_head(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let n = n.lock().await;
-    if let Err(why) = verify_headers(&headers, b"", |a| n.is_trusted_signer(a)) {
+    if let Err(why) = verify_headers(&headers, b"", |a| n.is_reader(a)) {
         return unauthorized(why);
     }
     let body = ChainHead { head: n.store.head(), last_checkpoint: n.store.last_checkpoint() };
@@ -1881,7 +1943,7 @@ async fn chain_blocks(AxState(n): AxState<Shared>, uri: Uri, headers: HeaderMap,
     // Signed over the raw query string — exactly what the caller put after
     // `?` — never the parsed `BlocksQuery`, so there's no canonicalization
     // to get subtly wrong between the two ends.
-    if let Err(why) = verify_headers(&headers, uri.query().unwrap_or("").as_bytes(), |a| n.is_trusted_signer(a)) {
+    if let Err(why) = verify_headers(&headers, uri.query().unwrap_or("").as_bytes(), |a| n.is_reader(a)) {
         return unauthorized(why);
     }
     let head = n.store.head();
@@ -1899,7 +1961,7 @@ async fn chain_blocks(AxState(n): AxState<Shared>, uri: Uri, headers: HeaderMap,
 
 async fn chain_checkpoint(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let n = n.lock().await;
-    if let Err(why) = verify_headers(&headers, b"", |a| n.is_trusted_signer(a)) {
+    if let Err(why) = verify_headers(&headers, b"", |a| n.is_reader(a)) {
         return unauthorized(why);
     }
     let cp = n.store.last_checkpoint();
