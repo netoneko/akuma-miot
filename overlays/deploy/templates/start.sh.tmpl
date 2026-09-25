@@ -5,4 +5,6 @@
 # rather than trusting the caller — same reasoning as
 # ../akuma/scripts/box/akuma-dev.env.
 {env_lines}
-exec /root/kot/bin/kot run
+# stderr into the same log: a panic or a failed allocation is written there,
+# and meow's kot died with no trace at all on 2026-09-25 without it.
+exec /root/kot/bin/kot run 2>&1

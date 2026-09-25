@@ -1,0 +1,40 @@
+#!/bin/sh
+# sora's network on ryzen: Akuma/amd64 in Firecracker, published on the LAN
+# as 192.168.1.50 by proxy-ARP (Wi-Fi can't be bridged). Installed as
+# /usr/local/sbin/sora-net, run by sora-net.service. Source of truth:
+# akuma-miot overlays/deploy/hosts/ryzen/.
+#
+# This is the setup ../akuma/docs/archive/AKUMA_AMD64_KOT_REPLICA_WEDGE.md
+# describes, which used to be typed by hand and was gone after every reboot:
+#   tap0 carries 192.168.1.49 (the guest's router), a host route sends .50 to
+#   it, proxy-ARP answers for .50 on Wi-Fi and for the LAN on tap0, and the
+#   existing akuma-dnsmasq container pins the guest's MAC to .50.
+# Plus the part that was missing on 2026-09-25: Docker's FORWARD policy is
+# DROP, so without an accept for Wi-Fi <-> tap0 nothing off-box reaches the
+# guest (tama, on this host, did — which hid it).
+set -eu
+TAP=tap0 WAN=wlp2s0 HOST_IP=192.168.1.49 GUEST_IP=192.168.1.50 OWNER=netoneko
+
+rule() { iptables -"$1" DOCKER-USER -i "$2" -o "$3" -j ACCEPT; }
+
+case "${1:-}" in
+up)
+    ip link show "$TAP" >/dev/null 2>&1 || ip tuntap add "$TAP" mode tap user "$OWNER"
+    ip addr show "$TAP" | grep -q "$HOST_IP/" || ip addr add "$HOST_IP/32" dev "$TAP"
+    ip link set "$TAP" up
+    ip route replace "$GUEST_IP/32" dev "$TAP"
+    sysctl -q -w net.ipv4.ip_forward=1 \
+        "net.ipv4.conf.$WAN.proxy_arp=1" "net.ipv4.conf.$TAP.proxy_arp=1" net.ipv4.conf.all.proxy_arp=1
+    rule C "$WAN" "$TAP" 2>/dev/null || rule I "$WAN" "$TAP"
+    rule C "$TAP" "$WAN" 2>/dev/null || rule I "$TAP" "$WAN"
+    docker start akuma-dnsmasq >/dev/null
+    ;;
+down)
+    docker stop akuma-dnsmasq >/dev/null 2>&1 || true
+    rule D "$WAN" "$TAP" 2>/dev/null || true
+    rule D "$TAP" "$WAN" 2>/dev/null || true
+    ip route del "$GUEST_IP/32" dev "$TAP" 2>/dev/null || true
+    ip link del "$TAP" 2>/dev/null || true
+    ;;
+*) echo "usage: sora-net up|down" >&2; exit 2 ;;
+esac
