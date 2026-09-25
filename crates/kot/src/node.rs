@@ -39,6 +39,8 @@
 //! | `GET /chain/{head,blocks,checkpoint}` | the block log, for replicas |
 //! | `GET /mesh/status`, `POST /mesh/vote` | election (`miot-mesh`) |
 //! | `GET /mesh/peers` | what this node sees of the mesh — `kot peers` |
+//! | `POST /activity` | this node's own cat's live record (`crate::activity`), signed by that cat — no one else's |
+//! | `GET /activity` | every cat's live record this node has heard: its own, and each peer's, carried on the status exchange |
 //!
 //! # Changing role
 //!
@@ -80,6 +82,7 @@ use sp_runtime::traits::Header as HeaderT;
 use sp_runtime::traits::UniqueSaturatedInto;
 use tokio::sync::Mutex;
 
+use crate::activity::{Activity, Seen};
 use crate::common::parse_task;
 use crate::tls;
 
@@ -190,7 +193,38 @@ pub struct Node {
     push_reconciled: BTreeSet<(String, u64)>,
     http: reqwest::Client,
     started: Instant,
+    /// This node's own cat's live record, and when it came in — never on
+    /// chain (`crate::activity`).
+    activity: Option<(Instant, Activity)>,
+    /// Each peer's cat's, by the account that signed the status carrying
+    /// it: when it came in, and how old it already was then.
+    peer_activity: BTreeMap<String, (Instant, u64, Activity)>,
 }
+
+/// What actually goes over `/mesh/status`: the election's [`Status`], plus
+/// this node's cat's live record riding along. Flattened, so to a node on
+/// an older build — which parses a plain `Status` and ignores fields it
+/// doesn't know — it's just a status; one that sends a plain `Status`
+/// reads here as one with no activity.
+#[derive(Serialize, Deserialize)]
+struct StatusWire {
+    #[serde(flatten)]
+    status: Status,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    activity: Option<CarriedActivity>,
+}
+
+/// A record on the wire between nodes: how old it is as it leaves.
+#[derive(Serialize, Deserialize)]
+struct CarriedActivity {
+    age_ms: u64,
+    #[serde(flatten)]
+    activity: Activity,
+}
+
+/// Records older than this aren't served: that cat's node has been out of
+/// earshot long enough that "what it's doing" is no longer known.
+const ACTIVITY_FORGET: Duration = Duration::from_secs(10 * 60);
 
 /// A block body: its effects, SCALE-encoded, then the seal time (unix ms,
 /// `u64`). The time is *appended* rather than wrapped around the effects so
@@ -400,6 +434,8 @@ impl Node {
                 .build()
                 .unwrap(),
             started: Instant::now(),
+            activity: None,
+            peer_activity: BTreeMap::new(),
         };
         if !node.store.is_empty() {
             println!(
@@ -414,6 +450,28 @@ impl Node {
 
     fn now_ms(&self) -> u64 {
         self.started.elapsed().as_millis() as u64
+    }
+
+    /// Our status as it goes on the wire, our cat's record riding along.
+    fn status_wire(&self) -> StatusWire {
+        let status = self.mesh.status(self.store.head(), &miot_keys::to_hex(&self.identity.account()));
+        let activity = self.activity.as_ref().map(|(got, a)| CarriedActivity { age_ms: got.elapsed().as_millis() as u64, activity: a.clone() });
+        StatusWire { status, activity }
+    }
+
+    /// A peer's cat's record, from a status `signer` sent (or answered
+    /// with). Only if the status names its own signer, and only if newer
+    /// than what we have — two routes can deliver the same record twice.
+    fn take_peer_activity(&mut self, signer: &AccountId, wire: &StatusWire) {
+        let Some(c) = &wire.activity else { return };
+        let key = miot_keys::to_hex(signer);
+        if wire.status.account != key {
+            return;
+        }
+        if self.peer_activity.get(&key).is_some_and(|(_, _, had)| had.at > c.activity.at) {
+            return;
+        }
+        self.peer_activity.insert(key, (Instant::now(), c.age_ms, c.activity.clone()));
     }
 
     pub fn head(&self) -> u64 {
@@ -763,7 +821,7 @@ impl PeerAuth {
 pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
     let (routes, mine) = {
         let n = shared.lock().await;
-        let mine = serde_json::to_vec(&n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account()))).expect("Status serializes");
+        let mine = serde_json::to_vec(&n.status_wire()).expect("Status serializes");
         (n.mesh.routes().to_vec(), mine)
     };
     let auth = PeerAuth::snapshot(shared).await;
@@ -798,8 +856,8 @@ pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
                 };
                 let resp_headers = resp.headers().clone();
                 let bytes = resp.bytes().await.ok()?;
-                verify_headers(&resp_headers, &bytes, |a| auth.is_trusted(a)).ok()?;
-                serde_json::from_slice::<Status>(&bytes).ok()
+                let signer = verify_headers(&resp_headers, &bytes, |a| auth.is_trusted(a)).ok()?;
+                Some((signer, serde_json::from_slice::<StatusWire>(&bytes).ok()?))
             }
             .await;
             (r, st)
@@ -814,8 +872,9 @@ pub async fn mesh_round(shared: &Shared, poll_ms: u64) {
         let mut n = shared.lock().await;
         let now = n.now_ms();
         for (r, st) in got {
-            if let Some(st) = st {
-                n.mesh.on_status(&r, st, now);
+            if let Some((signer, wire)) = st {
+                n.take_peer_activity(&signer, &wire);
+                n.mesh.on_status(&r, wire.status, now);
             }
         }
         let head = n.store.head();
@@ -1461,6 +1520,7 @@ pub fn router(shared: Shared) -> Router {
         .route("/mesh/status", get(mesh_status).post(mesh_status_post))
         .route("/mesh/vote", post(mesh_vote))
         .route("/mesh/peers", get(mesh_peers))
+        .route("/activity", get(activity_get).post(activity_post))
         .with_state(shared)
 }
 
@@ -1564,8 +1624,7 @@ async fn mesh_status(AxState(n): AxState<Shared>, headers: HeaderMap) -> Respons
     if let Err(why) = verify_headers(&headers, b"", |a| n.is_trusted_signer(a)) {
         return unauthorized(why);
     }
-    let status = n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account()));
-    signed_json(&n.identity, StatusCode::OK, &status)
+    signed_json(&n.identity, StatusCode::OK, &n.status_wire())
 }
 
 /// `POST /mesh/status`: the same answer as `GET`, but the caller sends its
@@ -1579,15 +1638,55 @@ async fn mesh_status_post(AxState(n): AxState<Shared>, headers: HeaderMap, body:
     };
     // A status that doesn't name its own signer is ignored, not refused:
     // the caller still gets our answer, which is all the old GET gave it.
-    if let Ok(st) = serde_json::from_slice::<Status>(&body) {
-        if st.account == miot_keys::to_hex(&signer) {
+    if let Ok(wire) = serde_json::from_slice::<StatusWire>(&body) {
+        if wire.status.account == miot_keys::to_hex(&signer) {
+            n.take_peer_activity(&signer, &wire);
             let now = n.now_ms();
-            n.mesh.on_inbound(st, now);
+            n.mesh.on_inbound(wire.status, now);
             n.follow_mesh();
         }
     }
-    let status = n.mesh.status(n.store.head(), &miot_keys::to_hex(&n.identity.account()));
-    signed_json(&n.identity, StatusCode::OK, &status)
+    signed_json(&n.identity, StatusCode::OK, &n.status_wire())
+}
+
+/// `POST /activity`: this node's own cat's live record. Signed by the cat,
+/// and taken only if that's this node's own key — `kot run --as <name>`
+/// runs the node and the cat as one identity — so no member can post a
+/// record for a cat it isn't.
+async fn activity_post(AxState(n): AxState<Shared>, headers: HeaderMap, body: Bytes) -> Response {
+    let mut n = n.lock().await;
+    let mine = n.identity.account();
+    match verify_headers(&headers, &body, |a| *a == mine) {
+        Ok(_) => {}
+        Err(why) => return unauthorized(why),
+    }
+    match serde_json::from_slice::<Activity>(&body) {
+        Ok(a) => {
+            n.activity = Some((Instant::now(), a));
+            StatusCode::NO_CONTENT.into_response()
+        }
+        Err(_) => (StatusCode::BAD_REQUEST, "malformed activity").into_response(),
+    }
+}
+
+/// `GET /activity`: every cat's live record this node has heard — its own
+/// first, then each peer's, with how old each is now.
+async fn activity_get(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+    let n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
+    let mut out: Vec<Seen> = Vec::new();
+    if let Some((got, a)) = &n.activity {
+        out.push(Seen { account: miot_keys::to_hex(&n.identity.account()), age_ms: got.elapsed().as_millis() as u64, activity: a.clone() });
+    }
+    for (account, (got, age, a)) in &n.peer_activity {
+        if got.elapsed() > ACTIVITY_FORGET {
+            continue;
+        }
+        out.push(Seen { account: account.clone(), age_ms: age + got.elapsed().as_millis() as u64, activity: a.clone() });
+    }
+    Json(out).into_response()
 }
 
 async fn mesh_vote(AxState(n): AxState<Shared>, headers: HeaderMap, body: Bytes) -> Response {

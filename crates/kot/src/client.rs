@@ -32,6 +32,7 @@ use sp_core::H256;
 use std::sync::Arc;
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 
+use crate::activity::Seen;
 use crate::common::{EventCursor, Roster, DIM, OFF};
 use crate::ui;
 
@@ -320,6 +321,15 @@ impl Client {
 
     /// The litter roster, then the mesh as seen from the connected node:
     /// who's primary, each peer's term, head and how recently it answered.
+    /// What every cat this node can hear is doing right now (`GET
+    /// /activity`), or just `only`.
+    pub async fn activity_text(&mut self, only: Option<&str>) -> String {
+        match self.get_json("/activity").await.and_then(|v| serde_json::from_value::<Vec<Seen>>(v).map_err(|e| e.to_string())) {
+            Ok(seen) => ui::activity_text(&seen, &self.roster, only),
+            Err(e) => format!("  {}", ui::alert(&format!("no /activity from {} ({e}) — an older build?", self.node))),
+        }
+    }
+
     pub async fn print_peers(&mut self) {
         println!("{}", self.peers_text().await);
     }
@@ -763,6 +773,21 @@ async fn tail_events(
     }
 }
 
+/// Background, spawned by the REPL: keeps `state.activity` current from
+/// `/activity`, once a second — the composer's activity row reads it on
+/// every redraw. A node too old to have the route just leaves it empty.
+async fn poll_activity(http: reqwest::Client, node: String, identity: Identity, state: Arc<AsyncMutex<ComposerState>>) {
+    loop {
+        let headers = crate::node::sign_headers(&identity, b"");
+        if let Ok(r) = http.get(format!("{node}/activity")).headers(headers).send().await {
+            if let Ok(seen) = r.json::<Vec<Seen>>().await {
+                state.lock().await.activity = seen;
+            }
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+    }
+}
+
 /// What the composer's hairline needs, kept current by the background
 /// pollers and read fresh on every redraw.
 struct ComposerState {
@@ -773,9 +798,12 @@ struct ComposerState {
     /// as `◌ sealing…` in the status row until the chain's `said` comes
     /// back through `tail_events`, which then prints only `✓ sealed`.
     sealing: usize,
+    /// Every cat's live record, as the node last served it.
+    activity: Vec<Seen>,
 }
 
-const COMPOSER_HEIGHT: u16 = 2;
+/// The activity row, the hairline, the prompt.
+const COMPOSER_HEIGHT: u16 = 3;
 
 /// Feeds one already-ANSI-colored block from `kot::ui` (possibly several
 /// `\n`-joined lines) into the inline viewport's scrollback, above the
@@ -941,7 +969,7 @@ impl Input {
             return;
         }
         let candidates: Vec<String> = if let Some(prefix) = word.strip_prefix('/') {
-            ["/task", "/tasks", "/peers", "/artifact", "/artifacts", "/note", "/notes", "/clear", "/keys", "/quit", "/exit"].iter().filter(|c| c[1..].starts_with(prefix)).map(|s| s.to_string()).collect()
+            ["/task", "/tasks", "/peers", "/activity", "/artifact", "/artifacts", "/note", "/notes", "/clear", "/keys", "/quit", "/exit"].iter().filter(|c| c[1..].starts_with(prefix)).map(|s| s.to_string()).collect()
         } else if let Some(prefix) = word.strip_prefix('@') {
             let mut v: Vec<String> = roster.names().filter(|n| n.starts_with(prefix)).map(|n| format!("@{n}")).collect();
             for alias in ["all", "litter", "cats"] {
@@ -1070,6 +1098,10 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
         }
         ("/peers", _) => {
             let t = c.peers_text().await;
+            send(t);
+        }
+        ("/activity", who) => {
+            let t = c.activity_text(if who.is_empty() { None } else { Some(who) }).await;
             send(t);
         }
         // Same id-shape routing as `Client::print_artifact`/`ArtifactRead`:
@@ -1311,16 +1343,22 @@ pub async fn repl(mut c: Client) {
     };
 
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
-    let state = Arc::new(AsyncMutex::new(ComposerState { node: c.node.clone(), primary: primary.unwrap_or_else(|| "?".into()), head: head_block, sealing: 0 }));
+    let state = Arc::new(AsyncMutex::new(ComposerState { node: c.node.clone(), primary: primary.unwrap_or_else(|| "?".into()), head: head_block, sealing: 0, activity: Vec::new() }));
 
     tokio::spawn(tail_events(c.http.clone(), c.node.clone(), c.identity, c.roster.clone(), me_name.clone(), cursor, tx.clone(), state.clone()));
     tokio::spawn(poll_mesh_ui(c.http.clone(), c.node.clone(), c.identity, c.roster.clone(), tx.clone(), state.clone()));
+    tokio::spawn(poll_activity(c.http.clone(), c.node.clone(), c.identity, state.clone()));
 
     let mut input = Input::new();
     let mut events = EventStream::new();
+    // The activity row counts seconds up; redraw on a tick, not only when a
+    // line arrives or a key is pressed.
+    let mut tick = tokio::time::interval(std::time::Duration::from_millis(1_000));
+    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
     loop {
         let quit = tokio::select! {
+            _ = tick.tick() => false,
             Some(text) = rx.recv() => { insert_ansi(&mut terminal, &text); false }
             maybe_ev = events.next() => match maybe_ev {
                 Some(Ok(Event::Key(key))) => match input.handle(key, &c.roster) {
@@ -1337,9 +1375,9 @@ pub async fn repl(mut c: Client) {
             break;
         }
 
-        let (node, primary, head, sealing) = {
+        let (node, primary, head, sealing, activity) = {
             let s = state.lock().await;
-            (s.node.clone(), s.primary.clone(), s.head, s.sealing)
+            (s.node.clone(), s.primary.clone(), s.head, s.sealing, ui::activity_row(&s.activity, &c.roster))
         };
         let status = ui::composer_status(&node, &primary, head, sealing);
         // Reflects `/dm`'s sticky target fresh every redraw, since
@@ -1349,10 +1387,12 @@ pub async fn repl(mut c: Client) {
         let prompt_w = ui::vcells(&prompt) as u16;
         let _ = terminal.draw(|f| {
             let area = f.area();
-            let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1)]).split(area);
+            let rows = Layout::vertical([Constraint::Length(1), Constraint::Length(1), Constraint::Length(1)]).split(area);
+            let activity_text: Text = activity.as_str().into_text().unwrap_or_else(|_| Text::raw(activity.clone()));
+            f.render_widget(Paragraph::new(activity_text), rows[0]);
             let status_text: Text = status.as_str().into_text().unwrap_or_else(|_| Text::raw(status.clone()));
-            f.render_widget(Paragraph::new(status_text), rows[0]);
-            let cols = Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(1)]).split(rows[1]);
+            f.render_widget(Paragraph::new(status_text), rows[1]);
+            let cols = Layout::horizontal([Constraint::Length(prompt_w), Constraint::Min(1)]).split(rows[2]);
             let prompt_text: Text = prompt.as_str().into_text().unwrap_or_else(|_| Text::raw(prompt.clone()));
             f.render_widget(Paragraph::new(prompt_text), cols[0]);
             f.render_widget(input.widget(), cols[1]);

@@ -108,6 +108,12 @@ enum Cmd {
     Compact,
     /// The litter roster, and the mesh as the connected node sees it.
     Peers,
+    /// What each cat is doing right now — its place in the agent loop, the
+    /// tool calls in flight, how finished ones went, its last reasoning.
+    Activity {
+        /// Just this cat.
+        name: Option<String>,
+    },
     /// The event log.
     Log {
         #[arg(long)]
@@ -392,6 +398,10 @@ async fn main() {
             c.submit(RuntimeCall::Litter(pallet_litter::Call::request_compaction {})).await;
         }
         Some(Cmd::Peers) => connect(&cli).await.print_peers().await,
+        Some(Cmd::Activity { name }) => {
+            let mut c = connect(&cli).await;
+            println!("{}", c.activity_text(name.as_deref()).await);
+        }
         Some(Cmd::Log { task, follow }) => connect(&cli).await.log(0, task.as_deref(), *follow, None).await,
         // The banner is `repl()`'s own (`ui::banner`) — printing the bare
         // cat here too drew the logo twice.

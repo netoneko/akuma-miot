@@ -26,7 +26,9 @@ use sp_core::H256;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+use crate::activity::Activity;
 use crate::agent_state_machine::{self, Dispatch, Host, Inbound};
+use crate::local_tasks::LocalTasks;
 use crate::common::{parse_task, EventCursor, Roster};
 use crate::ui::{self, ToolOut};
 
@@ -56,8 +58,7 @@ struct Session {
 
 impl Session {
     fn path(name: &str) -> PathBuf {
-        let home = std::env::var("HOME").unwrap_or_default();
-        std::path::Path::new(&home).join(".akuma/kot").join(format!("{name}.session.json"))
+        kot_dir().join(format!("{name}.session.json"))
     }
 
     /// Load this cat's saved session if it matches `epoch` — a stale one (the
@@ -83,6 +84,12 @@ impl Session {
     }
 }
 
+/// `~/.akuma/kot` — this cat's own files: its session, its transcript.
+fn kot_dir() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_default();
+    std::path::Path::new(&home).join(".akuma/kot")
+}
+
 /// Appended to every persona. Found live, 2026-09-23: GLM's tool calls were
 /// landing as `WrongKind`/`SubtasksOutstanding`/no-call-at-all often enough
 /// to break a run. Two of the three causes are id confusion (a small model
@@ -101,7 +108,10 @@ response, not a rule violation. Don't manufacture a reply just to have said \
 something.\n\
 - You may call several tools in the same response. They all run at once, so \
 don't make one depend on another's output within a response — call what you \
-need, and act on the results when they come back.";
+need, and act on the results when they come back.\n\
+- For a job with several steps, write them down with LocalTask (add), mark \
+each one as you start and finish it, and check the list when you're unsure \
+where you were — your conversation can be lost to a restart, the list isn't.";
 
 pub struct AgentConfig {
     pub name: String,
@@ -143,6 +153,13 @@ struct Cat {
     /// reported on chain (`report_stats`) the same way, so any cat's
     /// `Stats` tool call and the operator's `GET /stats` both see it.
     stats: tokio::sync::Mutex<CatStats>,
+    /// The live record (`crate::activity`), newest only — [`post_activity`]
+    /// sends whatever is here when it gets round to it, so a burst of
+    /// steps costs one POST, not one each.
+    activity: tokio::sync::watch::Sender<Option<Activity>>,
+    /// Its own to-do list (`LocalTask`), next to the session file, emptied
+    /// when the checkpoint moves (`watch_chain`).
+    local: std::sync::Mutex<LocalTasks>,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -710,7 +727,9 @@ impl Host for CatHost {
         &self.0.name
     }
     fn tools(&self, kind: &'static str) -> Vec<miot_llm::Tool> {
-        if kind == "said" { miot_llm::chat_tools() } else { task_tools() }
+        let mut t = if kind == "said" { miot_llm::chat_tools() } else { task_tools() };
+        t.push(miot_llm::local_task_tool());
+        t
     }
     fn rules(&self) -> &'static str {
         AGENT_RULES
@@ -719,6 +738,16 @@ impl Host for CatHost {
         let cat = self.0.clone();
         let c = c.clone();
         match c.name.as_str() {
+            // Local and instant, but a query all the same: the list comes
+            // back as its result.
+            "LocalTask" => {
+                let (ok, text) = match cat.local.lock().unwrap().apply(&c.str("action").unwrap_or_default(), &c.str("id").unwrap_or_default(), &c.str("text").unwrap_or_default()) {
+                    Ok(t) => (true, t),
+                    Err(t) => (false, t),
+                };
+                let arg = format!("{} {}", c.str("action").unwrap_or_default(), c.str("id").or(c.str("text")).unwrap_or_default());
+                Dispatch::Query(Box::pin(async move { ToolOut::new(arg, ok).body(text) }))
+            }
             "ArtifactList" | "ArtifactRead" | "Peers" | "Stats" => {
                 Dispatch::Query(Box::pin(async move { cat.query(&c).await.unwrap_or_else(|| ToolOut::new("", false)) }))
             }
@@ -728,6 +757,21 @@ impl Host for CatHost {
             _ => Dispatch::Unknown,
         }
     }
+    fn activity(&self, a: &Activity) {
+        let mut a = a.clone();
+        a.todo = self.0.local.lock().unwrap().open().map(|t| format!("{} [{}] {}", t.id, t.status, t.text)).collect();
+        self.0.activity.send_replace(Some(a));
+    }
+
+    fn reminder(&self) -> Option<String> {
+        self.0.local.lock().unwrap().reminder()
+    }
+
+    /// `~/.akuma/kot/<name>.transcript.jsonl` — next to the session file.
+    fn transcript(&self) -> Option<PathBuf> {
+        Some(kot_dir().join(format!("{}.transcript.jsonl", self.0.name)))
+    }
+
     fn about(&self) -> String {
         format!(
             "Where: a cat in the Akuma Miot litter, account {}, talking to its node at {}",
@@ -818,6 +862,8 @@ pub async fn run(cfg: AgentConfig) {
         meta: tokio::sync::OnceCell::new(),
         nonce: tokio::sync::Mutex::new(None),
         stats: tokio::sync::Mutex::new(CatStats::default()),
+        activity: tokio::sync::watch::channel(None).0,
+        local: std::sync::Mutex::new(LocalTasks::default()),
     });
     let name = cat.name.clone();
     println!("{}", ui::note(&format!("{name} id={} node={} llm={}", miot_keys::short(&account), cat.node, cfg.llm.label())));
@@ -832,13 +878,59 @@ pub async fn run(cfg: AgentConfig) {
         }
     };
     println!("{}", ui::note(&format!("{name} connected")));
+    let epoch = head["last_checkpoint"].as_u64().unwrap_or(0);
+    *cat.local.lock().unwrap() = LocalTasks::load(Some(kot_dir().join(format!("{name}.tasks.json"))), epoch);
 
     // The chain is one source of the inbox; the state machine's own tool
     // results are the other. This task only turns chain events into wakes.
     let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     tokio::spawn(watch_chain(cat.clone(), head, tx));
+    // Subscribed here, before the loop can publish: a receiver made after
+    // the first record would count it as already seen and never send it
+    // (found live 2026-09-25 — a GLM cat, whose loop starts with no network
+    // round trip, never showed up at all).
+    tokio::spawn(post_activity(cat.clone(), cat.activity.subscribe()));
     agent_state_machine::run(Arc::new(CatHost(cat)), cfg.llm, cfg.persona, rx).await;
 }
+
+/// Send the live record to this cat's node (`POST /activity`) whenever it
+/// changes — the newest one only, at most every [`ACTIVITY_MIN_MS`] — and
+/// again every [`ACTIVITY_HEARTBEAT`] when it doesn't, so a cat that's idle
+/// reads as idle rather than as a record gone stale (`ui::ACTIVITY_STALE_MS`).
+/// Best effort: a node too old to have the route, or one that's busy, just
+/// misses a step; the next send carries the whole state again. The body is
+/// signed with this cat's key, and the node takes it only from its own
+/// (`node.rs`), so one cat can't speak for another.
+async fn post_activity(cat: Arc<Cat>, mut rx: tokio::sync::watch::Receiver<Option<Activity>>) {
+    loop {
+        let current = rx.borrow_and_update().clone();
+        if let Some(mut a) = current {
+            // Re-stamped: a heartbeat says "still true as of now".
+            a.at = crate::activity::unix_ms();
+            let body = serde_json::to_vec(&a).expect("Activity serializes");
+            let headers = crate::node::sign_headers(&cat.identity, &body);
+            let _ = cat
+                .http
+                .post(format!("{}/activity", cat.node))
+                .headers(headers)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .body(body)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(ACTIVITY_MIN_MS)).await;
+        tokio::select! {
+            changed = rx.changed() => if changed.is_err() { return },
+            _ = tokio::time::sleep(ACTIVITY_HEARTBEAT) => {}
+        }
+    }
+}
+
+/// [`post_activity`]'s floor between two POSTs.
+const ACTIVITY_MIN_MS: u64 = 250;
+/// [`post_activity`]'s re-send when nothing changed.
+const ACTIVITY_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Poll the node's `/events`, and send every event that wakes this cat into
 /// the inbox as a prompt — newest per (task, kind), since a turn takes
@@ -875,6 +967,7 @@ async fn watch_chain(cat: Arc<Cat>, mut head: serde_json::Value, tx: tokio::sync
         if let Some(ep) = head["last_checkpoint"].as_u64() {
             if ep != session.epoch {
                 let _ = tx.send(Inbound::Reset(format!("chain checkpoint moved ({} -> {ep})", session.epoch)));
+                cat.local.lock().unwrap().reset(ep);
                 session.epoch = ep;
                 question.clear();
             }

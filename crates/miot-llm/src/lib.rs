@@ -72,6 +72,12 @@ pub struct Turn {
     /// one directly.
     pub total_tokens: u32,
     pub ms: u64,
+    /// What the model thought before answering, when the provider sends it
+    /// apart (`reasoning_content` — GLM, OpenRouter's reasoning models) or
+    /// inline as `<think>…</think>` (qwen3 on llama-server), which is cut
+    /// out of `text` here. Never fed back into history: it's for watching
+    /// the model work, not for the model.
+    pub reasoning: Option<String>,
 }
 
 /// A cat's endpoint.
@@ -232,9 +238,13 @@ impl Llm {
             Speaker::Assistant => ChatMessage::assistant(text.clone()),
         }));
         let req = ChatRequest::new(messages).with_tools(tools);
+        let mut opts = ChatOptions::default().with_normalize_reasoning_content(true);
+        if let Some(n) = self.max_tokens {
+            opts = opts.with_max_tokens(n);
+        }
         let res = self
             .client
-            .exec_chat(&self.model, req, self.max_tokens.map(|n| ChatOptions::default().with_max_tokens(n)).as_ref())
+            .exec_chat(&self.model, req, Some(&opts))
             .await
             .map_err(|e| format!("{}: {e}", self.label))?;
 
@@ -242,12 +252,13 @@ impl Llm {
         let prompt_tokens = res.usage.prompt_tokens.unwrap_or(0).max(0) as u32;
         let total_tokens = res.usage.total_tokens.map(|t| t.max(0) as u32).unwrap_or(prompt_tokens + tokens);
         let text = res.first_text().unwrap_or_default().to_string();
+        let reasoning = res.reasoning_content.clone().map(|r| r.trim().to_string()).filter(|r| !r.is_empty());
         let calls = res
             .into_tool_calls()
             .into_iter()
             .map(|c| Call { name: c.fn_name, args: c.fn_arguments })
             .collect();
-        Ok(Turn { text, calls, tokens, prompt_tokens, total_tokens, ms: started.elapsed().as_millis() as u64 })
+        Ok(Turn { text, calls, tokens, prompt_tokens, total_tokens, ms: started.elapsed().as_millis() as u64, reasoning })
     }
 }
 
@@ -455,6 +466,62 @@ pub fn budget_tools() -> Vec<Tool> {
                 "required": ["id"]
             })),
     ]
+}
+
+/// Your own calls still in flight — see what they've printed so far, stop
+/// one. Offered by `kot`'s agent state machine to every host, which runs
+/// them itself. Ids are `r3`-shaped so they can't be mistaken for a stored
+/// result's (`Inspect`'s) plain number.
+pub fn flight_tools() -> Vec<Tool> {
+    vec![
+        Tool::new("Running")
+            .with_description(
+                "Your tool calls still in flight: id (like r3), what it is, how long it's run, how \
+                 much output it has produced and how long since the last of it, and its latest \
+                 output. With an id, more of that one call's output so far. Use it to check on a \
+                 slow build instead of guessing.",
+            )
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "string", "description": "a running call's id, like r3 — omit to list them all"}},
+            })),
+        Tool::new("Cancel")
+            .with_description(
+                "Stop one of your running tool calls by id (like r3, from Running) — a Bash command \
+                 is killed. Its result still comes back, marked cancelled, with whatever output it \
+                 had produced. Chain writes (SendMessage, TaskUpdate, ...) can't be cancelled.",
+            )
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {"id": {"type": "string", "description": "the running call's id, like r3"}},
+                "required": ["id"]
+            })),
+    ]
+}
+
+/// A cat's own to-do list — local, never on chain, only ever its own work.
+/// One tool with an `action` value rather than five, for [`task_tools`]'s
+/// reason; ids are `L1`, `L2`, … so they can't be mistaken for a chain
+/// task's `t1.2`. Every call answers with the whole list.
+pub fn local_task_tool() -> Tool {
+    Tool::new("LocalTask")
+        .with_description(
+            "Your own private to-do list for work you've taken on — kept on your host, not on the \
+             chain, and nobody else sees or assigns it. NOT the litter's tasks (t1, t1.2: those \
+             are TaskUpdate's). Use it to break a job into steps and keep track of where you are; \
+             it survives a restart of your process but is emptied when the chain starts a new \
+             session. Every call answers with the current list.",
+        )
+        .with_schema(serde_json::json!({
+            "type": "object",
+            "properties": {
+                "action": {"type": "string", "enum": ["add", "start", "done", "failed", "drop", "list"],
+                           "description": "add a new one (text required); start/done/failed/drop an existing one by id; list shows them all"},
+                "id": {"type": "string", "description": "an id like L2, from the list — for start/done/failed/drop"},
+                "text": {"type": "string", "description": "for add: what to do. For done/failed: what came of it (optional)"}
+            },
+            "required": ["action"]
+        }))
 }
 
 /// Self-identity — persona, model, platform, build version — for a model

@@ -12,6 +12,12 @@
 //!   worth a turn — an operator's line, a chain wake rendered into a prompt)
 //!   and tool results. Both queue while a turn is in flight; a turn is
 //!   never cancelled for them.
+//! - **Calls in flight are visible to the model.** Each has an `r`-id and a
+//!   live output buffer (`Bash` streams into it). `Running` shows them and
+//!   their output so far, `Cancel` stops one; every turn taken while some
+//!   are out lists them ("still running"); and a call silent for
+//!   [`Host::stall_after`] gets the model one notice turn, once per silence
+//!   — counted as a follow-up, so it can't loop.
 //! - **Queries run on their own.** A query tool (`Bash`, `ReadFile`,
 //!   `Peers`, ...) is spawned, not awaited; its result lands in the inbox
 //!   and is fed to the model on a later turn, labelled with an id.
@@ -41,10 +47,20 @@
 //! - **One conversation.** History accumulates for both hosts, with the same
 //!   budget warnings and compaction (`TokenBudget`/`Compact`/`BrowseTools`/
 //!   `Inspect`), and the same `AboutMe`.
+//! - **Watchable.** Every step rewrites one live [`Activity`] record — which
+//!   part of the loop this is, what's in flight, how finished calls went,
+//!   the tail of the last reasoning — handed to [`Host::activity`] (a cat
+//!   sends it to its node; `crate::activity`). The model's reasoning and any
+//!   text it wrote alongside its tool calls are shown, and every turn, result
+//!   and record goes to a JSONL transcript if the host names one
+//!   ([`Host::transcript`]).
 
+use crate::activity::{self, Activity, Finished, Flight};
 use crate::ui::{self, ToolOut, TurnCost};
 use miot_llm::{Call, Llm, Speaker, Tool};
 use std::future::Future;
+use std::io::Write as _;
+use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -67,6 +83,17 @@ const INSPECT_CHARS: usize = 2700;
 /// The most of one result kept at all (head quarter, tail rest) — a build
 /// log must not eat a small box's heap.
 const STORE_CHARS: usize = 256 * 1024;
+/// A transcript past this is moved aside to `<name>.1` (one generation
+/// kept) and started again.
+const TRANSCRIPT_MAX: u64 = 64 * 1024 * 1024;
+/// A running call's buffer, before it's cut to its head and tail — a build
+/// log must not grow without bound while it runs either.
+const LIVE_BYTES: usize = 512 * 1024;
+const LIVE_HEAD: usize = 64 * 1024;
+/// A running call quiet this long gets the model a notice (`Host::stall_after`).
+pub const STALL_AFTER: Duration = Duration::from_secs(120);
+/// How much of a running call's output `Running <id>` shows — its tail.
+const RUNNING_TAIL: usize = 2400;
 /// `Bash` without a `timeout`, and the most one may ask for, in seconds.
 pub const BASH_DEFAULT_TIMEOUT: u64 = 30;
 pub const BASH_MAX_TIMEOUT: u64 = 3600;
@@ -129,6 +156,24 @@ pub trait Host: Send + Sync + 'static {
     fn show(&self, s: String) {
         println!("{s}");
     }
+    /// A call quiet this long gets the model a notice. A test shortens it.
+    fn stall_after(&self) -> Duration {
+        STALL_AFTER
+    }
+    /// The live record changed — a cat sends it to its node. Called often
+    /// (every step); coalescing is the host's business.
+    fn activity(&self, _a: &Activity) {}
+    /// Where to append the JSONL transcript — every turn's prompt,
+    /// reasoning, text and calls, every result and record in full. `None`:
+    /// no transcript.
+    fn transcript(&self) -> Option<PathBuf> {
+        None
+    }
+    /// A line added to every turn that has a wake in it — a cat's open
+    /// local tasks, so it knows where it was even after a restart.
+    fn reminder(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Appended to every persona, both hosts. The model has to know results
@@ -151,6 +196,9 @@ reads the part in between.\n\
 last one; report your progress then. Results that arrive after that aren't lost — they \
 come back with the next message you get.\n\
 - AboutMe tells you who you are: your persona, model, and what you're running on.\n\
+- Running shows your tool calls still in flight (ids like r3) and what they've printed so \
+far; Cancel stops one. You'll be told when one has gone quiet for a while — check it, \
+cancel it, or leave it.\n\
 - TokenBudget tells you how much context you have left. BrowseTools lists past tool \
 results (id, name, preview); Inspect pulls one back by id. Compact replaces the \
 conversation so far with a summary you write, to free room — past tool results survive \
@@ -161,13 +209,118 @@ pub fn shared_tools() -> Vec<Tool> {
     let mut t = vec![miot_llm::about_me_tool()];
     t.extend(miot_llm::local_tools());
     t.extend(miot_llm::budget_tools());
+    t.extend(miot_llm::flight_tools());
     t
 }
 
+/// A call in flight, as `Running`/`Cancel` see it: what it has printed so
+/// far (only `Bash` prints as it goes), when it last did, and the switch
+/// that stops it.
+pub struct Live {
+    out: std::sync::Mutex<Vec<u8>>,
+    bytes: std::sync::atomic::AtomicU64,
+    started: Instant,
+    last_output: std::sync::Mutex<Option<Instant>>,
+    cancel: tokio::sync::Notify,
+    /// A stall notice went out for the current silence; new output re-arms.
+    stall_noted: std::sync::atomic::AtomicBool,
+}
+
+impl Live {
+    fn new() -> Self {
+        Live {
+            out: Default::default(),
+            bytes: Default::default(),
+            started: Instant::now(),
+            last_output: Default::default(),
+            cancel: tokio::sync::Notify::new(),
+            stall_noted: Default::default(),
+        }
+    }
+
+    fn push(&self, chunk: &[u8]) {
+        let mut out = self.out.lock().unwrap();
+        out.extend_from_slice(chunk);
+        if out.len() > LIVE_BYTES {
+            // Keep the head (what it set out to do) and the newest tail.
+            let tail_from = out.len() - (LIVE_BYTES / 2);
+            let mut kept = out[..LIVE_HEAD].to_vec();
+            kept.extend_from_slice(format!("\n… [{} bytes not kept] …\n", tail_from - LIVE_HEAD).as_bytes());
+            kept.extend_from_slice(&out[tail_from..]);
+            *out = kept;
+        }
+        self.bytes.fetch_add(chunk.len() as u64, std::sync::atomic::Ordering::Relaxed);
+        *self.last_output.lock().unwrap() = Some(Instant::now());
+        self.stall_noted.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Everything kept so far.
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.out.lock().unwrap()).into_owned()
+    }
+
+    fn tail(&self, n: usize) -> String {
+        let t = self.text();
+        let len = t.chars().count();
+        if len <= n { t } else { format!("…{}", t.chars().skip(len - n).collect::<String>()) }
+    }
+
+    fn bytes(&self) -> u64 {
+        self.bytes.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// How long since it last printed — or since it started, if never.
+    fn quiet(&self) -> Duration {
+        self.last_output.lock().unwrap().unwrap_or(self.started).elapsed()
+    }
+
+    fn last_output(&self) -> Option<Instant> {
+        *self.last_output.lock().unwrap()
+    }
+}
+
 enum Back {
-    /// A query's result, tagged with the session it was asked in.
-    Result(String, ToolOut, u64),
-    RecordDone,
+    /// A query's result, tagged with the session it was asked in and its
+    /// flight (`None`: an instant one, never in flight).
+    Result(String, ToolOut, u64, Option<u64>),
+    /// A record finished; `None` if the host showed it its own way.
+    RecordDone(u64, Option<ToolOut>),
+}
+
+/// The JSONL transcript ([`Host::transcript`]). Best effort: a write that
+/// fails is dropped, never allowed to stop the loop.
+struct Transcript {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    written: u64,
+}
+
+impl Transcript {
+    fn open(path: PathBuf) -> Self {
+        if let Some(dir) = path.parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let file = std::fs::OpenOptions::new().create(true).append(true).open(&path).ok();
+        let written = file.as_ref().and_then(|f| f.metadata().ok()).map(|m| m.len()).unwrap_or(0);
+        Transcript { path, file, written }
+    }
+
+    fn write(&mut self, mut v: serde_json::Value) {
+        if self.written > TRANSCRIPT_MAX {
+            let mut old = self.path.clone().into_os_string();
+            old.push(".1");
+            let _ = std::fs::rename(&self.path, old);
+            *self = Transcript::open(self.path.clone());
+        }
+        v["at"] = activity::unix_ms().into();
+        let mut line = v.to_string();
+        line.push('\n');
+        if let Some(f) = &mut self.file {
+            if f.write_all(line.as_bytes()).is_ok() {
+                self.written += line.len() as u64;
+            }
+        }
+    }
 }
 
 struct AgentStateMachine<H: Host> {
@@ -202,6 +355,15 @@ struct AgentStateMachine<H: Host> {
     /// Inbound traffic read early — while checking for a reset between a
     /// turn's thinking and its acting — kept for the main loop, in order.
     pending: std::collections::VecDeque<Inbound>,
+    /// The live record ([`Host::activity`]).
+    act: Activity,
+    /// Each query in flight's buffer and cancel switch, by flight id.
+    live: std::collections::HashMap<u64, Arc<Live>>,
+    /// Stall notices waiting for a turn.
+    notices: Vec<String>,
+    /// The next flight id.
+    flights: u64,
+    transcript: Option<Transcript>,
 }
 
 /// Think until `inbox` closes and nothing is left in flight.
@@ -209,6 +371,23 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
     let window = llm.context_window().await;
     let (back_tx, mut back_rx) = mpsc::unbounded_channel();
     let system = format!("{persona}{RULES}{}", host.rules());
+    let mut transcript = host.transcript().map(Transcript::open);
+    if let Some(t) = &mut transcript {
+        if t.file.is_none() {
+            host.show(ui::note(&format!("transcript: can't open {} — not writing one", t.path.display())));
+        } else {
+            host.show(ui::note(&format!("transcript: {}", t.path.display())));
+        }
+        t.write(serde_json::json!({"t": "start", "name": host.name(), "model": llm.label(), "window": window, "system": system}));
+    }
+    let act = Activity {
+        name: host.name().to_string(),
+        model: llm.label().to_string(),
+        phase: "idle".into(),
+        since: activity::unix_ms(),
+        window,
+        ..Default::default()
+    };
     let mut m = AgentStateMachine {
         host,
         llm: Arc::new(llm),
@@ -229,7 +408,19 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         check_armed: false,
         session: 0,
         pending: std::collections::VecDeque::new(),
+        act,
+        flights: 0,
+        transcript,
+        live: std::collections::HashMap::new(),
+        notices: Vec::new(),
     };
+    // Checks running calls for silence, and refreshes their output figures
+    // in the live record. Often enough to notice a stall within a quarter
+    // of the threshold; never more than every 5 s.
+    let every = (m.host.stall_after() / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    let mut watchdog = tokio::time::interval(every);
+    watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    m.publish();
     let mut open = true;
     let mut was_idle = false;
 
@@ -270,6 +461,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
                     None => open = false,
                 },
                 Some(b) = back_rx.recv() => m.back(b, &mut results),
+                _ = watchdog.tick() => m.watch(),
             }
         }
 
@@ -298,16 +490,26 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
             }
         }
 
-        if wakes.is_empty() && results.is_empty() {
+        if wakes.is_empty() && results.is_empty() && m.notices.is_empty() {
             continue;
         }
         if wakes.is_empty() {
             if m.followups >= MAX_FOLLOWUPS {
+                // Advisory only: past the cap a notice is dropped, not held.
+                if !m.notices.is_empty() {
+                    m.host.show(ui::note(&format!("{} stall notice(s) not given — follow-up turns used up", m.notices.len())));
+                    m.notices.clear();
+                }
+                if results.is_empty() {
+                    continue;
+                }
                 m.host.show(ui::note(&format!(
                     "{} result(s) held back — {MAX_FOLLOWUPS} follow-up turns in a row with nobody speaking; fed with the next message",
                     results.len()
                 )));
+                m.log(serde_json::json!({"t": "held", "n": results.len()}));
                 m.held.extend(results);
+                m.publish();
                 continue;
             }
             m.followups += 1;
@@ -332,12 +534,14 @@ impl<H: Host> AgentStateMachine<H> {
             Inbound::Wake { text, kind, ctx } => wakes.push((text, kind, ctx)),
             Inbound::Reset(why) => {
                 self.host.show(ui::note(&format!("new session — {why}")));
+                self.log(serde_json::json!({"t": "reset", "why": why}));
                 self.session += 1;
                 self.history.clear();
                 self.warned_tier = 0;
                 self.pending_warning = None;
                 self.followups = 0;
                 self.held.clear();
+                self.notices.clear();
                 self.check_armed = false;
                 wakes.clear();
                 results.clear();
@@ -349,18 +553,143 @@ impl<H: Host> AgentStateMachine<H> {
     /// for the next turn by id.
     fn back(&mut self, b: Back, results: &mut Vec<(usize, String)>) {
         match b {
-            Back::RecordDone => self.records = self.records.saturating_sub(1),
-            Back::Result(name, out, session) => {
+            Back::RecordDone(flight, out) => {
+                self.records = self.records.saturating_sub(1);
+                let (ok, meta) = out.as_ref().map(|o| (o.ok, o.meta.join(" · "))).unwrap_or((true, String::new()));
+                let (tool, arg) = self.land(Some(flight), "", "", ok, meta.clone());
+                self.log(serde_json::json!({"t": "record", "tool": tool, "arg": out.as_ref().map(|o| o.arg.clone()).unwrap_or(arg), "ok": ok, "meta": meta}));
+            }
+            Back::Result(name, out, session, flight) => {
                 self.queries = self.queries.saturating_sub(1);
                 self.host.show(ui::tool(self.host.name(), &name, &out));
+                self.land(flight, &name, &out.arg, out.ok, out.meta.join(" · "));
                 if session != self.session {
                     self.host.show(ui::note(&format!("{name}'s result is from before the session reset — not fed back")));
+                    self.log(serde_json::json!({"t": "result", "id": null, "tool": name, "ok": out.ok, "stale": true, "text": out.text()}));
                     return;
                 }
                 let id = self.tool_log.len();
                 self.tool_log.push((name, keep(&out.text())));
+                self.log(serde_json::json!({"t": "result", "id": id, "tool": self.tool_log[id].0, "ok": out.ok, "text": self.tool_log[id].1}));
                 results.push((id, feed(id, &self.tool_log[id].1)));
             }
+        }
+    }
+
+    /// On the watchdog's tick: refresh each running call's output figures,
+    /// and queue a notice for any that has gone quiet for
+    /// [`Host::stall_after`] — once per silence.
+    fn watch(&mut self) {
+        if self.act.running.is_empty() {
+            return;
+        }
+        let stall = self.host.stall_after();
+        let now = activity::unix_ms();
+        for f in &mut self.act.running {
+            let Some(live) = self.live.get(&f.id) else { continue };
+            f.output = live.bytes();
+            f.last_output = live.last_output().map(|t| now.saturating_sub(t.elapsed().as_millis() as u64)).unwrap_or(0);
+            let quiet = live.quiet();
+            if quiet >= stall && !live.stall_noted.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let ran = ui::human(live.started.elapsed().as_secs());
+                let heard = if live.bytes() == 0 { format!("no output at all in {ran}") } else { format!("no new output for {}", ui::human(quiet.as_secs())) };
+                let notice = format!(
+                    "[r{} {} still running] {} — {ran} so far, {heard}. It may be stalled: Running r{} shows its \
+                     output so far, Cancel r{} stops it. Or leave it — its result comes back when it finishes.",
+                    f.id, f.tool, f.arg, f.id, f.id
+                );
+                self.host.show(ui::note(&format!("r{} {} quiet for {} — telling the model", f.id, f.tool, ui::human(quiet.as_secs()))));
+                self.notices.push(notice);
+            }
+        }
+        self.publish();
+    }
+
+    /// The queries still out — what the model can look at or cancel.
+    /// Records (chain writes) aren't among them: as far as the model is
+    /// told, a write just happens (`RULES`), and listing one that's merely
+    /// waiting to be tallied had GLM deliberating whether to resend it
+    /// (found live 2026-09-25). The live record still shows them.
+    fn running_queries(&self) -> impl Iterator<Item = (&Flight, &Arc<Live>)> {
+        self.act.running.iter().filter_map(|f| self.live.get(&f.id).map(|l| (f, l)))
+    }
+
+    /// What's still out, for the top of a turn — so the model sees a slow
+    /// call's progress whenever it's woken, without asking.
+    fn still_running(&self) -> Option<String> {
+        let rows: Vec<String> = self
+            .running_queries()
+            .map(|(f, l)| {
+                let ran = activity::unix_ms().saturating_sub(f.since) / 1000;
+                let out = if l.bytes() == 0 {
+                    "no output yet".to_string()
+                } else {
+                    format!("{} of output, last {} ago", ui::bytes(l.bytes() as usize), ui::human(l.quiet().as_secs()))
+                };
+                format!("r{} {} {} — {}, {out}", f.id, f.tool, f.arg, ui::human(ran))
+            })
+            .collect();
+        if rows.is_empty() {
+            return None;
+        }
+        Some(format!("Still running (Running <id> for output so far, Cancel <id> to stop one):\n{}", rows.join("\n")))
+    }
+
+    /// A call came back: off the running list (if it was ever on it), into
+    /// the tally and the recent list. The waiting phase ends with the last
+    /// one. Returns the call's tool and argument as they were dispatched.
+    fn land(&mut self, flight: Option<u64>, tool: &str, arg: &str, ok: bool, meta: String) -> (String, String) {
+        let now = activity::unix_ms();
+        if let Some(id) = flight {
+            self.live.remove(&id);
+        }
+        let f = flight.and_then(|id| self.act.running.iter().position(|f| f.id == id)).map(|i| self.act.running.remove(i));
+        let (tool, arg, ms) = match f {
+            Some(f) => (f.tool, f.arg, now.saturating_sub(f.since)),
+            None => (tool.to_string(), activity::short(arg, activity::ARG_CHARS), 0),
+        };
+        if ok {
+            self.act.ok += 1;
+        } else {
+            self.act.failed += 1;
+        }
+        self.act.recent.push(Finished { tool: tool.clone(), arg: arg.clone(), ok, ms, meta, at: now });
+        if self.act.recent.len() > activity::RECENT {
+            self.act.recent.remove(0);
+        }
+        if self.act.phase == "waiting" && self.act.running.is_empty() {
+            self.phase("idle");
+        }
+        self.publish();
+        (tool, arg)
+    }
+
+    /// Enter `phase` — its clock restarts only if it's actually new.
+    fn phase(&mut self, phase: &str) {
+        if self.act.phase != phase {
+            self.act.phase = phase.to_string();
+            self.act.since = activity::unix_ms();
+        }
+    }
+
+    /// Where the model is after acting: tools still out, or nothing.
+    fn settle(&mut self) {
+        let p = if self.act.running.is_empty() { "idle" } else { "waiting" };
+        self.phase(p);
+        self.publish();
+    }
+
+    fn publish(&mut self) {
+        self.act.followups = self.followups;
+        self.act.held = self.held.len() as u32;
+        self.act.at = activity::unix_ms();
+        self.host.activity(&self.act);
+    }
+
+    fn log(&mut self, mut v: serde_json::Value) {
+        if let Some(t) = &mut self.transcript {
+            v["session"] = self.session.into();
+            t.write(v);
         }
     }
 
@@ -391,8 +720,15 @@ impl<H: Host> AgentStateMachine<H> {
             let rows: Vec<String> = results.iter().map(|(id, text)| format!("[#{id} {}] {text}", self.tool_log[*id].0)).collect();
             msg.push(format!("Results of tools you called:\n{}", rows.join("\n\n")));
         }
+        if !self.notices.is_empty() {
+            msg.push(std::mem::take(&mut self.notices).join("\n"));
+        }
+        msg.extend(self.still_running());
         if check {
             msg.push(CHECK_IN.to_string());
+        }
+        if !wakes.is_empty() {
+            msg.extend(self.host.reminder());
         }
         if wakes.is_empty() && self.followups >= MAX_FOLLOWUPS {
             msg.push(format!(
@@ -404,13 +740,21 @@ impl<H: Host> AgentStateMachine<H> {
         }
         let why = if check {
             "check-in — nothing running".to_string()
+        } else if wakes.is_empty() && results.is_empty() {
+            "a call went quiet".to_string()
         } else if wakes.is_empty() {
             format!("{} result(s) back", results.len())
         } else {
             summary(&wakes[wakes.len() - 1].0)
         };
         self.host.show(ui::thinking(&name, &why));
-        self.history.push((Speaker::User, msg.join("\n\n")));
+        let prompt = msg.join("\n\n");
+        self.history.push((Speaker::User, prompt.clone()));
+        self.act.turns += 1;
+        self.act.why = why.clone();
+        self.act.since = activity::unix_ms();
+        self.act.phase = "thinking".into();
+        self.publish();
 
         let system_now = match self.pending_warning.take() {
             Some(w) => format!("{}\n\n{w}", self.system),
@@ -420,11 +764,31 @@ impl<H: Host> AgentStateMachine<H> {
             Ok(t) => t,
             Err(e) => {
                 self.host.show(ui::note(&format!("llm error: {e}")));
+                self.log(serde_json::json!({"t": "turn", "why": why, "check": check, "prompt": prompt, "error": e}));
                 // A failed turn never happened, as far as history goes.
                 self.history.pop();
+                self.settle();
                 return;
             }
         };
+        if let Some(r) = &turn.reasoning {
+            self.host.show(ui::musing(&name, "reasoning", r));
+            self.act.thought = activity::tail(r, activity::THOUGHT_CHARS);
+        }
+        self.act.tokens = turn.total_tokens;
+        self.log(serde_json::json!({
+            "t": "turn",
+            "why": why,
+            "check": check,
+            "prompt": prompt,
+            "reasoning": turn.reasoning,
+            "text": turn.text,
+            "calls": turn.calls.iter().map(|c| serde_json::json!({"name": c.name, "args": c.args})).collect::<Vec<_>>(),
+            "prompt_tokens": turn.prompt_tokens,
+            "out_tokens": turn.tokens,
+            "total_tokens": turn.total_tokens,
+            "ms": turn.ms,
+        }));
         let messages = turn.calls.iter().filter(|c| c.name == "SendMessage").count();
         let cost = TurnCost {
             prompt: turn.prompt_tokens,
@@ -447,7 +811,9 @@ impl<H: Host> AgentStateMachine<H> {
         if self.pending.iter().any(|i| matches!(i, Inbound::Reset(_))) {
             let n = turn.calls.len();
             self.host.show(ui::note(&format!("session reset while thinking — this turn's {n} call(s) dropped, nothing sent")));
+            self.log(serde_json::json!({"t": "dropped", "calls": n}));
             self.host.after_turn(&cost);
+            self.settle();
             return;
         }
 
@@ -465,12 +831,18 @@ impl<H: Host> AgentStateMachine<H> {
             self.history.pop();
             self.host.show(ui::note("check-in: nothing more to do"));
             self.host.after_turn(&cost);
+            self.settle();
             return;
         }
 
         let own = turn.text.trim();
         if !own.is_empty() {
             self.history.push((Speaker::Assistant, own.to_string()));
+            // Alone, it's a reply and the host shows it as one (below);
+            // beside tool calls it used to go unseen.
+            if !turn.calls.is_empty() {
+                self.host.show(ui::musing(&name, "wrote, beside its calls", own));
+            }
         }
 
         let queries_before = self.queries;
@@ -484,15 +856,16 @@ impl<H: Host> AgentStateMachine<H> {
                         summary.len(),
                         self.tool_log.len()
                     )));
+                    self.log(serde_json::json!({"t": "compact", "forced": false, "summary": summary}));
                     self.history = vec![(Speaker::Assistant, summary)];
                     self.warned_tier = 0;
                     compacted = true;
                 }
                 // Instant, but still a result: it comes back like any other.
-                "TokenBudget" | "BrowseTools" | "Inspect" | "AboutMe" => {
+                "TokenBudget" | "BrowseTools" | "Inspect" | "AboutMe" | "Running" | "Cancel" => {
                     let out = self.session_tool(c, turn.total_tokens);
                     self.queries += 1;
-                    let _ = self.back_tx.send(Back::Result(c.name.clone(), out, self.session));
+                    let _ = self.back_tx.send(Back::Result(c.name.clone(), out, self.session, None));
                 }
                 _ => self.dispatch(c),
             }
@@ -512,14 +885,20 @@ impl<H: Host> AgentStateMachine<H> {
             }
         }
         self.host.after_turn(&cost);
+        self.settle();
 
         // Against what this turn actually cost.
         if let Some(pct) = pct_used(turn.total_tokens, self.window) {
             if pct >= miot_llm::FORCE_COMPACT_PCT && !compacted {
                 self.host.show(ui::note(&format!("{pct}% of the context window used — force-compacting")));
+                self.act.phase = "compacting".into();
+                self.act.since = activity::unix_ms();
+                self.publish();
                 let summary = summarize(&self.llm, &self.system, &self.history).await;
+                self.log(serde_json::json!({"t": "compact", "forced": true, "summary": summary}));
                 self.history = vec![(Speaker::Assistant, summary)];
                 self.warned_tier = 0;
+                self.settle();
             } else if let Some(tier) = miot_llm::budget_checkpoint(pct, self.warned_tier) {
                 self.warned_tier = tier;
                 self.pending_warning = Some(format!(
@@ -534,19 +913,43 @@ impl<H: Host> AgentStateMachine<H> {
     fn dispatch(&mut self, c: &Call) {
         let started = Instant::now();
         let timed = move |out: ToolOut| out.meta(ui::millis(started.elapsed().as_millis() as u64));
-        let d = match local_tool(c) {
+        let live = Arc::new(Live::new());
+        let d = match local_tool(c, live.clone()) {
             Some(q) => Dispatch::Query(q),
             None => self.host.dispatch(c),
         };
+        if matches!(d, Dispatch::Unknown) {
+            // Fed back, so the model learns it rather than retrying blind.
+            self.queries += 1;
+            let _ = self.back_tx.send(Back::Result(c.name.clone(), ToolOut::new(gist(c), false).meta("no such tool here"), self.session, None));
+            return;
+        }
+        // In flight from here until it lands (`land`).
+        let id = self.flights;
+        self.flights += 1;
+        let arg = activity::short(&gist(c), activity::ARG_CHARS);
+        self.act.running.push(Flight { id, tool: c.name.clone(), arg: arg.clone(), since: activity::unix_ms(), ..Default::default() });
+        self.host.show(ui::started(self.host.name(), &c.name, &arg, self.act.running.len()));
+        self.publish();
         match d {
             Dispatch::Query(q) => {
                 self.queries += 1;
+                self.live.insert(id, live.clone());
                 let tx = self.back_tx.clone();
                 let name = c.name.clone();
                 let session = self.session;
+                let gist = gist(c);
                 tokio::spawn(async move {
-                    let out = timed(q.await);
-                    let _ = tx.send(Back::Result(name, out, session));
+                    // `Cancel` drops the call — a `Bash` child is killed with
+                    // it (`kill_on_drop`) — and answers with what it printed.
+                    let out = tokio::select! {
+                        out = q => out,
+                        _ = live.cancel.notified() => {
+                            let so_far = live.text();
+                            ToolOut::new(gist, false).meta("cancelled").body(so_far)
+                        }
+                    };
+                    let _ = tx.send(Back::Result(name, timed(out), session, Some(id)));
                 });
             }
             Dispatch::Record(r) => {
@@ -555,17 +958,14 @@ impl<H: Host> AgentStateMachine<H> {
                 let host = self.host.clone();
                 let name = c.name.clone();
                 tokio::spawn(async move {
-                    if let Some(out) = r.await {
-                        host.show(ui::tool(host.name(), &name, &timed(out)));
+                    let out = r.await.map(timed);
+                    if let Some(out) = &out {
+                        host.show(ui::tool(host.name(), &name, out));
                     }
-                    let _ = tx.send(Back::RecordDone);
+                    let _ = tx.send(Back::RecordDone(id, out));
                 });
             }
-            // Fed back, so the model learns it rather than retrying blind.
-            Dispatch::Unknown => {
-                self.queries += 1;
-                let _ = self.back_tx.send(Back::Result(c.name.clone(), ToolOut::new("", false).meta("no such tool here"), self.session));
-            }
+            Dispatch::Unknown => unreachable!("handled above"),
         }
     }
 
@@ -589,6 +989,41 @@ impl<H: Host> AgentStateMachine<H> {
                     .map(|(id, (name, out))| format!("{id}: {name} — {}", out.lines().next().unwrap_or("").chars().take(60).collect::<String>()))
                     .collect();
                 ToolOut::new("", true).meta(format!("{} stored", lines.len())).body(lines.join("\n"))
+            }
+            "Running" => {
+                let want = c.str("id").map(|s| s.trim().trim_start_matches(['r', 'R', '#']).to_string()).filter(|s| !s.is_empty());
+                let n = self.running_queries().count();
+                if n == 0 {
+                    return ToolOut::new("", true).body("Nothing is running.");
+                }
+                match want {
+                    None => {
+                        let mut out = vec![self.still_running().unwrap_or_default()];
+                        for (f, l) in self.running_queries().filter(|(_, l)| l.bytes() > 0) {
+                            out.push(format!("--- r{} latest output:\n{}", f.id, l.tail(400)));
+                        }
+                        ToolOut::new("", true).meta(format!("{n} running")).body(out.join("\n"))
+                    }
+                    Some(w) => match self.running_queries().find(|(f, _)| f.id.to_string() == w) {
+                        None => ToolOut::new(format!("r{w}"), false).meta("not running").body(self.still_running().unwrap_or_default()),
+                        Some((f, l)) => {
+                            let ran = ui::human(l.started.elapsed().as_secs());
+                            let head = format!("r{} {} {} — running {ran}, {} of output, last {} ago", f.id, f.tool, f.arg, ui::bytes(l.bytes() as usize), ui::human(l.quiet().as_secs()));
+                            let body = if l.bytes() == 0 { "(no output yet)".to_string() } else { l.tail(RUNNING_TAIL) };
+                            ToolOut::new(format!("r{w}"), true).body(format!("{head}\n{body}"))
+                        }
+                    },
+                }
+            }
+            "Cancel" => {
+                let w = c.str("id").unwrap_or_default().trim().trim_start_matches(['r', 'R', '#']).to_string();
+                match self.running_queries().find(|(f, _)| f.id.to_string() == w) {
+                    None => ToolOut::new(format!("r{w}"), false).meta("not running").body(self.still_running().unwrap_or_else(|| "Nothing is running.".into())),
+                    Some((f, l)) => {
+                        l.cancel.notify_one();
+                        ToolOut::new(format!("r{w}"), true).body(format!("Cancelling r{} ({} {}). Its result comes back marked cancelled.", f.id, f.tool, f.arg))
+                    }
+                }
             }
             "Inspect" => {
                 let id = c.args.get("id").and_then(|v| v.as_u64()).map(|n| n as usize);
@@ -626,28 +1061,64 @@ impl<H: Host> AgentStateMachine<H> {
 
 /// `Bash`/`ReadFile`/`WriteFile` on this host — the same for every cat and
 /// for `kot chat`. No sandbox.
-fn local_tool(c: &Call) -> Option<Query> {
+fn local_tool(c: &Call, live: Arc<Live>) -> Option<Query> {
     match c.name.as_str() {
         "Bash" => {
             let command = c.str("command").unwrap_or_default();
             let secs = c.args.get("timeout").and_then(|v| v.as_u64()).unwrap_or(BASH_DEFAULT_TIMEOUT).clamp(1, BASH_MAX_TIMEOUT);
             Some(Box::pin(async move {
-                // Timed out means killed, not left running unseen. (Only the
-                // shell itself — a child it forked may outlive it.)
-                let run = tokio::process::Command::new("/bin/sh").arg("-c").arg(&command).kill_on_drop(true).output();
-                match tokio::time::timeout(Duration::from_secs(secs), run).await {
-                    Ok(Ok(out)) => {
-                        let code = out.status.code();
-                        let mut body = String::from_utf8_lossy(&out.stdout).into_owned();
-                        body.push_str(&String::from_utf8_lossy(&out.stderr));
+                use std::process::Stdio;
+                use tokio::io::AsyncReadExt;
+                // Timed out (or cancelled) means killed, not left running
+                // unseen. (Only the shell itself — a child it forked may
+                // outlive it.)
+                let spawned = tokio::process::Command::new("/bin/sh")
+                    .arg("-c")
+                    .arg(&command)
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    .spawn();
+                let mut child = match spawned {
+                    Ok(c) => c,
+                    Err(e) => return ToolOut::new(format!("$ {command}"), false).meta("failed to spawn").body(e.to_string()),
+                };
+                // Both streams into the live buffer as they come, in arrival
+                // order — what `Running` shows while it runs, and the result.
+                let pump = |mut r: Box<dyn tokio::io::AsyncRead + Unpin + Send>, live: Arc<Live>| {
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 8192];
+                        while let Ok(n) = r.read(&mut buf).await {
+                            if n == 0 {
+                                break;
+                            }
+                            live.push(&buf[..n]);
+                        }
+                    })
+                };
+                let pumps = [
+                    pump(Box::new(child.stdout.take().expect("piped")), live.clone()),
+                    pump(Box::new(child.stderr.take().expect("piped")), live.clone()),
+                ];
+                match tokio::time::timeout(Duration::from_secs(secs), child.wait()).await {
+                    Ok(Ok(status)) => {
+                        // The last of the output; a background child still
+                        // holding the pipes doesn't get to hold this up.
+                        let _ = tokio::time::timeout(Duration::from_secs(2), futures_util::future::join_all(pumps)).await;
+                        let code = status.code();
                         ToolOut::new(format!("$ {command}"), code == Some(0))
                             .meta(code.map(|c| format!("exit {c}")).unwrap_or_else(|| "killed".into()))
-                            .body(body)
+                            .body(live.text())
                     }
-                    Ok(Err(e)) => ToolOut::new(format!("$ {command}"), false).meta("failed to spawn").body(e.to_string()),
-                    Err(_) => ToolOut::new(format!("$ {command}"), false)
-                        .meta(format!("timed out after {secs}s, killed"))
-                        .body(format!("Pass a larger timeout (seconds, up to {BASH_MAX_TIMEOUT}) if this needs longer.")),
+                    Ok(Err(e)) => ToolOut::new(format!("$ {command}"), false).meta("failed to wait").body(e.to_string()),
+                    Err(_) => {
+                        let _ = child.kill().await;
+                        let so_far = live.text();
+                        let hint = format!("Pass a larger timeout (seconds, up to {BASH_MAX_TIMEOUT}) if this needs longer.");
+                        let body = if so_far.trim().is_empty() { hint } else { format!("{so_far}\n[{hint}]") };
+                        ToolOut::new(format!("$ {command}"), false).meta(format!("timed out after {secs}s, killed")).body(body)
+                    }
                 }
             }))
         }
@@ -671,6 +1142,28 @@ fn local_tool(c: &Call) -> Option<Query> {
             }))
         }
         _ => None,
+    }
+}
+
+/// A call's gist, one line, for the running list and the log: the command,
+/// the path, the recipient and message — whatever says what it's doing.
+fn gist(c: &Call) -> String {
+    let s = |k: &str| c.str(k).unwrap_or_default();
+    match c.name.as_str() {
+        "Bash" => format!("$ {}", s("command")),
+        "ReadFile" | "WriteFile" => s("path"),
+        "SendMessage" => {
+            let to = s("to");
+            let to = if to.is_empty() { "litter".to_string() } else { to.trim_start_matches('@').to_string() };
+            format!("→ {to}  {}", s("body"))
+        }
+        "TaskUpdate" => format!("{} {}  {}", s("task"), s("status"), s("text")),
+        "TaskPlan" | "TaskReassign" => format!("{} {}", s("task"), s("to")),
+        "ArtifactRead" | "Inspect" | "Running" | "Cancel" => s("id"),
+        "LocalTask" => [s("action"), s("id"), s("text")].into_iter().filter(|x| !x.is_empty()).collect::<Vec<_>>().join(" "),
+        "Artifact" => s("text"),
+        _ if c.args.as_object().is_some_and(|o| o.is_empty()) || c.args.is_null() => String::new(),
+        _ => c.args.to_string(),
     }
 }
 

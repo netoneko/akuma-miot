@@ -786,6 +786,50 @@ pub fn thinking(caller: &str, what: &str) -> String {
     format!("\n  {} {} {} {}", paint(theme().warm, "◌"), sealed(caller), dim("thinking ·"), dim(what))
 }
 
+/// Most lines of a reasoning block shown: the first few (what it set out to
+/// do) and the rest from the end (where it got to). The transcript keeps it
+/// all.
+const MUSING_HEAD: usize = 4;
+const MUSING_LINES: usize = 16;
+
+/// What a model thought, or wrote beside its tool calls — hung off a gutter
+/// like a tool's output, head and tail if long:
+///
+/// ```text
+///   ✎ 喵 meow reasoning
+///     ┆ The build died at the link step, so …
+///     ┆ … 31 lines …
+///     ┆ I'll rerun it with a 600s timeout.
+/// ```
+pub fn musing(caller: &str, label: &str, text: &str) -> String {
+    let t = theme();
+    let mut rows = vec![format!("  {} {} {}", paint(t.warm, "✎"), sealed(caller), dim(label))];
+    let gutter = faint("┆");
+    let inner = term_width().saturating_sub(6).max(20);
+    let lines: Vec<&str> = text.trim().lines().filter(|l| !l.trim().is_empty()).collect();
+    let row = |l: &str| format!("    {gutter} {}", dim(&clip(&l.replace('\t', "    "), inner)));
+    if lines.len() <= MUSING_LINES {
+        rows.extend(lines.iter().map(|l| row(l)));
+    } else {
+        let tail = MUSING_LINES - MUSING_HEAD;
+        rows.extend(lines[..MUSING_HEAD].iter().map(|l| row(l)));
+        rows.push(format!("    {gutter} {}", faint(&format!("… {} lines …", lines.len() - MUSING_LINES))));
+        rows.extend(lines[lines.len() - tail..].iter().map(|l| row(l)));
+    }
+    rows.join("\n")
+}
+
+/// A tool call leaving — its result row comes later, when it lands:
+/// `◌ 喵 meow ▸ Bash  $ cargo build   started · 2 in flight`.
+pub fn started(caller: &str, name: &str, arg: &str, in_flight: usize) -> String {
+    let t = theme();
+    let lead = format!("  {} {} {} {}", paint(t.warm, "◌"), sealed(caller), dim(t.prompt), plain(name));
+    let tag = dim(&if in_flight > 1 { format!("started · {in_flight} in flight") } else { "started".to_string() });
+    let room = term_width().saturating_sub(vcells(&lead) + vcells(&tag) + 6).max(8);
+    let arg = if arg.is_empty() { String::new() } else { format!("  {}", dim(&clip(arg, room))) };
+    format!("{lead}{arg}  {tag}")
+}
+
 /// A bar for the context window, `▕███▌░░░░░▏`, coloured by how full it is.
 fn meter(pct: u32, n: usize) -> String {
     const PART: [char; 8] = ['▏', '▎', '▍', '▌', '▋', '▊', '▉', '█'];
@@ -1113,5 +1157,249 @@ mod time_tests {
     #[test]
     fn stamp_shows_the_gap_since_the_previous() {
         assert_eq!(stamp_at(Some(1_790_214_012_345), Some(1_790_214_012_345 - 75_000)), "09-24 01:40:12Z +1m15s");
+    }
+}
+
+// ── activity ────────────────────────────────────────────────────────────
+//
+// What each cat is doing right now (`crate::activity`), from a node's
+// `GET /activity`. Two forms: one row in the composer, redrawn in place
+// (`docs/CLI.md` §8 — the spinner on the composer line, not a rewrite of
+// scrollback), and a full snapshot printed into the log on demand
+// (`/activity`, `kot activity`).
+
+/// A record not refreshed for this long is shown as unknown, not current:
+/// that cat's node has gone quiet, and "thinking" may no longer be true.
+pub const ACTIVITY_STALE_MS: u64 = 15_000;
+
+fn seen_name(s: &crate::activity::Seen, roster: &Roster) -> String {
+    miot_keys::from_hex(&s.account).map(|a| roster.name_of(&a)).unwrap_or_else(|_| s.activity.name.clone())
+}
+
+/// The composer's activity row — one short phrase per cat, clipped to the
+/// terminal:
+///
+/// ```text
+///   活 喵 meow ◌ 42s · 黑 kuro ⚙2 Bash 1m03s · 玉 tama · ✗Bash
+/// ```
+pub fn activity_row(seen: &[crate::activity::Seen], roster: &Roster) -> String {
+    let t = theme();
+    if seen.is_empty() {
+        return format!("  {} {}", faint("活"), faint("no cat is reporting activity to this node"));
+    }
+    let mut parts = Vec::new();
+    for s in seen {
+        let a = &s.activity;
+        let name = who(&seen_name(s, roster));
+        if s.age_ms > ACTIVITY_STALE_MS {
+            parts.push(format!("{name} {}", faint(&format!("? {} ago", human(s.age_ms / 1000)))));
+            continue;
+        }
+        let secs = a.in_phase_ms(s.age_ms) / 1000;
+        let what = match a.phase.as_str() {
+            "thinking" => paint(t.warm, &format!("◌ {}", human(secs))),
+            "compacting" => paint(t.warm, &format!("◌ compacting {}", human(secs))),
+            _ if !a.running.is_empty() => {
+                let oldest = a.running.iter().min_by_key(|f| f.since).expect("not empty");
+                let ms = a.at.saturating_sub(oldest.since) + s.age_ms;
+                paint(t.accent, &format!("⚙{} {} {}", a.running.len(), oldest.tool, human(ms / 1000)))
+            }
+            _ => dim("·"),
+        };
+        // The newest finished call, if it failed and it's recent — the
+        // thing worth noticing without asking.
+        let failed = a
+            .recent
+            .last()
+            .filter(|f| !f.ok && a.at.saturating_sub(f.at) + s.age_ms < 60_000)
+            .map(|f| format!(" {}", paint(t.alarm, &format!("✗{}", f.tool))))
+            .unwrap_or_default();
+        parts.push(format!("{name} {what}{failed}"));
+    }
+    let row = format!("  {} {}", faint("活"), parts.join(&dim(" · ")));
+    clip_ansi(&row, term_width().saturating_sub(1))
+}
+
+/// [`clip`] for a string that already carries colour: count only visible
+/// cells, keep every escape, reset at the cut.
+fn clip_ansi(s: &str, n: usize) -> String {
+    if vcells(s) <= n {
+        return s.to_string();
+    }
+    let mut out = String::new();
+    let mut w = 0;
+    let mut chars = s.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            out.push(ch);
+            for c in chars.by_ref() {
+                out.push(c);
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+            continue;
+        }
+        let cw = cells(&ch.to_string());
+        if w + cw + 1 > n {
+            break;
+        }
+        w += cw;
+        out.push(ch);
+    }
+    out.push('…');
+    if colour() {
+        out.push_str("\x1b[0m");
+    }
+    out
+}
+
+/// The full snapshot, one block per cat (`/activity [name]`,
+/// `kot activity`): where it is in the loop and for how long, what woke
+/// it, every call in flight, how the finished ones went, its open local
+/// tasks, the tail of its last reasoning.
+pub fn activity_text(seen: &[crate::activity::Seen], roster: &Roster, only: Option<&str>) -> String {
+    let t = theme();
+    let mut out = Vec::new();
+    let pick: Vec<&crate::activity::Seen> = seen.iter().filter(|s| only.is_none_or(|n| seen_name(s, roster) == n.trim_start_matches('@'))).collect();
+    if pick.is_empty() {
+        return format!(
+            "  {}",
+            dim(&match only {
+                Some(n) => format!("no activity from {n} — not running an agent loop, or out of this node's earshot"),
+                None => "no cat is reporting activity to this node (an older build, or no agent loops running)".to_string(),
+            })
+        );
+    }
+    let inner = term_width().saturating_sub(12).max(20);
+    for s in pick {
+        let a = &s.activity;
+        let secs = a.in_phase_ms(s.age_ms) / 1000;
+        let phase = match a.phase.as_str() {
+            "thinking" | "compacting" => paint(t.warm, &format!("◌ {} {}", a.phase, human(secs))),
+            "waiting" => paint(t.accent, &format!("⚙ waiting on tools {}", human(secs))),
+            _ => dim(&format!("· idle {}", human(secs))),
+        };
+        let heard = if s.age_ms > ACTIVITY_STALE_MS {
+            warn(&format!("last heard {} ago — may be out of date", human(s.age_ms / 1000)))
+        } else {
+            dim(&format!("heard {} ago", millis(s.age_ms)))
+        };
+        out.push(String::new());
+        out.push(format!("  {}  {phase}  {}  {heard}", sealed(&seen_name(s, roster)), dim(&format!("turn {} · {}", a.turns, a.model))));
+        let label = |l: &str| dim(&format!("{l:>9}"));
+        if !a.why.is_empty() {
+            out.push(format!("  {} {}", label("on"), plain(&clip(&a.why, inner))));
+        }
+        if a.running.is_empty() {
+            out.push(format!("  {} {}", label("running"), dim("nothing")));
+        } else {
+            for (i, f) in a.running.iter().enumerate() {
+                let ms = a.at.saturating_sub(f.since) + s.age_ms;
+                let head = if i == 0 { label(&format!("running {}", a.running.len())) } else { " ".repeat(9) };
+                out.push(format!("  {head} {} {}  {}  {}", paint(t.warm, "◌"), bold(t.paper, &f.tool), dim(&clip(&f.arg, inner.saturating_sub(20))), dim(&human(ms / 1000))));
+            }
+        }
+        let mut done = format!("{} {}", paint(t.progress, &format!("✓ {}", a.ok)), paint(if a.failed > 0 { t.alarm } else { t.ink }, &format!("✗ {}", a.failed)));
+        if a.held > 0 {
+            done.push_str(&format!("  {}", warn(&format!("{} result(s) held until someone writes", a.held))));
+        }
+        if a.followups > 0 {
+            done.push_str(&format!("  {}", dim(&format!("{} follow-up turn(s) in a row", a.followups))));
+        }
+        out.push(format!("  {} {done}", label("done")));
+        for f in a.recent.iter().rev() {
+            let (mark, c) = if f.ok { ("✓", t.progress) } else { ("✗", t.alarm) };
+            let meta = if f.meta.is_empty() { String::new() } else { format!("  {}", dim(&f.meta)) };
+            out.push(format!("  {} {} {}  {}{meta}", " ".repeat(9), paint(c, mark), plain(&f.tool), dim(&clip(&f.arg, inner.saturating_sub(30)))));
+        }
+        for (i, todo) in a.todo.iter().enumerate() {
+            out.push(format!("  {} {}", if i == 0 { label("todo") } else { " ".repeat(9) }, plain(&clip(todo, inner))));
+        }
+        if !a.thought.is_empty() {
+            let width = inner.max(20);
+            for (i, l) in wrap(&a.thought, width).into_iter().take(4).enumerate() {
+                out.push(format!("  {} {}", if i == 0 { label("thought") } else { " ".repeat(9) }, dim(&l)));
+            }
+        }
+        if a.tokens > 0 {
+            let ctx = match a.window.filter(|&w| w > 0) {
+                Some(w) => format!("{} of {} tok", thousands(a.tokens as u64), kilo(w)),
+                None => format!("{} tok", thousands(a.tokens as u64)),
+            };
+            out.push(format!("  {} {}", label("context"), dim(&ctx)));
+        }
+    }
+    out.join("\n")
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use super::*;
+    use crate::activity::{Activity, Finished, Flight, Seen};
+
+    fn roster() -> Roster {
+        Roster(vec![("meow".into(), miot_keys::Identity::from_seed(&[7; 32]).account()), ("kuro".into(), miot_keys::Identity::from_seed(&[8; 32]).account())])
+    }
+
+    fn seen(n: u8, age_ms: u64, a: Activity) -> Seen {
+        Seen { account: miot_keys::to_hex(&miot_keys::Identity::from_seed(&[n; 32]).account()), age_ms, activity: a }
+    }
+
+    fn cats() -> Vec<Seen> {
+        vec![
+            seen(7, 200, Activity { name: "meow".into(), phase: "thinking".into(), since: 1_000, at: 43_000, ..Default::default() }),
+            seen(
+                8,
+                0,
+                Activity {
+                    name: "kuro".into(),
+                    phase: "waiting".into(),
+                    since: 0,
+                    at: 70_000,
+                    running: vec![
+                        Flight { id: 3, tool: "Bash".into(), arg: "$ cargo build".into(), since: 7_000, ..Default::default() },
+                        Flight { id: 4, tool: "Peers".into(), since: 69_000, ..Default::default() },
+                    ],
+                    ok: 9,
+                    failed: 2,
+                    recent: vec![Finished { tool: "Bash".into(), arg: "$ make".into(), ok: false, meta: "exit 2".into(), at: 60_000, ..Default::default() }],
+                    todo: vec!["L2 [doing] build it".into()],
+                    thought: "the link step needs more time".into(),
+                    ..Default::default()
+                },
+            ),
+        ]
+    }
+
+    #[test]
+    fn the_row_names_each_cats_phase_and_its_oldest_call() {
+        let row = strip_ansi(&activity_row(&cats(), &roster()));
+        assert!(row.contains("meow ◌ 42s"), "{row}");
+        // Oldest of two in flight, timed from its own start; the recent
+        // failure is flagged.
+        assert!(row.contains("kuro ⚙2 Bash 1m03s ✗Bash"), "{row}");
+    }
+
+    #[test]
+    fn a_stale_record_is_not_shown_as_current() {
+        let mut c = cats();
+        c[0].age_ms = ACTIVITY_STALE_MS + 1_000;
+        let row = strip_ansi(&activity_row(&c, &roster()));
+        assert!(row.contains("meow ? 16s ago"), "{row}");
+        assert!(!row.contains("◌"), "{row}");
+    }
+
+    #[test]
+    fn the_snapshot_has_everything_and_filters_by_name() {
+        let all = strip_ansi(&activity_text(&cats(), &roster(), None));
+        for want in ["◌ thinking 42s", "⚙ waiting on tools 1m10s", "running 2", "$ cargo build", "✓ 9", "✗ 2", "exit 2", "L2 [doing] build it", "the link step needs more time"] {
+            assert!(all.contains(want), "missing {want:?} in:\n{all}");
+        }
+        let one = strip_ansi(&activity_text(&cats(), &roster(), Some("@meow")));
+        assert!(one.contains("meow") && !one.contains("kuro"), "{one}");
+        let none = strip_ansi(&activity_text(&cats(), &roster(), Some("tama")));
+        assert!(none.contains("no activity from tama"), "{none}");
+        assert!(strip_ansi(&activity_text(&[], &roster(), None)).contains("no cat is reporting"));
     }
 }

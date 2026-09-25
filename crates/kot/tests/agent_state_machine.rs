@@ -5,6 +5,7 @@
 //! results must come back, records must not, wakes queued during a turn
 //! must be folded into the next one, and nothing may loop forever.
 
+use kot::activity::Activity;
 use kot::agent_state_machine::{self, Dispatch, Host, Inbound, CHECK_IN, MAX_FOLLOWUPS};
 use kot::ui::ToolOut;
 use miot_llm::{Call, Llm, Tool};
@@ -22,13 +23,18 @@ struct Reply {
     calls: Vec<(&'static str, Value)>,
     text: Option<&'static str>,
     delay_ms: u64,
+    /// Sent apart, as `reasoning_content` — GLM's way.
+    reasoning: Option<&'static str>,
 }
 
 fn calls(c: Vec<(&'static str, Value)>) -> Reply {
-    Reply { calls: c, text: None, delay_ms: 0 }
+    Reply { calls: c, text: None, delay_ms: 0, reasoning: None }
 }
 fn text(t: &'static str) -> Reply {
-    Reply { calls: vec![], text: Some(t), delay_ms: 0 }
+    Reply { calls: vec![], text: Some(t), delay_ms: 0, reasoning: None }
+}
+fn thinking(r: Reply, reasoning: &'static str) -> Reply {
+    Reply { reasoning: Some(reasoning), ..r }
 }
 fn say(body: &'static str) -> Reply {
     calls(vec![("SendMessage", json!({"body": body}))])
@@ -83,6 +89,9 @@ async fn serve(fake: Arc<Fake>) -> String {
                         .map(|(i, (name, args))| json!({"id": format!("call_{i}"), "type": "function", "function": {"name": name, "arguments": args.to_string()}}))
                         .collect();
                     let mut message = json!({"role": "assistant", "content": next.text});
+                    if let Some(r) = next.reasoning {
+                        message["reasoning_content"] = json!(r);
+                    }
                     if !tool_calls.is_empty() {
                         message["tool_calls"] = json!(tool_calls);
                     }
@@ -113,6 +122,12 @@ struct Seen {
     /// `Host::check_before_idle` — off unless a test is about it, so every
     /// other test's request count means what it says.
     check: bool,
+    /// Every live record handed to `Host::activity`, in order.
+    activity: Vec<Activity>,
+    transcript: Option<std::path::PathBuf>,
+    reminder: Option<String>,
+    /// `Host::stall_after` — the default (minutes) unless a test is about it.
+    stall: Option<Duration>,
 }
 
 struct TestHost(Arc<Mutex<Seen>>);
@@ -139,6 +154,14 @@ impl Host for TestHost {
                 Dispatch::Record(Box::pin(async move {
                     seen.lock().unwrap().sent.push(body.clone());
                     Some(ToolOut::new(body, true).meta("submitted"))
+                }))
+            }
+            // A chain write that takes a while to land.
+            "SlowSay" => {
+                let ms = c.args.get("ms").and_then(|m| m.as_u64()).unwrap_or(0);
+                Dispatch::Record(Box::pin(async move {
+                    tokio::time::sleep(Duration::from_millis(ms)).await;
+                    Some(ToolOut::new("slow", true).meta("submitted"))
                 }))
             }
             "Echo" => {
@@ -169,6 +192,18 @@ impl Host for TestHost {
     fn check_before_idle(&self) -> bool {
         self.0.lock().unwrap().check
     }
+    fn activity(&self, a: &Activity) {
+        self.0.lock().unwrap().activity.push(a.clone());
+    }
+    fn transcript(&self) -> Option<std::path::PathBuf> {
+        self.0.lock().unwrap().transcript.clone()
+    }
+    fn reminder(&self) -> Option<String> {
+        self.0.lock().unwrap().reminder.clone()
+    }
+    fn stall_after(&self) -> Duration {
+        self.0.lock().unwrap().stall.unwrap_or(agent_state_machine::STALL_AFTER)
+    }
 }
 
 struct Rig {
@@ -183,10 +218,14 @@ async fn rig(script: Vec<Reply>) -> Rig {
 }
 
 async fn rig_with(script: Vec<Reply>, check: bool) -> Rig {
+    rig_seen(script, Seen { check, ..Seen::default() }).await
+}
+
+async fn rig_seen(script: Vec<Reply>, seen: Seen) -> Rig {
     let fake = Arc::new(Fake::default());
     *fake.script.lock().unwrap() = script.into();
     let url = serve(fake.clone()).await;
-    let seen = Arc::new(Mutex::new(Seen { check, ..Seen::default() }));
+    let seen = Arc::new(Mutex::new(seen));
     let (tx, rx) = mpsc::unbounded_channel();
     let host = Arc::new(TestHost(seen.clone()));
     let done = tokio::spawn(agent_state_machine::run(host, Llm::local(&url, "fake"), "You are tama.".into(), rx));
@@ -660,4 +699,281 @@ async fn bash_timeout_is_honoured() {
     let (fake, _) = r.finish().await;
     let fed = fake.fed(1);
     assert!(fed.contains("timed out after 1s, killed") && fed.contains("larger timeout"), "{fed}");
+}
+
+// ── watching it work: reasoning, activity, transcript ───────────────────
+
+/// Reasoning sent apart (`reasoning_content`) is shown and kept as the
+/// activity's last thought — and never goes back to the model: the next
+/// request's history has the turn's text, not what it thought.
+#[tokio::test]
+async fn reasoning_is_shown_and_never_fed_back() {
+    let r = rig(vec![
+        thinking(calls(vec![("Bash", json!({"command": "echo hi"}))]), "the user wants echo; SECRET-THOUGHT"),
+        thinking(say("done"), "it printed hi, so report it"),
+    ])
+    .await;
+    r.wake("echo hi please");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, seen) = r.finish().await;
+    let seen = seen.lock().unwrap();
+
+    let shown = seen.shown.join("\n");
+    assert!(shown.contains("reasoning") && shown.contains("SECRET-THOUGHT"), "{shown}");
+    assert!(!fake.all(1).contains("SECRET-THOUGHT"), "reasoning leaked into history: {}", fake.all(1));
+    assert_eq!(seen.activity.last().unwrap().thought, "it printed hi, so report it");
+}
+
+/// qwen3 on llama-server thinks inline, `<think>…</think>` in the content.
+/// That's cut out of what the model "said" — a reply must not carry it.
+#[tokio::test]
+async fn inline_think_tags_are_cut_out_of_the_reply() {
+    let r = rig(vec![text("<think>pondering the question</think>The answer is 4.")]).await;
+    r.wake("2+2?");
+    r.until("spoke", |_, s| !s.spoke.is_empty()).await;
+    let (_, seen) = r.finish().await;
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.spoke, vec!["The answer is 4."]);
+    assert!(seen.shown.join("\n").contains("pondering the question"), "shown as reasoning instead");
+    assert_eq!(seen.activity.last().unwrap().thought, "pondering the question");
+}
+
+/// Text written beside tool calls used to vanish from the log; now it's
+/// shown (and it was always in history).
+#[tokio::test]
+async fn text_beside_calls_is_shown() {
+    let r = rig(vec![Reply { text: Some("Checking the build first."), ..calls(vec![("Bash", json!({"command": "true"}))]) }, say("ok")]).await;
+    r.wake("build it");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (_, seen) = r.finish().await;
+    let shown = seen.lock().unwrap().shown.join("\n");
+    assert!(shown.contains("wrote, beside its calls") && shown.contains("Checking the build first."), "{shown}");
+}
+
+/// The live record walks the loop: thinking while the model call is out,
+/// waiting while its tools run (both in flight at once, each named), then
+/// idle — with every call landed, tallied by outcome, failures included.
+#[tokio::test]
+async fn activity_follows_the_loop_and_tallies_calls() {
+    let r = rig(vec![
+        calls(vec![("Bash", json!({"command": "sleep 0.3; echo slow"})), ("Bash", json!({"command": "exit 3"})), ("Nope", json!({}))]),
+        say("one worked, one failed"),
+    ])
+    .await;
+    r.wake("try both");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (_, seen) = r.finish().await;
+    let seen = seen.lock().unwrap();
+    let acts = &seen.activity;
+
+    let phases: Vec<&str> = acts.iter().map(|a| a.phase.as_str()).collect();
+    let first = |p: &str| phases.iter().position(|x| *x == p).unwrap_or_else(|| panic!("never {p}: {phases:?}"));
+    assert!(first("thinking") < first("waiting") && first("waiting") < phases.iter().rposition(|x| *x == "idle").unwrap(), "{phases:?}");
+
+    let both = acts.iter().find(|a| a.running.len() == 2).expect("both Bash calls in flight at once");
+    assert!(both.running.iter().any(|f| f.arg == "$ sleep 0.3; echo slow"), "{:?}", both.running);
+    assert!(both.running.iter().any(|f| f.arg == "$ exit 3"), "{:?}", both.running);
+    assert!(acts.iter().all(|a| a.running.iter().all(|f| f.tool != "Nope")), "an unknown tool is never in flight");
+
+    let last = acts.last().unwrap();
+    assert!(last.running.is_empty(), "{:?}", last.running);
+    assert_eq!(last.phase, "idle");
+    assert_eq!((last.ok, last.failed), (2, 2), "slow Bash + SendMessage ok; exit 3 + the unknown tool failed: {:?}", last.recent);
+    let failed = last.recent.iter().find(|f| f.arg == "$ exit 3").unwrap();
+    assert!(!failed.ok && failed.meta.contains("exit 3"), "{failed:?}");
+    let slow = last.recent.iter().find(|f| f.arg.contains("echo slow")).unwrap();
+    assert!(slow.ok && slow.ms >= 250, "timed from dispatch: {slow:?}");
+    assert_eq!(last.turns, 2);
+    assert!(last.why.contains("result(s) back"), "the last turn was fed results: {}", last.why);
+    assert_eq!(last.window, Some(100000));
+
+    let shown = seen.shown.join("\n");
+    assert!(shown.contains("started · 2 in flight"), "the second call's start line counts both: {shown}");
+}
+
+/// The phase clock restarts only when the phase changes — a call landing
+/// mid-wait doesn't reset "waiting for 1m03s".
+#[tokio::test]
+async fn phase_clock_moves_only_on_a_change() {
+    let r = rig(vec![calls(vec![("Echo", json!({"v": "a", "ms": 200})), ("Echo", json!({"v": "b", "ms": 400}))]), say("ok")]).await;
+    r.wake("two echoes");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (_, seen) = r.finish().await;
+    let acts = seen.lock().unwrap().activity.clone();
+    // The first turn's wait: from its settle until the second echo lands.
+    // (The second turn's SendMessage is a wait of its own.)
+    let waiting: Vec<&Activity> = acts.iter().filter(|a| a.phase == "waiting" && a.turns == 1).collect();
+    assert!(waiting.len() >= 2, "a record at the settle and one per landed call: {}", waiting.len());
+    assert!(waiting.windows(2).all(|w| w[0].since == w[1].since), "still the same wait: {:?}", waiting.iter().map(|a| a.since).collect::<Vec<_>>());
+    assert!(waiting.iter().any(|a| a.running.len() == 1), "one echo landed, one still out");
+}
+
+/// The transcript has everything, in order: the system prompt once, each
+/// turn's prompt/reasoning/text/calls, each result in full, each record.
+#[tokio::test]
+async fn transcript_records_the_whole_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t/tama.transcript.jsonl");
+    let r = rig_seen(
+        vec![thinking(calls(vec![("Bash", json!({"command": "echo in-the-transcript"}))]), "run it"), say("all done")],
+        Seen { transcript: Some(path.clone()), ..Seen::default() },
+    )
+    .await;
+    r.wake("echo something");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    r.finish().await;
+
+    let lines: Vec<Value> = std::fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let kinds: Vec<&str> = lines.iter().map(|l| l["t"].as_str().unwrap()).collect();
+    assert_eq!(kinds, vec!["start", "turn", "result", "turn", "record"], "{kinds:?}");
+    assert!(lines[0]["system"].as_str().unwrap().starts_with("You are tama."));
+    assert_eq!(lines[1]["prompt"], "echo something");
+    assert_eq!(lines[1]["reasoning"], "run it");
+    assert_eq!(lines[1]["calls"][0]["name"], "Bash");
+    assert_eq!(lines[1]["total_tokens"], 110);
+    assert_eq!(lines[2]["tool"], "Bash");
+    assert!(lines[2]["text"].as_str().unwrap().contains("in-the-transcript"));
+    assert_eq!(lines[2]["ok"], true);
+    assert!(lines[3]["prompt"].as_str().unwrap().contains("[#0 Bash]"));
+    assert_eq!(lines[4]["tool"], "SendMessage");
+    assert!(lines.iter().all(|l| l["at"].as_u64().is_some() && l.get("session").is_some() || l["t"] == "start"));
+
+    // A second run appends — the file is a log, not a snapshot.
+    let r = rig_seen(vec![say("again")], Seen { transcript: Some(path.clone()), ..Seen::default() }).await;
+    r.wake("hello again");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    r.finish().await;
+    let n = std::fs::read_to_string(&path).unwrap().lines().count();
+    assert_eq!(n, 5 + 3, "start, turn, record appended");
+}
+
+/// The host's reminder (a cat's open local tasks) rides every turn with a
+/// wake in it — and not a result-only turn, which is still mid-thought.
+#[tokio::test]
+async fn reminder_rides_wakes_not_result_turns() {
+    let r = rig_seen(
+        vec![calls(vec![("Bash", json!({"command": "true"}))]), say("ok")],
+        Seen { reminder: Some("(Your open local tasks — L1 [doing] build it)".into()), ..Seen::default() },
+    )
+    .await;
+    r.wake("go on");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, _) = r.finish().await;
+    assert!(fake.fed(0).contains("L1 [doing] build it"), "{}", fake.fed(0));
+    assert!(!fake.fed(1).contains("L1 [doing]"), "{}", fake.fed(1));
+}
+
+// ── calls in flight, as the model sees them ─────────────────────────────
+
+/// While a Bash runs, any turn lists it ("still running"); `Running` shows
+/// what it has printed so far; `Cancel` kills it, and its result comes back
+/// marked cancelled with that output — long before its own 30 s were up.
+#[tokio::test]
+async fn running_shows_live_output_and_cancel_kills() {
+    let r = rig(vec![
+        calls(vec![("Bash", json!({"command": "echo started-the-build; sleep 30", "timeout": 60}))]),
+        calls(vec![("Running", json!({})), ("Cancel", json!({"id": "r0"}))]),
+        say("stopped it"),
+    ])
+    .await;
+    let t0 = std::time::Instant::now();
+    r.wake("build it");
+    r.until("the build printing", |_, s| s.activity.last().is_some_and(|a| a.phase == "waiting")).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    r.wake("how is it going?");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, seen) = r.finish().await;
+    assert!(t0.elapsed() < Duration::from_secs(15), "cancel didn't kill it: {:?}", t0.elapsed());
+
+    let woke = fake.fed(1);
+    assert!(woke.contains("Still running") && woke.contains("r0 Bash $ echo started-the-build; sleep 30"), "{woke}");
+    let fed = fake.fed(2);
+    assert!(fed.contains("Running]") && fed.contains("latest output:\nstarted-the-build"), "Running shows the output so far: {fed}");
+    assert!(fed.contains("Cancelling r0"), "{fed}");
+    assert!(fed.contains("Bash] $ echo started-the-build; sleep 30  (cancelled"), "the cancelled result itself: {fed}");
+    let last = seen.lock().unwrap().activity.last().unwrap().clone();
+    assert!(last.running.is_empty());
+    assert!(last.recent.iter().any(|f| f.tool == "Bash" && !f.ok && f.meta.contains("cancelled")), "{:?}", last.recent);
+}
+
+/// `Running` and `Cancel` with nothing in flight, or a wrong id, say so.
+#[tokio::test]
+async fn running_and_cancel_with_nothing_to_show() {
+    let r = rig(vec![calls(vec![("Running", json!({})), ("Cancel", json!({"id": "r7"}))]), say("ok")]).await;
+    r.wake("anything running?");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("Nothing is running."), "{fed}");
+    assert!(fed.contains("r7  (not running"), "{fed}");
+}
+
+/// A call silent past `stall_after` gets the model one turn to hear about
+/// it — once for that silence, not every tick — and the result still lands
+/// when it finishes.
+#[tokio::test]
+async fn a_quiet_call_gets_one_stall_notice() {
+    let r = rig_seen(
+        vec![calls(vec![("Bash", json!({"command": "sleep 1.5; echo finally", "timeout": 10}))]), text("I'll leave it running."), say("it finished")],
+        Seen { stall: Some(Duration::from_millis(300)), ..Seen::default() },
+    )
+    .await;
+    r.wake("run the slow thing");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, seen) = r.finish().await;
+
+    let n = fake.requests().len();
+    let notices: usize = (0..n).map(|i| fake.fed(i).matches("still running]").count()).sum();
+    assert_eq!(notices, 1, "exactly one notice: {:?}", (0..n).map(|i| fake.fed(i)).collect::<Vec<_>>());
+    let notice = (0..n).map(|i| fake.fed(i)).find(|f| f.contains("still running]")).unwrap();
+    assert!(notice.contains("[r0 Bash still running] $ sleep 1.5; echo finally") && notice.contains("no output at all"), "{notice}");
+    assert!(fake.fed(n - 1).contains("finally"), "the result still comes back: {}", fake.fed(n - 1));
+    assert!(seen.lock().unwrap().shown.join("\n").contains("telling the model"));
+}
+
+/// New output re-arms the notice: a call that prints, goes quiet, prints,
+/// goes quiet again is noticed twice.
+#[tokio::test]
+async fn output_rearms_the_stall_notice() {
+    let r = rig_seen(
+        vec![calls(vec![("Bash", json!({"command": "sleep 0.6; echo tick; sleep 0.8; echo tock", "timeout": 10}))]), text("waiting"), text("still waiting"), say("done")],
+        Seen { stall: Some(Duration::from_millis(400)), ..Seen::default() },
+    )
+    .await;
+    r.wake("go");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, _) = r.finish().await;
+    let n = fake.requests().len();
+    let notices: Vec<String> = (0..n).map(|i| fake.fed(i)).filter(|f| f.contains("still running]")).collect();
+    assert_eq!(notices.len(), 2, "{notices:?}");
+    assert!(notices[0].contains("no output at all"), "{}", notices[0]);
+    assert!(notices[1].contains("no new output for"), "{}", notices[1]);
+}
+
+/// A Bash that times out still hands back what it printed before it died —
+/// the useful part of a build that ran out of time.
+#[tokio::test]
+async fn a_timed_out_bash_keeps_its_output() {
+    let r = rig(vec![calls(vec![("Bash", json!({"command": "echo got-this-far; sleep 5", "timeout": 1}))]), say("ok")]).await;
+    r.wake("go");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("got-this-far") && fed.contains("timed out after 1s, killed"), "{fed}");
+}
+
+/// A chain write still landing is never shown to the model as "running":
+/// it was told writes just happen. Found live: listing one had GLM
+/// deliberating whether to resend its summary.
+#[tokio::test]
+async fn a_write_in_flight_is_not_listed_to_the_model() {
+    let r = rig(vec![calls(vec![("SlowSay", json!({"ms": 800})), ("Echo", json!({"v": "a", "ms": 30}))]), calls(vec![("Running", json!({}))]), say("ok")]).await;
+    r.wake("go");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, seen) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("echo:a") && !fed.contains("SlowSay") && !fed.contains("Still running"), "{fed}");
+    assert!(fake.fed(2).contains("Nothing is running."), "{}", fake.fed(2));
+    // The operator's live view still had it in flight.
+    assert!(seen.lock().unwrap().activity.iter().any(|a| a.running.iter().any(|f| f.tool == "SlowSay")));
 }

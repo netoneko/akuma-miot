@@ -9,10 +9,12 @@
 //! `crates/miot` used to be the node and the client, and `kot` the agent
 //! loop. They merged here (`docs/CLEANUP.md` item 2), and `miot` is gone.
 
+pub mod activity;
 pub mod agent;
 pub mod chat;
 pub mod client;
 pub mod common;
+pub mod local_tasks;
 pub mod agent_state_machine;
 pub mod node;
 pub mod tls;
