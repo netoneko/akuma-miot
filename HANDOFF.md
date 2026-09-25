@@ -834,6 +834,15 @@ does). It runs, and stops at `cannot open /dev/dsp (is sound available?)`,
 which is correct until meow's driver registers the device. The 412 MB FLAC
 in `bootstrap/music/soundtrack/` was not staged (Kirill: one WAV is enough).
 
+**The first manual restart of the trashcan (2026-09-26).** Until now every
+reboot of the metal box was meow's own (`reboot -f` at the end of each
+build-and-install step). This time the kernel hung, and Kirill power-cycled
+it by hand, the first time that was needed. Cause not looked at yet;
+meow's in-progress HDA driver is the obvious suspect, but that's unconfirmed.
+Otherwise the HDA work is going well: meow has written the driver patch
+almost entirely on its own, milestone by milestone, from the runbook
+(`../akuma/docs/runbooks/add-intel-hda-audio.md`).
+
 ## Block seal times (2026-09-24)
 
 Every block body now ends with the primary's wall clock at seal time
@@ -1269,7 +1278,10 @@ Cheapest tests to separate the two:
   without a restart, as before.
 - **meow's HDA work** has moved past M1 (it reported M6 and M7, CORB/RIRB
   codec discovery, on 09-25 night; its own notes and commits have the
-  state). The end-to-end test is on the box already: once `/dev/dsp` exists,
+  state), written almost entirely by meow. On 09-26 the kernel hung and the
+  box needed its first manual power-cycle. If it happens again, capture the
+  console before power-cycling: a hang in a new driver's init path is
+  exactly what the boot suite won't catch. The end-to-end test is on the box already: once `/dev/dsp` exists,
   `wavplay /src/github.com/netoneko/akuma/bootstrap/music/
   tokyo_rider_enter_omegashima.wav`. The WAV is 44.1 kHz, so the driver's
   `SNDCTL_DSP_SPEED` has to take that rate; 24-bit becomes 16 in `wavplay`.
