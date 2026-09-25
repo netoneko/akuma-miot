@@ -300,6 +300,26 @@ fn unix_ms() -> u64 {
     std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0)
 }
 
+/// Who an effect wakes, as it goes into `/events` — `None` for a record
+/// nobody's loop should assemble a turn for, `"*"` for a broadcast.
+///
+/// This is the **node-level `no_ack` enforcement** (artifact 5 §1.3, kuro's
+/// fix): a `Said`/`Message` flagged `no_ack` is *delivered* — it's in the
+/// log, a human reading it sees it, an agent that happens to be awake for
+/// another reason will find it — but it never **wakes** anyone. The old
+/// behavior asked every model to honor the flag in its prompt and in its
+/// auto-check-in; some did, some ping-ponged anyway, which is exactly the
+/// "left to per-agent discipline" failure meow called out. Delivery is one
+/// place, so the rule lives in one place.
+fn wake_target(e: &Effect<AccountId>) -> Option<String> {
+    use miot_keys::to_hex;
+    let no_ack = matches!(e, Effect::Said { no_ack: true, .. } | Effect::Message { no_ack: true, .. });
+    if no_ack || !e.wakes() {
+        return None;
+    }
+    Some(e.to().map(to_hex).unwrap_or_else(|| "*".to_string()))
+}
+
 fn render(e: &Effect<AccountId>) -> serde_json::Value {
     use miot_keys::to_hex;
     use serde_json::json;
@@ -342,6 +362,13 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
         // `messages` present when the reporter counted them apart.
         Effect::StatsReported2 { who, turns, tool_calls, messages, tokens, ms } => {
             json!({"t":"stats_reported","who":to_hex(who),"turns":turns,"tool_calls":tool_calls,"messages":messages,"tokens":tokens,"ms":ms})
+        }
+        Effect::Message { id, from, to, body, parent, artifact_id, tags, from_root, no_ack, off_record } => {
+            json!({"t":"message","id":id.to_string(),"from":to_hex(from),"to":to.as_ref().map(to_hex),"body":body,"parent":parent.map(|p| p.to_string()),"artifact_id":artifact_id.map(|a| a.to_string()),"tags":tags,"root":from_root,"no_ack":no_ack,"off_record":off_record})
+        }
+        Effect::Reacted { who, target, emoji } => json!({"t":"reacted","who":to_hex(who),"target":target.to_string(),"emoji":emoji}),
+        Effect::Voted { who, artifact, up } => {
+            json!({"t":"voted","who":to_hex(who),"artifact":artifact.to_string(),"up":up})
         }
     }
 }
@@ -572,7 +599,7 @@ impl Node {
             // doesn't recognize (a stricter, differently-versioned agent)
             // degrades to "didn't wake for this broadcast" rather than a
             // parse error, which a shape change would risk instead.
-            let wakes = if e.wakes() { Some(e.to().map(miot_keys::to_hex).unwrap_or_else(|| "*".to_string())) } else { None };
+            let wakes = wake_target(&e);
             let entry = Entry { seq: self.seq, block: self.block, effect: render(&e), wakes, at: None };
             if self.log.len() >= LOG_CAP {
                 self.log.pop_front();
@@ -2240,15 +2267,43 @@ pub async fn mempool_round(shared: &Shared) {
     }
 }
 
+/// A `Tally` as the wire JSON `/artifact/{id}` and `/note/{id}` carry:
+/// accounts as hex; clients resolve names through the roster.
+fn tally_json(v: &pallet_litter::Tally<AccountId>) -> serde_json::Value {
+    let hexes = |vs: &Vec<AccountId>| vs.iter().map(miot_keys::to_hex).collect::<Vec<_>>();
+    serde_json::json!({"up": hexes(&v.up), "down": hexes(&v.down)})
+}
+
+/// The current epoch's comment thread under an artifact, as wire JSON —
+/// who/when/body, names resolved by the client. Only this epoch's section:
+/// each epoch naturally gains its own (`docs/MESSAGING.md`).
+fn comments_json(n: &mut Node, a: miot_primitives::ArtifactId) -> serde_json::Value {
+    serde_json::Value::Array(
+        n.ext
+            .execute_with(|| Litter::comments(a))
+            .into_iter()
+            .map(|c| serde_json::json!({"who": miot_keys::to_hex(&c.who), "at": c.at, "body": c.body}))
+            .collect(),
+    )
+}
+
 async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
     }
-    let a = parse_task(&id).and_then(|t| n.ext.execute_with(|| Litter::artifact(t)));
-    Json(match a {
-        Some(a) => serde_json::json!({"found":true,"title":a.title,"body":a.body,"author":miot_keys::to_hex(&a.author)}),
-        None => serde_json::json!({"found":false}),
+    let task = parse_task(&id).map(miot_primitives::ArtifactId::Task);
+    let cm = task.as_ref().map(|aid| comments_json(&mut n, *aid));
+    let a = task.and_then(|t| {
+        n.ext.execute_with(|| {
+            let a = Litter::artifact(t)?;
+            let v = Litter::tally(t);
+            Some((a, v))
+        })
+    });
+    Json(match (a, cm) {
+        (Some((a, v)), Some(cm)) => serde_json::json!({"found":true,"title":a.title,"body":a.body,"author":miot_keys::to_hex(&a.author),"votes":tally_json(&v),"comments":cm}),
+        _ => serde_json::json!({"found":false}),
     })
     .into_response()
 }
@@ -2261,10 +2316,19 @@ async fn standalone_artifact(AxState(n): AxState<Shared>, Path(id): Path<String>
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
     }
-    let a = id.parse::<u32>().ok().and_then(|id| n.ext.execute_with(|| Litter::standalone_artifact(id)));
-    Json(match a {
-        Some(a) => serde_json::json!({"found":true,"title":a.title,"body":a.body,"author":miot_keys::to_hex(&a.author)}),
-        None => serde_json::json!({"found":false}),
+    let note = id.parse::<u32>().ok().map(miot_primitives::ArtifactId::Note);
+    let cm = note.as_ref().map(|aid| comments_json(&mut n, *aid));
+    let a = note.and_then(|aid| {
+        let miot_primitives::ArtifactId::Note(id) = aid else { unreachable!() };
+        n.ext.execute_with(|| {
+            let a = Litter::standalone_artifact(id)?;
+            let v = Litter::tally(aid);
+            Some((a, v))
+        })
+    });
+    Json(match (a, cm) {
+        (Some((a, v)), Some(cm)) => serde_json::json!({"found":true,"title":a.title,"body":a.body,"author":miot_keys::to_hex(&a.author),"votes":tally_json(&v),"comments":cm}),
+        _ => serde_json::json!({"found":false}),
     })
     .into_response()
 }

@@ -49,10 +49,26 @@ pub mod pallet {
     use sp_runtime::traits::UniqueSaturatedInto;
 
     use miot_primitives::{
-        Act, Artifact, BlockNumber, Config as MiotConfig, Effect, Error as TaskError, Limits,
-        PlanItem, TaskId, Timers,
+        Act, Artifact, ArtifactId, BlockNumber, Config as MiotConfig, Effect, Error as TaskError,
+        Limits, MessageId, PlanItem, TaskId, Timers,
     };
     use miot_tasks::{State, Task, TaskTable};
+
+    /// One voter, one side: voting the other way moves them, repeating
+    /// their own side withdraws. Free and shared by [`Pallet::vote`] and
+    /// [`Pallet::replay_effect`], so a replica folds a vote exactly the
+    /// way the primary recorded it.
+    fn cast_vote<A: Clone + PartialEq>(t: &mut Tally<A>, who: &A, up: bool) {
+        let (own, other) = if up { (&mut t.up, &mut t.down) } else { (&mut t.down, &mut t.up) };
+        if let Some(i) = own.iter().position(|v| v == who) {
+            own.remove(i);
+            return;
+        }
+        if let Some(i) = other.iter().position(|v| v == who) {
+            other.remove(i);
+        }
+        own.push(who.clone());
+    }
 
     /// A cat's own cumulative work stats, self-reported via
     /// [`Pallet::report_stats`] — see [`Stats`]. Plain scalars, not a
@@ -203,6 +219,66 @@ pub mod pallet {
     /// snapshot already written, and a changed struct would stop decoding.
     #[pallet::storage]
     pub type MessagesSent<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, u32, ValueQuery>;
+
+    /// An artifact's vote tally — [`Pallet::vote`]. One voter appears in at
+    /// most one side (voting again on the other side moves them); a voter
+    /// repeats its own side to withdraw. Kept as plain `Vec`s, not counts:
+    /// "who thought this was trustworthy" is the signal a reader wants, and
+    /// every artifact ever voted on is a small litter, so the map stays
+    /// small by construction.
+    #[derive(Debug, Clone, PartialEq, Eq, codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo)]
+    pub struct Tally<AccountId> {
+        pub up: Vec<AccountId>,
+        pub down: Vec<AccountId>,
+    }
+
+    /// Hand-written rather than derived: a derived `Default` would demand
+    /// `T::AccountId: Default`, which an `AccountId32` universe doesn't
+    /// give — and `ValueQuery` needs a default.
+    impl<AccountId> Default for Tally<AccountId> {
+        fn default() -> Self {
+            Tally { up: Vec::new(), down: Vec::new() }
+        }
+    }
+
+    #[pallet::storage]
+    pub type Votes<T: Config> = StorageMap<_, Blake2_128Concat, ArtifactId, Tally<T::AccountId>, ValueQuery>;
+
+    /// One comment on one artifact — [`Pallet::post`] with an
+    /// `artifact_id`. On-chain **storage**, not just an effect, on purpose:
+    /// an artifact's comment thread is part of the artifact ("packaged
+    /// under it"), and the block log is what compaction shrinks — a
+    /// comment that lived only as a log effect would vanish at the next
+    /// `/clear` while the artifact it belongs to survived. Votes made the
+    /// same trade ([`Votes`]); reactions didn't (they're ephemeral social
+    /// gloss by design).
+    #[derive(Debug, Clone, PartialEq, Eq, codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo)]
+    pub struct Comment<AccountId> {
+        pub who: AccountId,
+        pub at: BlockNumber,
+        pub body: String,
+    }
+
+    /// How far back an artifact's thread goes. A sliding window, oldest
+    /// dropped first — same philosophy as the nudge budget: unbounded
+    /// growth is a loop that pays forever, and the log itself still holds
+    /// the early thread until the next compaction.
+    pub const COMMENT_KEEP: usize = 32;
+
+    /// The current epoch — the session bounded by a compaction. Bumped by
+    /// [`Pallet::clear_all`] and [`Pallet::request_compaction`], the two
+    /// calls that make the node snapshot and shrink the block log, so the
+    /// counter itself rides every compaction snapshot: a replica folding
+    /// effects after a rewind lands on the same epoch the primary did.
+    /// Nothing here is valid *across* an epoch boundary — messages' live
+    /// window is exactly one epoch — which is why artifact comments are
+    /// keyed by it (see [`Comments`]): each epoch naturally gains its own
+    /// comment section, and no thread grows eternal under an artifact.
+    #[pallet::storage]
+    pub type Epoch<T: Config> = StorageValue<_, u32, ValueQuery>;
+
+    #[pallet::storage]
+    pub type Comments<T: Config> = StorageDoubleMap<_, Blake2_128Concat, ArtifactId, Blake2_128Concat, u32, Vec<Comment<T::AccountId>>, ValueQuery>;
 
     /// Who is in this litter, by name: `(name, account)`, in genesis order.
     /// Written once at genesis and never changed by any call — membership is
@@ -396,7 +472,12 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn clear_all(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
-            Self::apply(|t, auth, now| t.clear_all(auth, now), &who)
+            Self::apply(|t, auth, now| t.clear_all(auth, now), &who)?;
+            // A session boundary is an epoch boundary (`docs/MESSAGING.md`):
+            // this is the compaction trigger, so the counter moves with it
+            // — inside this block's state, and so inside the snapshot.
+            Epoch::<T>::mutate(|e| *e = e.saturating_add(1));
+            Ok(())
         }
 
         /// Move a sub-task to a different cat. Leader only.
@@ -463,6 +544,9 @@ pub mod pallet {
             let who = ensure_signed(origin)?;
             let state = Litter::<T>::get();
             ensure!(Self::authority_of(&who, &state) == miot_primitives::Authority::Root, Error::<T>::NotAuthorized);
+            // Same epoch bump as `clear_all`: compaction is the boundary,
+            // whether or not a task was failed on the way past it.
+            Epoch::<T>::mutate(|e| *e = e.saturating_add(1));
             Ok(())
         }
 
@@ -502,6 +586,84 @@ pub mod pallet {
             Stats::<T>::insert(who.clone(), CatStats { turns, tool_calls, tokens, ms });
             MessagesSent::<T>::insert(who.clone(), messages);
             Self::deposit_event(Event::Happened(Effect::StatsReported2 { who, turns, tool_calls, messages, tokens, ms }));
+            Ok(())
+        }
+
+        /// Say something as a **reply** to an earlier message, and/or under
+        /// topic tags — [`Effect::Message`], artifact 5 §1.2/§2.3. Same
+        /// semantics as [`Self::say`] otherwise: `no_ack` is the sender's
+        /// own "needs no reply", `off_record` keeps it out of the block
+        /// log. `parent` is the block number of the message being answered;
+        /// `None` is a top-level message (tags alone still route here, so
+        /// tagged conversation threads stay one variant).
+        ///
+        /// Not routed through `TaskTable` — chat touches no lifecycle state,
+        /// exactly like `say`'s own no-op — so this is the same thin shape
+        /// `report_stats` uses: validate, emit, and let replicas fold the
+        /// effect.
+        #[pallet::call_index(12)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn post(
+            origin: OriginFor<T>,
+            id: MessageId,
+            to: Option<T::AccountId>,
+            body: String,
+            parent: Option<MessageId>,
+            artifact_id: Option<ArtifactId>,
+            tags: Vec<String>,
+            no_ack: bool,
+            off_record: bool,
+        ) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(body.len() <= T::MaxMessage::get() as usize, Error::<T>::TooLong);
+            ensure!(tags.len() <= 8, Error::<T>::TooLong);
+            ensure!(tags.iter().all(|t| !t.is_empty() && t.len() <= 32), Error::<T>::TooLong);
+            let state = Litter::<T>::get();
+            let from_root = Self::authority_of(&who, &state) == miot_primitives::Authority::Root;
+            // A comment on an artifact joins that artifact's thread — chain
+            // storage, keyed by the current epoch (`docs/MESSAGING.md`).
+            // The effect still rides below, so replays land in the same
+            // thread and live readers see it in `/events`.
+            if let Some(a) = &artifact_id {
+                let now: BlockNumber =
+                    frame_system::Pallet::<T>::block_number().unique_saturated_into();
+                let epoch = Epoch::<T>::get();
+                Comments::<T>::mutate(a, epoch, |v| {
+                    v.push(Comment { who: who.clone(), at: now, body: body.clone() });
+                    if v.len() > COMMENT_KEEP {
+                        v.remove(0);
+                    }
+                });
+            }
+            Self::deposit_event(Event::Happened(Effect::Message { id, from: who, to, body, parent, artifact_id, tags, from_root, no_ack, off_record }));
+            Ok(())
+        }
+
+        /// React to the message with id `target` with an emoji —
+        /// [`Effect::Reacted`], artifact 5 §2.1. The agreement sora and tama
+        /// typed out at length would have been one of these. Non-waking by
+        /// construction: a reaction *is* the acknowledgment. Effect-only —
+        /// no storage — because a reaction is ephemeral gloss by design
+        /// (`docs/MESSAGING.md`).
+        #[pallet::call_index(13)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn react(origin: OriginFor<T>, target: MessageId, emoji: String) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            ensure!(!emoji.is_empty() && emoji.len() <= 16, Error::<T>::TooLong);
+            Self::deposit_event(Event::Happened(Effect::Reacted { who, target, emoji }));
+            Ok(())
+        }
+
+        /// Vote an artifact up or down — [`Effect::Voted`], artifact 5
+        /// §1.1. Voting the other way moves the voter; repeating the same
+        /// way withdraws. Read back via [`Self::tally`]. Anyone may: a
+        /// quality signal is only as good as its sample.
+        #[pallet::call_index(14)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn vote(origin: OriginFor<T>, artifact: ArtifactId, up: bool) -> DispatchResult {
+            let who = ensure_signed(origin)?;
+            Votes::<T>::mutate(artifact, |t| cast_vote(t, &who, up));
+            Self::deposit_event(Event::Happened(Effect::Voted { who, artifact, up }));
             Ok(())
         }
     }
@@ -592,6 +754,22 @@ pub mod pallet {
                 MessagesSent::<T>::insert(who.clone(), *messages);
                 return;
             }
+            if let Effect::Voted { who, artifact, up } = effect {
+                Votes::<T>::mutate(artifact.clone(), |t| cast_vote(t, who, *up));
+                return;
+            }
+            if let Effect::Message { from, artifact_id: Some(a), body, .. } = effect {
+                // The comment half of `post` — the same insert the primary
+                // executed, against the same (snapshot-carried) epoch.
+                let epoch = Epoch::<T>::get();
+                Comments::<T>::mutate(a, epoch, |v| {
+                    v.push(Comment { who: from.clone(), at: now, body: body.clone() });
+                    if v.len() > COMMENT_KEEP {
+                        v.remove(0);
+                    }
+                });
+                return;
+            }
             let mut table = Self::table();
             table.apply(effect, now);
             Litter::<T>::put(table.into_state());
@@ -600,6 +778,23 @@ pub mod pallet {
         /// See [`Roster`].
         pub fn roster() -> Vec<(String, T::AccountId)> {
             Roster::<T>::get()
+        }
+
+        /// An artifact's current tally — `GET /artifact/{id}`'s and
+        /// `/note/{id}`'s `votes` field.
+        pub fn tally(artifact: ArtifactId) -> Tally<T::AccountId> {
+            Votes::<T>::get(artifact)
+        }
+
+        /// The current epoch's comment thread under an artifact — the only
+        /// one that exists as far as this session is concerned.
+        pub fn comments(artifact: ArtifactId) -> Vec<Comment<T::AccountId>> {
+            Comments::<T>::get(artifact, Epoch::<T>::get())
+        }
+
+        /// The current epoch — session bounded by the last compaction.
+        pub fn epoch() -> u32 {
+            Epoch::<T>::get()
         }
 
         /// See [`Replaying`]. Plain function, not a call: whether this node

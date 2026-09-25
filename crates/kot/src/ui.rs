@@ -607,11 +607,18 @@ pub fn mesh(text: String) -> String {
 /// `off_record`: this one was never written to the block log — see
 /// `Effect::Said`'s doc comment.
 pub fn said(time: &str, block: u64, from: &str, to: &str, body: &str, roster: &Roster, off_record: bool) -> String {
+    said_ex(time, block, from, to, body, roster, off_record, "")
+}
+
+/// [`said`] with a thread/tag annotation on the header row — a reply's
+/// `↩ #parent` and its topic tags, from `Effect::Message`.
+pub fn said_ex(time: &str, block: u64, from: &str, to: &str, body: &str, roster: &Roster, off_record: bool, note: &str) -> String {
     let art: Vec<&str> = AVATAR.lines().collect();
     let c = cat(from);
     let arrow = if to == "litter" { dim("· to the litter") } else { format!("{} {}", dim("→"), who(to)) };
     let otr = if off_record { format!("  {}", dim("· off the record")) } else { String::new() };
-    let head = format!("{} {arrow}{otr}   {}", sealed(from), stamp(time, block).trim_start());
+    let extra = if note.is_empty() { String::new() } else { format!("  {}", dim(note)) };
+    let head = format!("{} {arrow}{otr}{extra}   {}", sealed(from), stamp(time, block).trim_start());
     let mut rows: Vec<String> = vec![head];
     let width = term_width().saturating_sub(2 + 20 + 2 + 1).max(20);
     rows.extend(wrap(body, width).into_iter().map(|l| tags(&l, roster)));
@@ -1151,6 +1158,56 @@ pub fn render(time: &str, block: u64, eff: &serde_json::Value, roster: &Roster, 
                 format!("{} {} {}", who(&name_of(eff, "who", roster)), dim("∑"), dim(&stats_phrase(eff))),
             )
         }
+        // A reply and/or a tagged message — [`Effect::Message`]. Renders
+        // like speech (it is), with the thread/tag note on the header.
+        "message" => {
+            let from = name_of(eff, "from", roster);
+            let to = if eff["to"].is_null() { "litter".to_string() } else { name_of(eff, "to", roster) };
+            let off_record = eff["off_record"].as_bool().unwrap_or(false);
+            let mut note = String::new();
+            if let Some(p) = eff["parent"].as_str() {
+                note = format!("↩ #{p}");
+            } else if let Some(id) = eff["id"].as_str() {
+                note = format!("#{id}");
+            }
+            for t in eff["tags"].as_array().into_iter().flatten() {
+                if let Some(t) = t.as_str() {
+                    if !note.is_empty() {
+                        note.push_str(" · ");
+                    }
+                    note.push('#');
+                    note.push_str(t);
+                }
+            }
+            if from == me_name {
+                let base = me(time, block, me_name, &to, &text("body"), roster, off_record);
+                if note.is_empty() {
+                    base
+                } else {
+                    format!("{base} {}", dim(&format!("({note})")))
+                }
+            } else {
+                said_ex(time, block, &from, &to, &text("body"), roster, off_record, &note)
+            }
+        }
+        // A reaction — [`Effect::Reacted`]. One glyph of acknowledgment
+        // where a whole speech block used to be typed.
+        "reacted" => obs(
+            time,
+            block,
+            format!("{} reacted {} on #{}", who(&name_of(eff, "who", roster)), plain(eff["emoji"].as_str().unwrap_or("·")), eff["target"].as_str().unwrap_or("?")),
+        ),
+        // An artifact vote — [`Effect::Voted`].
+        "voted" => obs(
+            time,
+            block,
+            format!(
+                "{} voted {} {}",
+                who(&name_of(eff, "who", roster)),
+                if eff["up"].as_bool().unwrap_or(false) { paint(theme().done, "▲") } else { paint(theme().alarm, "▼") },
+                format!("§{}", eff["artifact"].as_str().unwrap_or("?"))
+            ),
+        ),
         other => obs(time, block, format!("{} {}", dim(other), faint(&eff.to_string()))),
     }
 }

@@ -32,9 +32,15 @@ and the evidence is on chain or in a journal. Where it's shaky, it says so.
      ||  空 sora   Akuma › Firecracker › ryzen (KVM)    ||
      ||            amd64 · qwen3-4b                     ||
      ||_________________________________________________||      the bridge: every link is mTLS, pinned
-                                                                to genesis keys. Home router forwards
-                                                                9944-9948 inward; nginx passes 9441-
-                                                                9442 straight through, no TLS of its own
+                                                                to genesis keys. nginx passes 9441-9442
+                                                                straight through, no TLS of its own.
+                                                                Home→AWS works both ways (push, pull);
+                                                                the router forwards that would open
+                                                                AWS→home (`deploy-aws-node.md` §1) are
+                                                                still not in, so a write from yuki/shiro
+                                                                queues locally and waits for a route
+                                                                (`HANDOFF.md`, "A mempool for the
+                                                                no-route case") rather than landing
 
        reading a seat:  OS › what it runs in › the machine underneath
                         arch · model
@@ -93,7 +99,16 @@ AWS, with no operator involvement.
   nobody, and caught up only when the primary came back to AWS. Since the
   two-way status and leader push (HANDOFF, "One-way reachability"), they
   follow a home primary too. On 2026-09-25 all seven followed kuro at one
-  head. They still can't *write* while the primary is at home.
+  head. **They still can't get a write to *land* while the primary is at
+  home** — but as of the same day, the node they submit to no longer
+  refuses it outright either: it queues (`Node::mempool`) and relays to
+  every peer its own config can reach, same mechanism proven in
+  `crates/kot/tests/mempool.rs`. For yuki/shiro specifically this doesn't
+  help yet, because they have no *reachable* peer in the home direction at
+  all — the mechanism needs one working link somewhere to relay across, and
+  the router forwards that would give them one aren't in (`HANDOFF.md`, "A
+  mempool for the no-route case"). It would already help two home members
+  that can reach each other but not the current primary.
 - **Cats call tools, and since 2026-09-24 they get the results back.**
   Before that, results were printed and dropped (the agent loop's inbox held
   only chain events), so tama and sora called `Peers` on every wake and never

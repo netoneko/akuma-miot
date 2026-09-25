@@ -98,6 +98,12 @@ read that first, it is kept current and this file does not repeat it.
 - `docs/MESH_AUTH.md` — who a peer/client actually is, on the wire: the
   `x-miot-signer`/`x-miot-sig` header envelope, then mTLS pinned to the same
   keys. Added 2026-09-23, prompted by planning an AWS deploy.
+- `docs/MESSAGE_ROUTING.md` — where a write actually goes: the
+  `Route::{Here,Primary,Nobody}` decision every `/submit` makes, the mempool
+  queue and peer relay a no-route node falls into (2026-09-25), and how
+  `/tx/{hash}` learns "sealed" by asking a reachable peer rather than
+  re-deriving it from a synced block (which carries only effects, not
+  extrinsics). Diagrams; read before changing `node.rs::route`/`mempool_round`.
 - `docs/KEY_MANAGEMENT.md` — what one account's key now backs (chain writes,
   every read, the TLS connection itself), the dev-seed footgun in `kot`'s own
   CLI defaults, and the genesis-generation procedure (`deploy.py`/`deploy.sh
@@ -125,12 +131,22 @@ read that first, it is kept current and this file does not repeat it.
 - **Election ≠ replication.** A block the primary produced that no replica
   pulled before it died is lost to the rewind (records, not work —
   `miot-store`'s docs). There is no commit index.
-- **A push-only node can't write (2026-09-25).** yuki and shiro follow a
-  home primary by push, with no route to it, so `/submit` (and `/account`)
-  on them has nowhere to forward: it answers 503 "the primary is kuro, but
-  this node has no route to it". Their cats can read and follow along but
-  can't post while the primary is at home. The router forwards
-  (`docs/runbooks/deploy-aws-node.md` §1) or a relay would close it.
+- ~~**A push-only node can't write.**~~ **Has a fallback** (checked in the
+  code 2026-09-25, same day, prompted by root hitting the 503 for real):
+  `/submit`'s `Route::Nobody` case no longer refuses — it queues the raw
+  extrinsic in a bounded in-memory `Node::mempool` and answers `200
+  "pending"` immediately, and a new periodic `mempool_round` relays it to
+  every peer this node's own config *can* reach until one of them can
+  forward it (a new `/mempool/relay` endpoint, `crates/kot/tests/
+  mempool.rs`). A new `/tx/{hash}` endpoint, itself relayed the same way,
+  answers whether it's landed. **The router forwards
+  (`docs/runbooks/deploy-aws-node.md` §1) are still the real fix and still
+  not done** — this is a same-day fallback that gets a write there via
+  whatever peers are reachable, not a route home for yuki/shiro themselves.
+  Kept for the history: yuki and shiro follow a home primary by push, with
+  no route to it, so `/submit` on them had nowhere to forward: it answered
+  503 "the primary is kuro, but this node has no route to it". `HANDOFF.md`,
+  "A mempool for the no-route case".
 - **`seq` in `/events` restarts when a node rebuilds its log** (demotion,
   rewind, adopted checkpoint). The agent loop resets its cursor; any other
   client holding one should too.

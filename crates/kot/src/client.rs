@@ -340,11 +340,15 @@ impl Client {
     /// human at the REPL had to already know which of `/artifact <id>` or
     /// `/note <id>` an id from that merged list needed — the exact
     /// distinction the tool-calling side never had to make.
+    ///
+    /// The body is the artifact; below it come its votes and this epoch's
+    /// comment thread (each epoch gains its own — `docs/MESSAGING.md`).
     pub async fn print_artifact(&mut self, id: &str) -> bool {
         let path = if id.trim_start().starts_with(['t', 'T']) { format!("/artifact/{id}") } else { format!("/note/{id}") };
         match self.get_json(&path).await {
             Ok(a) if a["found"] == true => {
                 println!("{}", a["body"].as_str().unwrap_or(""));
+                self.print_feedback(&a);
                 true
             }
             Ok(_) => {
@@ -358,11 +362,36 @@ impl Client {
         }
     }
 
+    /// Votes and the current epoch's comments, under an artifact body —
+    /// the shared tail of `print_artifact`/`print_note`.
+    fn print_feedback(&self, a: &serde_json::Value) {
+        let (ups, downs) = (
+            a["votes"]["up"].as_array().map(Vec::len).unwrap_or(0),
+            a["votes"]["down"].as_array().map(Vec::len).unwrap_or(0),
+        );
+        if ups + downs > 0 {
+            println!("\n▲ {ups}  ▼ {downs}");
+        }
+        let comments = a["comments"].as_array();
+        if comments.is_some_and(|c| !c.is_empty()) {
+            println!("\n--- comments (this epoch) ---");
+            for c in comments.unwrap() {
+                let who = c["who"]
+                    .as_str()
+                    .and_then(|h| miot_keys::from_hex(h).ok())
+                    .map(|acc| self.roster.name_of(&acc))
+                    .unwrap_or_else(|| "?".into());
+                println!("  {who}: {}", c["body"].as_str().unwrap_or(""));
+            }
+        }
+    }
+
     /// A standalone note's markdown on stdout, no task behind it.
     pub async fn print_note(&mut self, id: &str) -> bool {
         match self.get_json(&format!("/note/{id}")).await {
             Ok(a) if a["found"] == true => {
                 println!("{}", a["body"].as_str().unwrap_or(""));
+                self.print_feedback(&a);
                 true
             }
             Ok(_) => {
@@ -580,6 +609,21 @@ impl Client {
                 let otr = if eff["off_record"].as_bool().unwrap_or(false) { " (off the record)" } else { "" };
                 format!("{}: {}{otr}", self.name(eff, "from"), text("body"))
             }
+            "message" => {
+                let otr = if eff["off_record"].as_bool().unwrap_or(false) { " (off the record)" } else { "" };
+                let mut extra = String::new();
+                if let Some(p) = eff["parent"].as_u64() {
+                    extra.push_str(&format!(" ↩#{p}"));
+                }
+                for t in eff["tags"].as_array().into_iter().flatten() {
+                    if let Some(t) = t.as_str() {
+                        extra.push_str(&format!(" #{t}"));
+                    }
+                }
+                format!("{}: {}{otr}{extra}", self.name(eff, "from"), text("body"))
+            }
+            "reacted" => format!("{} reacted {} on #{}", self.name(eff, "who"), text("emoji"), eff["target"]),
+            "voted" => format!("{} voted {} on §{}", self.name(eff, "who"), if eff["up"].as_bool().unwrap_or(false) { "up" } else { "down" }, eff["artifact"].as_str().unwrap_or("?")),
             "opened" => format!("{} opened {}: {}", self.name(eff, "who"), task(), text("text")),
             "planned" => format!("{} planned {} into {} subtask(s)", self.name(eff, "who"), task(), eff["count"]),
             "assigned" => format!("{} assigned to {}: {}", task(), self.name(eff, "to"), text("what")),
@@ -679,6 +723,138 @@ impl Client {
             tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         }
     }
+
+    /// `kot log --tree`: the conversation log as the tree it actually is.
+    ///
+    /// Only speech is threaded — `said` and `message` events, edges drawn
+    /// from `Effect::Message`'s `parent` (the id of the message being
+    /// answered). Task transitions, stats and everything else are skipped:
+    /// the point is to follow one discussion in isolation without paging
+    /// past a day of lifecycle records (artifact 5 §1.2). Reactions
+    /// collapse onto the line they answered, so an agreement is one glyph
+    /// under the message instead of a block of its own.
+    ///
+    /// A parent this window doesn't hold (compacted away, or a reply to a
+    /// pre-epoch message) makes its node a root, marked `…` — better a
+    /// rooted orphan than a silently dropped branch. Cycles can't occur on
+    /// chain (a parent is always an earlier message) but the walk is
+    /// guarded anyway, since it renders arbitrary wire data.
+    pub async fn log_tree(&mut self) {
+        use std::collections::HashMap;
+        let batch = match self.get_json("/events?since=0").await {
+            Ok(serde_json::Value::Array(b)) => b,
+            _ => {
+                eprintln!("could not fetch events");
+                return;
+            }
+        };
+        #[derive(Clone)]
+        struct Msg {
+            from: String,
+            to: String,
+            body: String,
+            parent: Option<String>,
+            tags: Vec<String>,
+            at: Option<u64>,
+            reactions: Vec<String>,
+        }
+        let mut msgs: HashMap<String, Msg> = HashMap::new();
+        let mut children: HashMap<String, Vec<String>> = HashMap::new();
+        let mut order: Vec<String> = Vec::new();
+        let mut roots: Vec<String> = Vec::new();
+        for e in &batch {
+            let block = e["block"].as_u64().unwrap_or(0);
+            let eff = &e["effect"];
+            match eff["t"].as_str().unwrap_or("") {
+                "said" | "message" => {
+                    // `said` has no id (legacy path) — key it by block so it
+                    // still shows, as a root, with nothing hanging off it.
+                    let id = match eff["id"].as_str() {
+                        Some(i) => i.to_string(),
+                        None => format!("b{block}"),
+                    };
+                    let m = Msg {
+                        from: self.name(eff, "from"),
+                        to: if eff["to"].is_null() { "litter".into() } else { self.name(eff, "to") },
+                        body: eff["body"].as_str().unwrap_or("").to_string(),
+                        parent: eff["parent"].as_str().map(str::to_string),
+                        tags: eff["tags"].as_array().map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect()).unwrap_or_default(),
+                        at: e["at"].as_u64(),
+                        reactions: Vec::new(),
+                    };
+                    if !msgs.contains_key(&id) {
+                        order.push(id.clone());
+                    }
+                    msgs.insert(id, m);
+                }
+                "reacted" => {
+                    let target = eff["target"].as_str().unwrap_or("").to_string();
+                    let emoji = eff["emoji"].as_str().unwrap_or("·").to_string();
+                    let who = self.name(eff, "who");
+                    if let Some(m) = msgs.get_mut(&target) {
+                        m.reactions.push(format!("{emoji}{}", if emoji.chars().count() == 1 { format!(" {who}") } else { String::new() }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        // Parents, in log order; a reply to an unseen parent is a root.
+        for id in &order {
+            match msgs[id].parent.clone() {
+                Some(p) if msgs.contains_key(&p) => children.entry(p).or_default().push(id.clone()),
+                Some(p) => {
+                    roots.push(id.clone());
+                    println!("  {}", ui::dim(&format!("… #{p} (not in this node's window)")));
+                }
+                None => roots.push(id.clone()),
+            }
+        }
+        for m in msgs.values_mut() {
+            m.reactions.dedup();
+        }
+        let printed = std::cell::Cell::new(0usize);
+        fn walk(
+            id: &str,
+            prefix: &str,
+            last: bool,
+            msgs: &HashMap<String, Msg>,
+            children: &HashMap<String, Vec<String>>,
+            printed: &std::cell::Cell<usize>,
+        ) {
+            let m = &msgs[id];
+            let branch = if printed.get() == 0 { "" } else if last { "└─" } else { "├─" };
+            let mut line = format!(
+                "{prefix}{branch} {} {}{}",
+                ui::who(&format!("#{id}")),
+                ui::who(&m.from),
+                ui::dim(&format!(" → {}", m.to))
+            );
+            let time = m.at.map(|t| ui::dim(&format!(" {}", ui::clock(t)))).unwrap_or_default();
+            line.push_str(&time);
+            let first = m.body.lines().next().unwrap_or("");
+            let rest = m.body.lines().count().saturating_sub(1);
+            line.push_str(&format!(" {}", ui::plain(first)));
+            if rest > 0 {
+                line.push_str(&ui::dim(&format!(" (+{rest} more lines)")));
+            }
+            for t in &m.tags {
+                line.push_str(&ui::dim(&format!(" #{t}")));
+            }
+            if !m.reactions.is_empty() {
+                line.push_str(&format!("  {}", ui::dim(&m.reactions.join(" "))));
+            }
+            println!("{line}");
+            printed.set(printed.get() + 1);
+            let kids = children.get(id).map(Vec::as_slice).unwrap_or(&[]);
+            let next = if last { format!("{prefix}   ") } else { format!("{prefix}│  ") };
+            for (i, k) in kids.iter().enumerate() {
+                walk(k, &next, i + 1 == kids.len(), msgs, children, printed);
+            }
+        }
+        for r in &roots {
+            walk(r, "", true, &msgs, &children, &printed);
+        }
+    }
 }
 
 fn unix_ms_now() -> u64 {
@@ -692,6 +868,21 @@ fn host_port(route: &str) -> String {
 }
 
 const BROADCAST_ALIASES: [&str; 3] = ["all", "cats", "litter"];
+
+/// A fresh `MessageId` for a message we're about to post — minted from a
+/// randomly-seeded hasher over the body and the clock, which is plenty:
+/// ids only have to be unique within one epoch (a handful of cats, a few
+/// thousand messages — `docs/MESSAGING.md`).
+pub fn fresh_id(body: &str) -> miot_primitives::MessageId {
+    use std::hash::{BuildHasher, Hasher};
+    static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write(body.as_bytes());
+    h.write_u64(n);
+    h.write_u64(unix_ms_now());
+    miot_primitives::MessageId(h.finish())
+}
 
 /// `@name` tags in a line → who to `say` to. `@all`/`@cats`/`@litter`
 /// anywhere forces a broadcast (empty target list); otherwise every resolved
@@ -1158,7 +1349,7 @@ impl Input {
             return;
         }
         let candidates: Vec<String> = if let Some(prefix) = word.strip_prefix('/') {
-            ["/task", "/tasks", "/peers", "/activity", "/artifact", "/artifacts", "/note", "/notes", "/clear", "/keys", "/quit", "/exit"].iter().filter(|c| c[1..].starts_with(prefix)).map(|s| s.to_string()).collect()
+            ["/task", "/tasks", "/peers", "/activity", "/artifact", "/artifacts", "/note", "/notes", "/clear", "/keys", "/reply", "/react", "/vote", "/quit", "/exit"].iter().filter(|c| c[1..].starts_with(prefix)).map(|s| s.to_string()).collect()
         } else if let Some(prefix) = word.strip_prefix('@') {
             let mut v: Vec<String> = roster.names().filter(|n| n.starts_with(prefix)).map(|n| format!("@{n}")).collect();
             for alias in ["all", "litter", "cats"] {
@@ -1423,6 +1614,90 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
                 if !targets.is_empty() { targets.into_iter().map(Some).collect() } else { vec![c.dm_target.clone()] };
             send_and_seal(c, &me_name, calls, text, true, &send, state).await;
         }
+        // `/reply <id> <text>` — a threaded, optionally tagged message
+        // (`Effect::Message`). `@name` targets as everywhere else; `#tag`
+        // tokens come off the body into the effect's `tags`. `<id>` is the
+        // 8-hex-digit id shown on every message (`MessageId::parse` also
+        // takes decimal, `#`/`0x` prefixed forms).
+        ("/reply", rest) if !rest.is_empty() => {
+            let (raw_id, body) = match rest.split_once(' ') {
+                Some((p, b)) if miot_primitives::MessageId::parse(p).is_some() => (p, b.trim()),
+                _ => {
+                    send(format!("  {}", ui::dim("usage: /reply <id> <text> — #tags and @targets allowed in the text")));
+                    return false;
+                }
+            };
+            let parent = miot_primitives::MessageId::parse(raw_id);
+            let mut tags: Vec<String> = Vec::new();
+            let body = body
+                .split_whitespace()
+                .filter(|w| {
+                    if let Some(t) = w.trim_end_matches(|c: char| !c.is_alphanumeric()).strip_prefix('#') {
+                        if !t.is_empty() && !tags.contains(&t.to_string()) {
+                            tags.push(t.to_string());
+                            return false;
+                        }
+                    }
+                    true
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let (targets, unknown) = parse_targets(&c.roster, &body);
+            for bad in &unknown {
+                send(format!("  {}", ui::warn(&format!("no such cat: @{bad}"))));
+            }
+            let calls: Vec<Option<AccountId>> =
+                if !targets.is_empty() { targets.into_iter().map(Some).collect() } else { vec![c.dm_target.clone()] };
+            for t in calls {
+                if let Err(e) = c
+                    .try_submit(RuntimeCall::Litter(pallet_litter::Call::post {
+                        id: fresh_id(&body),
+                        to: t,
+                        body: body.clone(),
+                        parent,
+                        artifact_id: None,
+                        tags: tags.clone(),
+                        no_ack: false,
+                        off_record: false,
+                    }))
+                    .await
+                {
+                    send(format!("  {}", ui::alert(&format!("refused: {e}"))));
+                }
+            }
+        }
+        // `/react <id> <emoji>` — the acknowledgment that isn't a message.
+        ("/react", rest) => match rest.split_once(' ') {
+            Some((id, emoji)) if !emoji.trim().is_empty() && miot_primitives::MessageId::parse(id).is_some() => {
+                if let Err(e) = c
+                    .try_submit(RuntimeCall::Litter(pallet_litter::Call::react {
+                        target: miot_primitives::MessageId::parse(id).unwrap(),
+                        emoji: emoji.trim().to_string(),
+                    }))
+                    .await
+                {
+                    send(format!("  {}", ui::alert(&format!("refused: {e}"))));
+                }
+            }
+            _ => send(format!("  {}", ui::dim("usage: /react <id> <emoji>"))),
+        },
+        // `/vote t5 up` / `/vote 7 down` — artifact votes; the id is
+        // addressed exactly as `/artifact` addresses it.
+        ("/vote", rest) => match rest.split_whitespace().collect::<Vec<_>>()[..] {
+            [id, dir] if dir == "up" || dir == "down" => {
+                match miot_primitives::ArtifactId::parse(id) {
+                    Some(a) => {
+                        if let Err(e) =
+                            c.try_submit(RuntimeCall::Litter(pallet_litter::Call::vote { artifact: a, up: dir == "up" })).await
+                        {
+                            send(format!("  {}", ui::alert(&format!("refused: {e}"))));
+                        }
+                    }
+                    None => send(format!("  {}", ui::warn(&format!("no such artifact id: {id} (t5 or 7)")))),
+                }
+            }
+            _ => send(format!("  {}", ui::dim("usage: /vote <id> <up|down> — e.g. /vote t5 up"))),
+        },
         (cmd, _) if cmd.starts_with('/') => send(format!("  {}", ui::dim(&format!("unknown command {cmd}")))),
         _ => {
             let (targets, unknown) = parse_targets(&c.roster, line);

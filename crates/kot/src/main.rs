@@ -114,12 +114,15 @@ enum Cmd {
         /// Just this cat.
         name: Option<String>,
     },
-    /// The event log.
+    /// The event log. `--tree` renders just the conversation, threaded by
+    /// reply parent (see `Client::log_tree`).
     Log {
         #[arg(long)]
         task: Option<String>,
         #[arg(long, short)]
         follow: bool,
+        #[arg(long)]
+        tree: bool,
     },
     /// Create an identity at --seed-file if there isn't one, and print it.
     Id {
@@ -411,7 +414,14 @@ async fn main() {
             let mut c = connect(&cli).await;
             println!("{}", c.activity_text(name.as_deref()).await);
         }
-        Some(Cmd::Log { task, follow }) => connect(&cli).await.log(0, task.as_deref(), *follow, None).await,
+        Some(Cmd::Log { task, follow, tree }) => {
+            let mut c = connect(&cli).await;
+            if *tree {
+                c.log_tree().await;
+            } else {
+                c.log(0, task.as_deref(), *follow, None).await;
+            }
+        }
         // The banner is `repl()`'s own (`ui::banner`) — printing the bare
         // cat here too drew the logo twice.
         None => client::repl(connect(&cli).await).await,

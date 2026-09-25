@@ -429,7 +429,7 @@ impl Cat {
                 ),
                 _ => return None,
             },
-            "said" => {
+            "said" | "message" => {
                 let from = e.effect.get("from")?.as_str()?;
                 let body = e.effect.get("body")?.as_str().unwrap_or("");
                 let who = miot_keys::from_hex(from).map(|a| self.roster.name_of(&a)).unwrap_or_else(|_| "someone".into());
@@ -490,10 +490,18 @@ impl Cat {
                 } else {
                     ""
                 };
+                // The id (8 hex digits, shown as `#9f2c1ab0`) is what a
+                // reply references via SendMessage's `parent` — that, not
+                // the block, is a message's identity (`docs/MESSAGING.md`).
+                // A legacy `said` has none, so its reply just won't thread.
+                let id_note = match e.effect.get("id").and_then(|v| v.as_str()) {
+                    Some(id) => format!(" Its id is #{id} — set SendMessage's parent to \"{id}\" when you reply to it, so the thread stays together."),
+                    None => String::new(),
+                };
                 format!(
                     "{who} said to the litter:\n\"{body}\"\n\n{framing} The litter's other \
-                     members, by name: {}.\n\n{ack_note}{otr_note}",
-                    others.join(", ")
+                     members, by name: {}.\n\n{ack_note}{otr_note}{id_note}",
+                    others.join(", "),
                 )
             }
             _ => return None,
@@ -626,6 +634,44 @@ impl Cat {
         let task = c.str("task").unwrap_or_default();
         let refuse = |arg: String, why: &str| ToolOut::new(arg, false).meta(why.to_string());
         let (call, arg) = match c.name.as_str() {
+            // Vote first, so its optional comment can ride as a second
+            // call (`post` with `artifact_id`) — the comment lands on the
+            // artifact's own thread for this epoch (`docs/MESSAGING.md`).
+            "Vote" => {
+                let (Some(id), Some(up)) = (
+                    c.args.get("id").and_then(|v| v.as_str()).and_then(miot_primitives::ArtifactId::parse),
+                    c.args.get("up").and_then(|v| v.as_bool()),
+                ) else {
+                    return refuse(String::new(), "Vote needs id (from ArtifactList) and up (true/false)");
+                };
+                let comment = c.str("comment").unwrap_or_default().to_string();
+                let extra = if comment.is_empty() { String::new() } else { format!("  “{comment}”") };
+                let arg = format!("{} §{id}{extra}", if up { "▲" } else { "▼" });
+                let vote = RuntimeCall::Litter(pallet_litter::Call::vote { artifact: id, up });
+                let comment_call = if comment.is_empty() {
+                    None
+                } else {
+                    Some(RuntimeCall::Litter(pallet_litter::Call::post {
+                        id: crate::client::fresh_id(&comment),
+                        to: None,
+                        body: comment,
+                        parent: None,
+                        artifact_id: Some(id),
+                        tags: Vec::new(),
+                        no_ack: true,
+                        off_record: false,
+                    }))
+                };
+                return match self.submit(vote).await {
+                    Ok(()) => {
+                        if let Some(cc) = comment_call {
+                            let _ = self.submit(cc).await;
+                        }
+                        ToolOut::new(arg, true).meta("submitted")
+                    }
+                    Err(why) => ToolOut::new(arg, false).meta(why),
+                };
+            }
             "TaskPlan" => {
                 let assignments: Vec<miot_primitives::PlanItem<AccountId>> = c
                     .args
@@ -693,16 +739,61 @@ impl Cat {
                 };
                 let no_ack = c.args.get("no_ack").and_then(|v| v.as_bool()).unwrap_or(false);
                 let off_record = c.args.get("off_record").and_then(|v| v.as_bool()).unwrap_or(false);
+                // Threading (`Effect::Message`): `parent` is the id of the
+                // message being answered (8 hex digits, as shown on every
+                // delivered message); `tags` are topic labels; `artifact`
+                // anchors the message to an artifact's comment thread.
+                // Every SendMessage is a `post` now — the id is minted here,
+                // by the sender, so the conversation log is a tree that any
+                // late joiner can walk (`docs/MESSAGING.md`).
+                let parent = c
+                    .args
+                    .get("parent")
+                    .and_then(|v| v.as_str())
+                    .and_then(miot_primitives::MessageId::parse);
+                let artifact = c
+                    .args
+                    .get("artifact")
+                    .and_then(|v| v.as_str())
+                    .and_then(miot_primitives::ArtifactId::parse);
+                let tags: Vec<String> = c
+                    .args
+                    .get("tags")
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|t| t.as_str().map(str::to_string)).collect())
+                    .unwrap_or_default();
                 let who = if to.is_some() { raw_to.trim_start_matches('@').to_string() } else { "litter".to_string() };
-                let mut flags = Vec::new();
+                let mut flags: Vec<String> = Vec::new();
                 if no_ack {
-                    flags.push("no_ack");
+                    flags.push("no_ack".into());
                 }
                 if off_record {
-                    flags.push("off record");
+                    flags.push("off record".into());
                 }
+                if let Some(p) = parent {
+                    flags.push(format!("↩#{p}"));
+                }
+                if let Some(a) = &artifact {
+                    flags.push(format!("§{a}"));
+                }
+                let call = RuntimeCall::Litter(pallet_litter::Call::post {
+                    id: crate::client::fresh_id(&body),
+                    to,
+                    body: body.clone(),
+                    parent,
+                    artifact_id: artifact,
+                    tags: tags.clone(),
+                    no_ack,
+                    off_record,
+                });
                 let flags = if flags.is_empty() { String::new() } else { format!("  ({})", flags.join(", ")) };
-                (RuntimeCall::Litter(pallet_litter::Call::say { to, body: body.clone(), no_ack, off_record }), format!("→ {who}  {body}{flags}"))
+                let tags_s = if tags.is_empty() { String::new() } else { format!("  ({})", tags.iter().map(|t| format!("#{t}")).collect::<Vec<_>>().join(" ")) };
+                (call, format!("→ {who}  {body}{flags}{tags_s}"))
+            }
+            "Vote" => {
+                // Handled before this match: a vote plus its optional
+                // comment are two chain writes, and the match yields one.
+                unreachable!("Vote is handled before the call-building match")
             }
             "Artifact" => {
                 let text = c.str("text").unwrap_or_default();
@@ -790,8 +881,7 @@ impl Host for CatHost {
     fn spoke(&self, text: &str, ctx: &serde_json::Value) {
         let said = ctx.get("t").and_then(|v| v.as_str()) == Some("said");
         let no_ack = ctx.get("no_ack").and_then(|v| v.as_bool()).unwrap_or(false);
-        if !said || no_ack {
-            self.show(ui::note(&format!("plain text, no tool call — not sent: {}", text.lines().next().unwrap_or(""))));
+        if !said || no_ack {            self.show(ui::note(&format!("plain text, no tool call — not sent: {}", text.lines().next().unwrap_or(""))));
             return;
         }
         // Back to whoever spoke, marked `no_ack` (the model never chose to
@@ -806,8 +896,19 @@ impl Host for CatHost {
         tokio::spawn(async move {
             // A message all the same — the next stats report counts it.
             cat.stats.lock().await.messages += 1;
-            let arg = format!("→ {who}  {body}  (auto, no_ack)");
-            let out = match cat.submit(RuntimeCall::Litter(pallet_litter::Call::say { to, body, no_ack: true, off_record })).await {
+        let arg = format!("→ {who}  {body}  (auto, no_ack)");
+        let out = match cat.submit(RuntimeCall::Litter(pallet_litter::Call::post {
+            id: crate::client::fresh_id(&body),
+            to,
+            body,
+            parent: None,
+            artifact_id: None,
+            tags: Vec::new(),
+            no_ack: true,
+            off_record,
+        }))
+        .await
+        {
                 Ok(()) => ToolOut::new(arg, true).meta("submitted"),
                 Err(why) => ToolOut::new(arg, false).meta(why),
             };
@@ -1000,7 +1101,9 @@ async fn watch_chain(cat: Arc<Cat>, mut head: serde_json::Value, tx: tokio::sync
             // 2026-09-24, the GLM/OpenRouter cats answered it every time
             // and "Understood" / "Acknowledged" ran on for rounds. Now it
             // simply wakes no one.
-            if e.effect.get("t").and_then(|v| v.as_str()) == Some("said") && e.effect.get("no_ack").and_then(|v| v.as_bool()) == Some(true) {
+            if matches!(e.effect.get("t").and_then(|v| v.as_str()), Some("said") | Some("message"))
+                && e.effect.get("no_ack").and_then(|v| v.as_bool()) == Some(true)
+            {
                 return false;
             }
             match e.wakes.as_deref() {

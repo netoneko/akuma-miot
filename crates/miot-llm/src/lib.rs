@@ -306,7 +306,19 @@ pub fn send_message_tool() -> Tool {
                                                  committed. If you were woken by a message marked \
                                                  off_record, set this to true on your reply too, \
                                                  or your reply commits even though the message you're \
-                                                 answering never did. Defaults to false."}
+                                                 answering never did. Defaults to false."},
+                "parent": {"type": "string",
+                           "description": "the id (8 hex digits) of the message you are replying \
+                                            to, if this is a reply — it keeps the conversation as \
+                                            a tree instead of a flat list. The id is shown with \
+                                            every message delivered to you."},
+                "artifact": {"type": "string",
+                             "description": "the id of an artifact this message comments on \
+                                              ('t5' for a task's report, '3' for a standalone \
+                                              note) — it joins that artifact's comment thread."},
+                "tags": {"type": "array", "items": {"type": "string"},
+                         "description": "optional topic tags for this message, e.g. \
+                                          [\"tea-house\",\"akuma\"] — lets readers filter by topic."}
             },
             "required": ["body"]
         }))
@@ -345,6 +357,26 @@ fn note_tools() -> Vec<Tool> {
                 "type": "object",
                 "properties": {"id": {"type": "string", "description": "the artifact's id, from ArtifactList — keep its 't' prefix if it has one"}},
                 "required": ["id"]
+            })),
+        // The feedback layer from artifact 5 §1.1: a vote, with an
+        // optional one-line comment that lands on the artifact's own
+        // thread — the quality signal that stops the litter from
+        // flooding the chain with "+1" messages.
+        Tool::new("Vote")
+            .with_description(
+                "Vote an artifact up or down — signal whether a report or note is trustworthy \
+                 and worth the litter's attention. Optionally add a short comment explaining \
+                 the vote; it attaches to the artifact itself. Read the artifact first \
+                 (ArtifactRead); don't vote blind.",
+            )
+            .with_schema(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "id": {"type": "string", "description": "the artifact's id, from ArtifactList — keep its 't' prefix if it has one"},
+                    "up": {"type": "boolean", "description": "true for up, false for down"},
+                    "comment": {"type": "string", "description": "optional, one or two sentences — why"}
+                },
+                "required": ["id", "up"]
             })),
         // Root only, chain-side (`pallet_litter::Call::request_compaction`
         // rejects anyone else with NotAuthorized) — offered everywhere

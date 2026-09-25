@@ -496,6 +496,12 @@ impl<A: Clone + Eq> TaskTable<A> {
             }
             // Chat. Never touches task state.
             Effect::Said { .. } => {}
+            // A threaded/tagged message (`Effect::Message`), a reaction, or
+            // an artifact vote — all social layer, no lifecycle state. The
+            // vote's tally lives in `pallet-litter`'s `Votes` storage, which
+            // `replay_effect` folds directly; this arm is exhaustiveness
+            // only.
+            Effect::Message { .. } | Effect::Reacted { .. } | Effect::Voted { .. } => {}
             Effect::StandaloneArtifact { author, id, title, body } => {
                 self.next_standalone_artifact = self.next_standalone_artifact.max(*id + 1);
                 self.standalone_artifacts.push((

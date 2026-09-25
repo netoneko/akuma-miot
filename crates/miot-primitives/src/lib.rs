@@ -365,6 +365,120 @@ pub enum Effect<A> {
     /// every block already on disk and in every checkpoint, and changing it
     /// would make every node fail to decode its own log on the next replay.
     StatsReported2 { who: A, turns: u32, tool_calls: u32, messages: u32, tokens: u64, ms: u64 },
+    /// Somebody said something as a **reply** to an earlier message, and/or
+    /// under a topic tag — the conversation log as a tree instead of a flat
+    /// list (artifact 5 §1.2 / artifact 6, consensus 2026-09-25). A new
+    /// variant rather than a changed [`Effect::Said`]: that variant's
+    /// encoding sits in every block already on disk, and adding a field
+    /// would stop every node from decoding its own log on the next replay
+    /// — the same rule that produced [`Effect::StatsReported2`].
+    ///
+    /// Messages identify by [`MessageId`], never by block number — a block
+    /// can carry several messages, so a block is not an identity. `id` is
+    /// chosen by the *sender* and rides inside the effect, so every replay
+    /// and every replica agrees on it without anyone re-deriving it from
+    /// wire bytes a synced block no longer carries. `parent` is the `id` of
+    /// the message being answered; `None` is a top-level message.
+    /// `tags` are free-form topic labels (`tea-house`, `akuma`);
+    /// client-side filtering, not a consensus rule about what they mean.
+    ///
+    /// Waking is [`Effect::Said`]'s, and `no_ack` means the same thing —
+    /// and is enforced in the same place (`kot::node`), at delivery,
+    /// not by per-agent discipline.
+    Message {
+        id: MessageId,
+        from: A,
+        to: Option<A>,
+        body: String,
+        parent: Option<MessageId>,
+        /// Cross-reference (artifact 5 §2.5): the artifact this comment is
+        /// attached to, addressed as `/artifact/{id}` addresses it (`t5`,
+        /// or a bare note id). What "comments on an artifact" means on
+        /// chain — `kot artifact t5` can show its comment thread and its
+        /// tally side by side without anyone parsing prose for an id.
+        artifact_id: Option<ArtifactId>,
+        tags: Vec<String>,
+        from_root: bool,
+        no_ack: bool,
+        off_record: bool,
+    },
+    /// Broadcast, non-waking: a lightweight reaction (an emoji) on the
+    /// message with id `target` — the "+1 without a block of chat" from
+    /// artifact 5 §2.1. The agreement sora and tama typed out at length
+    /// would have been one of these. No task state, so `TaskTable::apply`
+    /// ignores it; it exists so replays and `/events` readers see it like
+    /// any record.
+    Reacted { who: A, target: MessageId, emoji: String },
+    /// Broadcast, non-waking: an up/down vote on an artifact — the
+    /// feedback/quality signal from artifact 5 §1.1, so the litter can
+    /// converge on which findings are trustworthy without flooding the
+    /// chain with "+1" messages. The tally itself lives in
+    /// `pallet_litter`'s `Votes` storage; this effect is what replicas
+    /// fold to keep it identical.
+    Voted { who: A, artifact: ArtifactId, up: bool },
+}
+
+/// A message's identity: 64 bits chosen by the sender and carried inside
+/// the message itself — the same role a txid plays, minus the dependence
+/// on wire bytes a compacted/synced block no longer carries. Threads only
+/// reach back inside the current epoch (everything earlier is compacted
+/// away together), so the id only has to be collision-free within one
+/// epoch — a handful of cats and a few thousand messages — and 64 bits is
+/// overkill already. Shown as 8 hex digits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo))]
+pub struct MessageId(pub u64);
+
+impl MessageId {
+    /// Parse the 8-hex-digit short form (with or without a `#`/`0x`), or a
+    /// decimal — however a human copied it out of a UI.
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim().trim_start_matches(['#', '0', 'x']).trim_start_matches("x");
+        u64::from_str_radix(s, 16)
+            .or_else(|_| s.parse())
+            .ok()
+            .map(MessageId)
+    }
+}
+
+impl core::fmt::Display for MessageId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:08x}", self.0)
+    }
+}
+
+/// Which artifact a vote is about. Two namespaces exist — a closed parent
+/// task's report, and a standalone note — addressed exactly as
+/// `/artifact/{id}` addresses them: `t5` vs `7`. Display renders them the
+/// same way, so a client can round-trip the id without parsing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[cfg_attr(feature = "codec", derive(codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo))]
+pub enum ArtifactId {
+    /// A closed parent task's artifact.
+    Task(TaskId),
+    /// A standalone note's running counter.
+    Note(u32),
+}
+
+impl ArtifactId {
+    pub fn parse(s: &str) -> Option<Self> {
+        let s = s.trim();
+        if let Some(n) = s.strip_prefix(['t', 'T']) {
+            let (p, sub) = n.split_once('.').unwrap_or((n, "0"));
+            Some(ArtifactId::Task(TaskId::sub(p.parse().ok()?, sub.parse().ok()?)))
+        } else {
+            s.parse().ok().map(ArtifactId::Note)
+        }
+    }
+}
+
+impl core::fmt::Display for ArtifactId {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        match self {
+            ArtifactId::Task(t) => write!(f, "{t}"),
+            ArtifactId::Note(n) => write!(f, "{n}"),
+        }
+    }
 }
 
 impl<A> Effect<A> {
@@ -380,7 +494,7 @@ impl<A> Effect<A> {
     /// `Node::absorb` for where a broadcast actually turns into "wakes
     /// every member but the sender."
     pub const fn wakes(&self) -> bool {
-        matches!(self, Effect::Assigned { .. } | Effect::Directed { .. } | Effect::Nudge { .. } | Effect::Said { .. })
+        matches!(self, Effect::Assigned { .. } | Effect::Directed { .. } | Effect::Nudge { .. } | Effect::Said { .. } | Effect::Message { .. })
     }
 
     /// Who this is addressed to, if anyone specific. `None` is a broadcast
@@ -391,7 +505,7 @@ impl<A> Effect<A> {
             Effect::Assigned { to, .. }
             | Effect::Directed { to, .. }
             | Effect::Nudge { to, .. } => Some(to),
-            Effect::Said { to, .. } => to.as_ref(),
+            Effect::Said { to, .. } | Effect::Message { to, .. } => to.as_ref(),
             _ => None,
         }
     }

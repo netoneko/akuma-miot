@@ -381,10 +381,108 @@ paths disabled), and `tests/election.rs`
 mute node also starts with a fork of its own that the primary has
 rewound.
 
-**Still open:** a push-only node can't *write*. Its `/submit` has no route
-to forward to (`CLAUDE.md`, known gaps), so AWS cats can't post while the
-primary is at home. The router forwards would fix that, and would make
-pull work for them again. Push is the fallback, not a replacement.
+**Was open, now has a fallback (2026-09-25, see below):** a push-only node
+couldn't *write* — `/submit` had no route to forward to (`CLAUDE.md`, known
+gaps), so AWS cats couldn't post while the primary was at home. The router
+forwards (`docs/runbooks/deploy-aws-node.md` §1) are still the real fix and
+still not done — what's below is a same-day fallback that doesn't need them.
+
+## A mempool for the no-route case, and a REPL corruption fix (2026-09-25)
+
+Prompted live: root broadcast to the litter from a node whose configured
+peers had no route to that moment's primary and got `503 "the primary is
+ryzen-linux-amd64, but this node has no route to it (it follows by push);
+submit to another node"` (`node.rs::no_primary`) — exactly the gap the
+paragraph above names, hit for real instead of in theory.
+
+**The fix:** `/submit`'s `Route::Nobody` case no longer refuses. It queues
+the raw extrinsic in a new in-memory `Node::mempool` (bounded, 15-minute
+TTL) and answers `200 {"ok":true,"status":"pending","tx_hash":…}`
+immediately. A new periodic `mempool_round` (piggybacked on the existing
+`poll_ms` mesh tick) then, per queued hash: applies it directly if this
+node is now the primary, forwards it if a route now exists, or — the actual
+fix — POSTs it to every peer this node's own config *can* reach, at a new
+`/mempool/relay` endpoint that runs the identical routing decision. A
+relayed write crosses the gap by however many hops it takes to reach a node
+with a real route, the same way `Mesh::push_targets` already gets *blocks*
+across a one-way link, just for the write side instead of the read side.
+
+**Knowing when it lands:** a block's persisted body is effects, not raw
+extrinsics (`seal_body`), so a node can't tell whether a hash it relayed
+away landed by re-reading a synced block. Fixed with a second small
+in-memory table, `Node::tx_status` (hash → `Pending`/`Applied{height}`/
+`Sealed{height}`), set only by whichever node actually calls `submit()` on
+it, flipped to `Sealed` when `advance()` closes that block. A new `/tx/
+{hash}` endpoint answers from that table if it has one, otherwise forwards
+the read the same way `/submit`/`/account` forward a write — and
+`mempool_round`'s `Route::Nobody` arm now also *polls* `/tx/{hash}` on its
+reachable peers every tick, so a node that only ever relayed a write (never
+applied it, never forwarded it to the actual primary) still learns and
+reports the truth once a peer that does know it can proxy the answer
+through. Neither table is persisted or replicated — a leadership change
+loses an unsealed entry, same as the block riding it would be lost.
+`Client::try_submit`/`Cat::submit` print the ack and then poll `/tx/{hash}`
+in the background (`watch_seal`) until sealed or a ~30s timeout.
+
+Proven with a new test, `crates/kot/tests/mempool.rs`
+`a_node_with_no_route_to_the_primary_relays_through_a_peer_it_can_reach`:
+three nodes, quorum 2, so alpha/beta settle a primary between themselves
+first (observed, not assumed) — then gamma joins with a route to whichever
+of the two lost and *no* route to the primary. A submit straight to gamma
+queues, relays through the loser, applies on the real primary, converges on
+all three via the primary's ordinary push back to gamma, and gamma itself
+reports `"sealed"` when asked — proving the read-side relay, not just the
+write-side one.
+
+**A real regression this caused, and the fix:** `election.rs`'s
+`a_mesh_of_one_produces_on_its_own` broke, because it had been relying on
+the *old* single-attempt `/submit` to double as an accidental "block until
+this node wins its own election" barrier (success required `Route::Here`
+already). The new mempool ack returns immediately, before any election
+concludes, which is strictly better behavior but removes that incidental
+sync — fixed by polling for `is_producing()` explicitly instead of trusting
+a fixed sleep to outlast a 600-1200ms election window.
+
+**A second real regression, found live by root, mid-session:** routing
+`try_submit`'s new retry/ack notices through a bare `eprintln!` corrupted
+the REPL's display — garbled text mixing the status bar with a stray
+"trying the next node" line. `repl()`'s terminal is in raw mode with
+ratatui's `Viewport::Inline` owning the whole screen (`docs/CLI.md` §0/§1);
+anything written straight to stdout/stderr from then on doesn't get
+skipped, it desyncs ratatui's buffer from what's actually on screen. Two of
+these (`reconnect`'s "switched to", `get_json`'s "unreachable… trying the
+next node") were *pre-existing*, just rare enough before this session's new
+retry loop made `get_json`/`meta` run far more often per submit. Fixed with
+`Client::notice: Option<mpsc::UnboundedSender<String>>` — `None` (a bare
+`eprintln!` is correct) for a one-shot verb, `Some(tx)` once `repl()` has
+put the terminal in raw mode, feeding the same inline-viewport scrollback
+channel every other REPL line already goes through. `watch_seal`, spawned
+and long-outliving the call that started it, takes its own clone of the
+sink so it keeps reporting correctly for as long as it keeps polling.
+
+**Also today, small:** `ui::directed` fed a `Directive`'s PascalCase name
+(`PlanNeeded`, `ClearanceNeeded`, `ReassignNeeded` — `miot_primitives::
+Directive`) straight into `shout()` (an unconditional `.to_uppercase()`
+under some themes), collapsing the word boundary into unreadable blobs like
+`PLANNEEDED` — found live, root: "we need it to look better, hard to
+read." Fixed with `ui::split_words`, inserting a space at each PascalCase
+boundary before shouting. `ui::directed_tests`.
+
+**Redeployed the same session**, `overlays/deploy/deploy.py up`, to
+dumpster-akuma-amd64, ryzen-linux-amd64, mac-linux-aarch64 and
+ryzen-akuma-amd64. **Not** mac-akuma-aarch64: its akuma-guest (nested in
+Lima `fc`, a separate VM from `fc` itself) wasn't booted — port 4444
+accepted TCP but nothing answered the SSH handshake on the other side.
+Left on its old binary; another agent is taking the guest's kernel side.
+
+**Not done, next:** a UI indicator for `Effect::Said`'s `no_ack` flag
+(`miot_primitives`) in `ui::said`/`ui::render`'s `"said"` arm — asked live,
+root: cats are "still doing crazy loops" despite `no_ack` existing
+specifically to stop reply ping-pong (see that field's own doc comment,
+2026-09-23), and there's currently no way to see from the REPL which
+messages were actually marked `no_ack` to tell whether the flag itself is
+the problem or the loop is happening for some other reason. Handed to
+another agent rather than built this session.
 
 ## Watching the litter (2026-09-25)
 
@@ -1070,6 +1168,12 @@ Cheapest tests to separate the two:
 - `docs/RESULTS.md` — **what actually ran, with numbers.** Evidence, not
   intentions. Read this before trusting any claim elsewhere.
 - `docs/CLI.md` — `miot-cli` requirements. Scrollback is sacred.
+- `docs/MESSAGE_ROUTING.md` — how a write actually gets to sealed: the
+  three-way `Route::{Here,Primary,Nobody}` decision every `/submit` and
+  `/account` makes, the mempool queue and peer relay `Nobody` falls into
+  since 2026-09-25, and how `/tx/{hash}` learns "sealed" by asking rather
+  than by re-deriving it from a synced block. Diagrams, and what it doesn't
+  fix (a node with zero reachable peers still can't relay across nothing).
 - `docs/LOCAL_SIM.md` — running the agent loop and multi-cat behavior with
   no fleet and no real infra: `kot chat` (a model, in-process, no chain),
   and a peered local mesh of two `kot run` cats against dev `llama-server`s.
