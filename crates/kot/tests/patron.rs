@@ -1,9 +1,9 @@
-//! A follower over real HTTP: three members and one node outside the
-//! roster (`--follower`), which the members list in `--followers`. It keeps
+//! A patron over real HTTP: three members and one node outside the
+//! roster (`--patron`), which the members list in `--patrons`. It keeps
 //! up with the chain through a change of primary, reads like a member, and
 //! can't vote, push or write. `miot-mesh`'s tests cover the learner's
 //! election logic; this covers the node wiring — TLS, the header gates, and
-//! a follower's status staying out of the members' election.
+//! a patron's status staying out of the members' election.
 
 use codec::Encode;
 use kot::node::{self, NodeConfig, Running};
@@ -50,7 +50,7 @@ fn cfg(who: u8, name: &str, port: u16, peers: Vec<String>, db: std::path::PathBu
         sync_ms: 100,
         poll_ms: 100,
         timing: miot_mesh::Timing { election_min_ms: 600, election_max_ms: 1200 },
-        followers: if learner { vec![] } else { vec![("friend".into(), acct(FRIEND))] },
+        patrons: if learner { vec![] } else { vec![("friend".into(), acct(FRIEND))] },
         learner,
     }
 }
@@ -148,7 +148,7 @@ impl Litter {
                 let mut g = self.nodes[3].as_ref().unwrap().shared.lock().await;
                 (g.head(), g.state_fingerprint(), g.mesh().leader().map(str::to_string), g.is_producing())
             };
-            assert!(!producing, "a follower never produces");
+            assert!(!producing, "a patron never produces");
             if fh == ph && fs == ps && leader.as_deref() == Some(NAMES[p]) {
                 return;
             }
@@ -203,7 +203,7 @@ async fn task_texts(who: u8, node: &str) -> Vec<String> {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn a_follower_keeps_up_reads_and_never_votes_or_writes() {
+async fn a_patron_keeps_up_reads_and_never_votes_or_writes() {
     let mut l = Litter::start().await;
     let friend = l.url(3);
 
@@ -225,7 +225,7 @@ async fn a_follower_keeps_up_reads_and_never_votes_or_writes() {
     {
         let g = l.nodes[first].as_ref().unwrap().shared.lock().await;
         assert_eq!(g.mesh().quorum(), 2);
-        assert!(g.mesh().heard().keys().all(|n| n != "friend"), "a follower's status never reaches the mesh");
+        assert!(g.mesh().heard().keys().all(|n| n != "friend"), "a patron's status never reaches the mesh");
     }
 
     // 4. Kill the primary. The two left elect one of themselves (the friend

@@ -36,6 +36,38 @@ use crate::activity::Seen;
 use crate::common::{EventCursor, Roster, DIM, OFF};
 use crate::ui;
 
+/// Why [`Client::try_submit`] didn't land a write: the chain said no, or no
+/// node could be reached to ask. Only the second is worth waiting out.
+enum SubmitError {
+    Refused(String),
+    Unreachable(String),
+}
+
+impl SubmitError {
+    fn text(self) -> String {
+        match self {
+            SubmitError::Refused(m) | SubmitError::Unreachable(m) => m,
+        }
+    }
+}
+
+/// What [`Client::submit_or_queue`] did with a write.
+pub enum Sent {
+    /// Accepted by a node now.
+    Now,
+    /// No node answered; a background task keeps sending it
+    /// ([`QUEUE_FOR`]) and reports how it went through `notice`.
+    Queued,
+}
+
+/// How long a queued write keeps being retried, and how often. A node
+/// restart (a redeploy, meow's herd bringing kot back) is tens of seconds;
+/// five minutes covers that with room, without a line resurfacing an hour
+/// later as if it were new.
+const QUEUE_FOR: std::time::Duration = std::time::Duration::from_secs(300);
+const QUEUE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+#[derive(Clone)]
 pub struct Client {
     http: reqwest::Client,
     candidates: Vec<String>,
@@ -127,7 +159,24 @@ impl Client {
         let mut c = Client { http, candidates, node: String::new(), identity, roster, dm_target: None, notice: None };
         c.reconnect().await?;
         c.adopt_chain_roster().await;
+        c.learn_peers().await;
         Ok(c)
+    }
+
+    /// Add the node's own peers to the nodes to fall back on, after the ones
+    /// given. Before this, a session opened against one node (`--node`, no
+    /// `MIOT_NODES`) had nowhere to go when that node restarted, and every
+    /// line typed meanwhile was refused. A peer URL is as the *node* reaches
+    /// it; one this machine can't reach just fails its probe in
+    /// [`Client::reconnect`], same as a dead node.
+    async fn learn_peers(&mut self) {
+        let Ok(v) = self.get_json("/mesh/peers").await else { return };
+        for r in v["peers"].as_array().into_iter().flatten().filter_map(|p| p["route"].as_str()) {
+            let r = r.trim_end_matches('/').to_string();
+            if !self.candidates.contains(&r) {
+                self.candidates.push(r);
+            }
+        }
     }
 
     /// Name accounts by the chain's own genesis roster (`/roster`), not by
@@ -209,27 +258,101 @@ impl Client {
     /// `agent.rs::Cat::submit`; a business-logic refusal
     /// (`NotAuthorized`, `WrongKind`, ...) still fails on the first attempt.
     pub async fn try_submit(&mut self, call: RuntimeCall) -> Result<(), String> {
-        const ATTEMPTS: u32 = 4;
+        self.submit_once(call, 4).await.map_err(SubmitError::text)
+    }
+
+    /// [`Client::try_submit`], but a write no node could take isn't lost: it
+    /// goes to a background task that keeps sending it until a node takes
+    /// it or [`QUEUE_FOR`] runs out. For the REPL, which shouldn't make the
+    /// operator retype a line because a node was mid-restart, and shouldn't
+    /// block the composer for the outage either.
+    pub async fn submit_or_queue(&mut self, call: RuntimeCall) -> Result<Sent, String> {
+        // Two quick tries before queueing: enough for a stale nonce or a
+        // failover to the next node, short enough not to hold the composer.
+        match self.submit_once(call.clone(), 2).await {
+            Ok(()) => Ok(Sent::Now),
+            Err(SubmitError::Refused(m)) => Err(m),
+            Err(SubmitError::Unreachable(m)) => {
+                emit(&self.notice, format!("  {DIM}queued — {m}; sending it as soon as a node answers{OFF}"));
+                let mut c = self.clone();
+                tokio::spawn(async move {
+                    let deadline = tokio::time::Instant::now() + QUEUE_FOR;
+                    loop {
+                        tokio::time::sleep(QUEUE_EVERY).await;
+                        if c.reconnect().await.is_err() {
+                            if tokio::time::Instant::now() >= deadline {
+                                emit(&c.notice, format!("  {}", ui::alert(&format!("gave up on a queued write after {}s: no node answered", QUEUE_FOR.as_secs()))));
+                                return;
+                            }
+                            continue;
+                        }
+                        match c.submit_once(call.clone(), 1).await {
+                            Ok(()) => {
+                                emit(&c.notice, format!("  {}", ui::ok(&format!("✓ queued write sent via {}", c.node))));
+                                return;
+                            }
+                            Err(SubmitError::Refused(m)) => {
+                                emit(&c.notice, format!("  {}", ui::alert(&format!("queued write refused: {m}"))));
+                                return;
+                            }
+                            Err(SubmitError::Unreachable(_)) if tokio::time::Instant::now() < deadline => {}
+                            Err(SubmitError::Unreachable(m)) => {
+                                emit(&c.notice, format!("  {}", ui::alert(&format!("gave up on a queued write: {m}"))));
+                                return;
+                            }
+                        }
+                    }
+                });
+                Ok(Sent::Queued)
+            }
+        }
+    }
+
+    /// Up to `attempts` tries (at most 4), backing off 1, 2, 4 s between.
+    async fn submit_once(&mut self, call: RuntimeCall, attempts: u32) -> Result<(), SubmitError> {
         const BACKOFF_MS: [u64; 3] = [1000, 2000, 4000];
+        let attempts = attempts.clamp(1, 4);
 
         let mut last = String::new();
-        for attempt in 0..ATTEMPTS {
+        let mut unreachable_last = false;
+        for attempt in 0..attempts {
             if attempt > 0 {
                 tokio::time::sleep(std::time::Duration::from_millis(BACKOFF_MS[attempt as usize - 1])).await;
-                emit(&self.notice, format!("  {DIM}retrying submit (attempt {}/{ATTEMPTS}) — {last}{OFF}", attempt + 1));
+                emit(&self.notice, format!("  {DIM}retrying submit (attempt {}/{attempts}) — {last}{OFF}", attempt + 1));
             }
 
-            let m = self.meta().await?;
+            // No node answering is retried like a stale nonce, not returned
+            // on the spot: a `?` here used to skip every retry below, so a
+            // node mid-restart refused each line at once.
+            let m = match self.meta().await {
+                Ok(m) => m,
+                Err(e) => {
+                    last = e;
+                    unreachable_last = true;
+                    let _ = self.reconnect().await;
+                    continue;
+                }
+            };
             let who = miot_keys::to_hex(&self.identity.account());
-            let nonce = self.get_json(&format!("/account/{who}")).await?["nonce"].as_u64().unwrap_or(0) as u32;
+            let nonce = match self.get_json(&format!("/account/{who}")).await {
+                Ok(v) => v["nonce"].as_u64().unwrap_or(0) as u32,
+                Err(e) => {
+                    last = e;
+                    unreachable_last = true;
+                    continue;
+                }
+            };
             let uxt = client::sign(&self.identity, call.clone(), nonce, &m);
             let r = match self.http.post(format!("{}/submit", self.node)).body(uxt.encode()).send().await {
                 Ok(r) => r,
                 Err(e) => {
                     last = format!("node unreachable: {e}");
+                    unreachable_last = true;
+                    let _ = self.reconnect().await;
                     continue;
                 }
             };
+            unreachable_last = false;
             let ok = r.status().is_success();
             let v: serde_json::Value = r.json().await.unwrap_or_default();
             if ok {
@@ -250,18 +373,28 @@ impl Client {
             }
             let msg = v.get("error").unwrap_or(&v).to_string();
             if msg.contains("Payment") {
-                return Err(format!(
+                return Err(SubmitError::Refused(format!(
                     "{msg} — {} isn't a member of this chain (no `providers`; see HANDOFF.md's \"catnip\"). \
                      Add it to MIOT_ROSTER on every node (a new genesis), or sign --as a member.",
                     miot_keys::short(&self.identity.account())
-                ));
+                )));
+            }
+            // A replica whose primary just died answers "primary
+            // unreachable" until the mesh elects another, and "no primary"
+            // during the election itself: not a refusal, just the same
+            // outage one hop further away.
+            if msg.contains("primary unreachable") || msg.contains("no primary") {
+                last = msg;
+                unreachable_last = true;
+                continue;
             }
             if !(msg.contains("Stale") || msg.contains("Future") || msg.contains("no route to it")) {
-                return Err(msg);
+                return Err(SubmitError::Refused(msg));
             }
             last = format!("refused: {msg}");
         }
-        Err(format!("gave up after {ATTEMPTS} attempts — {last}"))
+        let why = format!("gave up after {attempts} attempt(s) — {last}");
+        Err(if unreachable_last { SubmitError::Unreachable(why) } else { SubmitError::Refused(why) })
     }
 
     /// Sign and submit. Prints the outcome; returns whether it landed.
@@ -528,13 +661,15 @@ impl Client {
         let names = mesh_names(&m, &self.roster);
         let cat_of = |mesh_name: &str| names.get(mesh_name).cloned().unwrap_or_else(|| mesh_name.to_string());
 
+        // A patron's node has no vote, so it has no quorum to speak of.
+        let patron = m["learner"].as_bool().unwrap_or(false);
+        let quorum = if patron { ui::dim("patron, no vote") } else { format!("quorum {}", ui::plain(&m["quorum"].to_string())) };
         out.push(format!(
-            "  {} {} mesh, from {} ({})  quorum {}  last checkpoint #{}",
+            "  {} {} mesh, from {} ({})  {quorum}  last checkpoint #{}",
             ui::dim("网"),
             ui::dim("mesh,"),
             ui::who(&cat_of(me["name"].as_str().unwrap_or("?"))),
             ui::dim(&self.node),
-            ui::plain(&m["quorum"].to_string()),
             m["last_checkpoint"]
         ));
         let row = |name: String, addr: &str, st: &serde_json::Value, seen: String| {
@@ -572,6 +707,19 @@ impl Client {
             let ago = p["seen_ms_ago"].as_u64().unwrap_or(0);
             let seen = ui::dim(&format!("heard {:.1}s ago, calls us (no route from here)", ago as f64 / 1000.0));
             out.push(row(cat_of(p["status"]["name"].as_str().unwrap_or("?")), "(inbound only)", &p["status"], seen));
+        }
+        // Patrons (`--patrons`): readers outside the roster that poll this
+        // node. Not members, so no role or term, just how far along they are.
+        for p in m["patrons"].as_array().into_iter().flatten() {
+            let ago = p["seen_ms_ago"].as_u64().unwrap_or(0);
+            out.push(format!(
+                "    {}  {}  {}  head {:<7} {}",
+                ui::pad(&ui::who(p["name"].as_str().unwrap_or("?")), 14),
+                ui::pad(&ui::dim("(patron)"), 24),
+                ui::dim(&format!("{:<13}", "reads only")),
+                p["head"],
+                ui::dim(&format!("polled {:.1}s ago", ago as f64 / 1000.0)),
+            ));
         }
         out.join("\n")
     }
@@ -1564,8 +1712,9 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
             }
             _ => send(format!("  {}", ui::alert("could not fetch artifacts"))),
         },
-        ("/task", text) if !text.is_empty() => match c.try_submit(RuntimeCall::Litter(pallet_litter::Call::open { text: text.to_string() })).await {
-            Ok(()) => send(format!("  {}", ui::ok("✓ task opened"))),
+        ("/task", text) if !text.is_empty() => match c.submit_or_queue(RuntimeCall::Litter(pallet_litter::Call::open { text: text.to_string() })).await {
+            Ok(Sent::Now) => send(format!("  {}", ui::ok("✓ task opened"))),
+            Ok(Sent::Queued) => {}
             Err(e) => send(format!("  {}", ui::alert(&format!("refused: {e}")))),
         },
         // `/dm <name>` — sticky, not one-shot: every bare line after this
@@ -1586,7 +1735,7 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
                     c.dm_target = Some(a.clone());
                     send(format!("  {}", ui::dim(&format!("dm → {} (stays until /dm turns it off)", c.roster.name_of(&a)))));
                     if !body.is_empty() {
-                        if let Err(e) = c.try_submit(say_call(Some(a), body, false)).await {
+                        if let Err(e) = c.submit_or_queue(say_call(Some(a), body, false)).await {
                             send(format!("  {}", ui::alert(&format!("refused: {e}"))));
                         }
                     }
@@ -1604,7 +1753,7 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
         },
         ("/all", text) => {
             c.dm_target = None;
-            if let Err(e) = c.try_submit(say_call(None, text, false)).await {
+            if let Err(e) = c.submit_or_queue(say_call(None, text, false)).await {
                 send(format!("  {}", ui::alert(&format!("refused: {e}"))));
             }
         }
@@ -1658,7 +1807,7 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
                 if !targets.is_empty() { targets.into_iter().map(Some).collect() } else { vec![c.dm_target.clone()] };
             for t in calls {
                 if let Err(e) = c
-                    .try_submit(RuntimeCall::Litter(pallet_litter::Call::post {
+                    .submit_or_queue(RuntimeCall::Litter(pallet_litter::Call::post {
                         id: fresh_id(&body),
                         to: t,
                         body: body.clone(),
@@ -1678,7 +1827,7 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
         ("/react", rest) => match rest.split_once(' ') {
             Some((id, emoji)) if !emoji.trim().is_empty() && miot_primitives::MessageId::parse(id).is_some() => {
                 if let Err(e) = c
-                    .try_submit(RuntimeCall::Litter(pallet_litter::Call::react {
+                    .submit_or_queue(RuntimeCall::Litter(pallet_litter::Call::react {
                         target: miot_primitives::MessageId::parse(id).unwrap(),
                         emoji: emoji.trim().to_string(),
                     }))
@@ -1696,7 +1845,7 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
                 match miot_primitives::ArtifactId::parse(id) {
                     Some(a) => {
                         if let Err(e) =
-                            c.try_submit(RuntimeCall::Litter(pallet_litter::Call::vote { artifact: a, up: dir == "up" })).await
+                            c.submit_or_queue(RuntimeCall::Litter(pallet_litter::Call::vote { artifact: a, up: dir == "up" })).await
                         {
                             send(format!("  {}", ui::alert(&format!("refused: {e}"))));
                         }
@@ -1743,7 +1892,7 @@ async fn send_and_seal(
         let to = t.as_ref().map(|a| c.roster.name_of(a)).unwrap_or_else(|| "litter".to_string());
         send(ui::typed(me_name, Some(&to), text, &c.roster));
         state.lock().await.sealing += 1;
-        if let Err(e) = c.try_submit(say_call(t, text, off_record)).await {
+        if let Err(e) = c.submit_or_queue(say_call(t, text, off_record)).await {
             let mut s = state.lock().await;
             s.sealing = s.sealing.saturating_sub(1);
             send(format!("  {}", ui::alert(&format!("refused: {e}"))));

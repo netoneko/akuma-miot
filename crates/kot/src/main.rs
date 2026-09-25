@@ -183,14 +183,14 @@ struct RunArgs {
     /// Accounts outside the roster allowed to follow from this node —
     /// `name=pub:<64 hex>,...`. They read (status, block log, client GETs);
     /// they never vote, push blocks or count toward the quorum. Not genesis:
-    /// set it on just the nodes a follower talks to.
-    #[arg(long, env = "MIOT_FOLLOWERS", default_value = "")]
-    followers: String,
-    /// Run as a follower: pull the chain, never campaign or vote, never
+    /// set it on just the nodes a patron talks to.
+    #[arg(long, env = "MIOT_PATRONS", default_value = "")]
+    patrons: String,
+    /// Run as a patron: pull the chain, never campaign or vote, never
     /// produce. For a node whose key isn't in the roster; the members it
-    /// polls must list it in their --followers.
-    #[arg(long, env = "MIOT_FOLLOWER")]
-    follower: bool,
+    /// polls must list it in their --patrons.
+    #[arg(long, env = "MIOT_PATRON")]
+    patron: bool,
 }
 
 #[derive(Args)]
@@ -311,10 +311,10 @@ async fn run(cli: &Cli, a: &RunArgs) {
     let root = account(&a.root);
     roster.check_genesis(&root).unwrap_or_else(|e| die(format!("--roster: {e}")));
     let leader = roster.account(&a.leader).unwrap_or_else(|| account(&a.leader));
-    let followers = Roster::parse(&a.followers).unwrap_or_else(|e| die(format!("--followers: {e}")));
-    for (f, acct) in &followers.0 {
+    let patrons = Roster::parse(&a.patrons).unwrap_or_else(|e| die(format!("--patrons: {e}")));
+    for (f, acct) in &patrons.0 {
         if roster.0.iter().any(|(_, m)| m == acct) || *acct == root || *acct == leader {
-            die(format!("--followers: {f} is already a genesis member; a member doesn't need to be a follower"));
+            die(format!("--patrons: {f} is already a genesis member; a member doesn't need to be a patron"));
         }
     }
     let cfg = node::NodeConfig {
@@ -331,8 +331,8 @@ async fn run(cli: &Cli, a: &RunArgs) {
         sync_ms: a.sync_ms,
         poll_ms: a.poll_ms,
         timing: miot_mesh::Timing { election_min_ms: a.election_min_ms, election_max_ms: a.election_max_ms },
-        followers: followers.0,
-        learner: a.follower,
+        patrons: patrons.0,
+        learner: a.patron,
     };
     let running = node::start(cfg).await.unwrap_or_else(|e| die(e));
 

@@ -583,27 +583,42 @@ full table (and mimi, still `qwen3:4b` on llama-server :8084).
   5 idle minutes and reload on the next wake. Nothing brings it back after a
   mac reboot.
 
-## Followers, and GLM thinking less (2026-09-25)
+## Patrons, and GLM thinking less (2026-09-25)
 
-**Followers.** Kirill wanted to let friends onto the mesh (neobeav first,
+**Patrons.** Kirill wanted to let friends onto the mesh (neobeav first,
 three more later) without touching the GLM cats. A roster entry can't do
 that: the roster is genesis, and a partial rollout would have left two
 chains that still elect and pull together. The genesis fingerprint is only
 checked locally, never between peers, so nothing would have caught it. So,
-instead, a non-voting follower: `MIOT_FOLLOWERS` on the members, per node,
-and `--follower` on the friend's node. Design and limits: `docs/MESH_AUTH.md`,
-"Followers". Found on the way: a follower that pulls only from the primary
+instead, a non-voting patron: `MIOT_PATRONS` on the members, per node,
+and `--patron` on the friend's node. Design and limits: `docs/MESH_AUTH.md`,
+"Patrons". Found on the way: a patron that pulls only from the primary
 never moves, because friends reach only the AWS pair, which are replicas
 while a home cat leads. A learner now pulls from any member it can reach
 (`Mesh::pull_sources`). Tests: `miot-mesh` (a learner never leads, even
 alone; follows through a leader change; pulls from a replica),
-`crates/kot/tests/follower.rs` (real nodes: follows via a replica with the
+`crates/kot/tests/patron.rs` (real nodes: follows via a replica with the
 primary unreachable, reads, `Invalid(Payment)` on write, 401 on vote and
 push, a stranger refused at the handshake). Both negative-controlled: no
-`--followers`, or leader-only pulling, and the friend sits at head 0. A
+`--patrons`, or leader-only pulling, and the friend sits at head 0. A
 local run of four real `kot run` processes did the same over the CLI flags.
 **neobeav's key is an ssh-ed25519 line, which `kot` can't sign with**, so
 the friend needs a `kot` seed (or `kot` needs OpenSSH private-key reading).
+
+**The REPL stopped refusing lines while a node restarts.** Kirill retyped
+one line five times while meow's node (the only one his session knew)
+restarted. Two bugs: `try_submit`'s `self.meta().await?` returned "no node
+answered" before its own retry loop could run, and a replica whose primary
+had just died answered "primary unreachable" / "no primary", which was
+treated as a refusal. Now both are retried. The client learns its node's
+peers at connect (`learn_peers`, from `/mesh/peers`) and fails over to
+them. The REPL's writes go through `submit_or_queue`: two quick tries, then
+a background task resends every 5 s for up to 5 minutes and reports how it
+went. `/clear` is deliberately not queued. `crates/kot/tests/client_queue.rs`;
+a one-shot `task open` sent into the election gap of a local sim landed
+after 11 s instead of being refused. Still true: the REPL's event tail and
+mesh poll stay on the node it started with, so if that node is gone for
+good, the scrollback goes quiet even though writes still land.
 
 **GLM reasoning effort defaults to `low`** (`--reasoning`/`MIOT_REASONING`,
 `default` for the provider's own). z.ai's coding endpoint honors

@@ -126,11 +126,11 @@ read that first, it is kept current and this file does not repeat it.
   either is a coordinated restart, not an operation. A block log remembers
   the genesis it was built under and refuses a different one.
   No joint consensus — fine for one operator, not for anything else.
-  **Followers are the exception that isn't genesis (2026-09-25):** an
-  account in a member's `MIOT_FOLLOWERS` may read and pull but never vote
-  or write, and its own node runs `--follower` (a learner that pulls from
+  **Patrons are the exception that isn't genesis (2026-09-25):** an
+  account in a member's `MIOT_PATRONS` may read and pull but never vote
+  or write, and its own node runs `--patron` (a learner that pulls from
   any member it can reach). Per node, so it rolls out without a new chain.
-  `docs/MESH_AUTH.md`, "Followers".
+  `docs/MESH_AUTH.md`, "Patrons".
 - **An operator's client doesn't pin the node (2026-09-23).** `kot`'s
   client reads the roster from whichever node it connects to (`/roster`)
   and trusts that node's cert as presented (`tls::client_config_any_node`);
