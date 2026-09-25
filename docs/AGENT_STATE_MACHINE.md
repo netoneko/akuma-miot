@@ -138,7 +138,11 @@ silence with nothing to look at. Nothing here is on chain.
   hear, push-only ones included. The REPL shows one row above the hairline
   (`活 meow ◌ 42s · kuro ⚙2 Bash 1m03s · tama · ✗Bash`), redrawn every
   second; `/activity [name]` and `kot activity [name]` print the full
-  snapshot into scrollback.
+  snapshot into scrollback. The record also carries the cat's local task
+  list (every open one plus the newest finished, 24 at most, with done/total
+  over the whole list): the row shows it as `3/4`, and `/tasks <cat>` (or
+  `kot task list --cat <cat>`) prints it with each finished step's note.
+  Bare `/tasks` is still the litter's tasks on chain.
 
 **What the model sees.**
 

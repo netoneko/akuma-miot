@@ -132,7 +132,12 @@ enum Cmd {
 #[derive(Subcommand)]
 enum TaskCmd {
     Open { text: String },
-    List,
+    /// The litter's tasks — or, with --cat, that cat's own local list.
+    List {
+        /// A cat's own local task list (`LocalTask`), from its live activity.
+        #[arg(long)]
+        cat: Option<String>,
+    },
 }
 
 #[derive(Args)]
@@ -356,7 +361,11 @@ async fn main() {
                 c.log(since, None, true, Some(8)).await;
             }
         }
-        Some(Cmd::Task { cmd: TaskCmd::List }) => connect(&cli).await.print_tasks().await,
+        Some(Cmd::Task { cmd: TaskCmd::List { cat: None } }) => connect(&cli).await.print_tasks().await,
+        Some(Cmd::Task { cmd: TaskCmd::List { cat: Some(cat) } }) => {
+            let mut c = connect(&cli).await;
+            println!("{}", c.local_tasks_text(cat).await);
+        }
         Some(Cmd::Artifact { id }) => {
             if !connect(&cli).await.print_artifact(id).await {
                 std::process::exit(1);

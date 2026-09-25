@@ -160,6 +160,23 @@ impl LocalTasks {
         out.join("\n")
     }
 
+    /// The list for the live record (`Activity::tasks`): every open one and
+    /// the newest finished, `max` in all, back in id order — with how many
+    /// are finished and how many there are, over the whole list.
+    pub fn progress(&self, max: usize) -> (Vec<crate::activity::TaskLine>, u32, u32) {
+        use crate::activity::{short, TaskLine, TASK_CHARS};
+        let open: Vec<&LocalTask> = self.open().collect();
+        let room = max.saturating_sub(open.len());
+        let closed: Vec<&LocalTask> = self.tasks.iter().filter(|t| !t.is_open()).collect();
+        let mut pick: Vec<&LocalTask> = open.into_iter().take(max).chain(closed[closed.len().saturating_sub(room)..].iter().copied()).collect();
+        pick.sort_by_key(|t| t.id.trim_start_matches('L').parse::<u64>().unwrap_or(u64::MAX));
+        let lines = pick
+            .into_iter()
+            .map(|t| TaskLine { id: t.id.clone(), status: t.status.clone(), text: short(&t.text, TASK_CHARS), note: short(&t.note, TASK_CHARS) })
+            .collect();
+        (lines, closed.len() as u32, self.tasks.len() as u32)
+    }
+
     /// For a wake's prompt: the open ones, one line each — `None` if there
     /// are none, so an idle cat's prompts don't grow.
     pub fn reminder(&self) -> Option<String> {
@@ -217,6 +234,24 @@ mod tests {
         again.reset(4);
         assert!(again.tasks.is_empty());
         assert!(LocalTasks::load(Some(path), 4).tasks.is_empty());
+    }
+
+    #[test]
+    fn progress_keeps_every_open_one_and_the_newest_finished_in_order() {
+        let mut t = LocalTasks::load(None, 0);
+        for i in 1..=6 {
+            t.apply("add", "", &format!("step {i}")).unwrap();
+        }
+        for id in ["L1", "L2", "L3", "L5"] {
+            t.apply("done", id, "ok").unwrap();
+        }
+        t.apply("start", "L4", "").unwrap();
+        // Room for 4: both open ones (L4, L6), then the two newest finished (L3, L5).
+        let (lines, finished, total) = t.progress(4);
+        assert_eq!(lines.iter().map(|l| l.id.as_str()).collect::<Vec<_>>(), vec!["L3", "L4", "L5", "L6"]);
+        assert_eq!((finished, total), (4, 6));
+        assert_eq!(lines[1].status, "doing");
+        assert_eq!(lines[0].note, "ok");
     }
 
     #[test]

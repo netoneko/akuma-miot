@@ -1214,7 +1214,9 @@ pub fn activity_row(seen: &[crate::activity::Seen], roster: &Roster) -> String {
             .filter(|f| !f.ok && a.at.saturating_sub(f.at) + s.age_ms < 60_000)
             .map(|f| format!(" {}", paint(t.alarm, &format!("✗{}", f.tool))))
             .unwrap_or_default();
-        parts.push(format!("{name} {what}{failed}"));
+        // Its own to-do list, as a fraction — how far through a job it is.
+        let progress = if a.tasks_total > 0 { format!(" {}", dim(&format!("{}/{}", a.tasks_finished, a.tasks_total))) } else { String::new() };
+        parts.push(format!("{name} {what}{progress}{failed}"));
     }
     let row = format!("  {} {}", faint("活"), parts.join(&dim(" · ")));
     clip_ansi(&row, term_width().saturating_sub(1))
@@ -1252,6 +1254,74 @@ fn clip_ansi(s: &str, n: usize) -> String {
         out.push_str("\x1b[0m");
     }
     out
+}
+
+/// One local task: a glyph for where it's at, its id, its text, and what
+/// came of it if it's finished.
+fn task_line(t: &crate::activity::TaskLine, width: usize) -> String {
+    let th = theme();
+    let (mark, c) = match t.status.as_str() {
+        "doing" => ("◐", th.warm),
+        "done" => ("✓", th.progress),
+        "failed" => ("✗", th.alarm),
+        "dropped" => ("–", th.ink),
+        _ => ("○", th.ink),
+    };
+    let text = clip(&t.text, width.saturating_sub(8));
+    let body = match t.status.as_str() {
+        "doing" => bold(th.paper, &text),
+        "todo" => plain(&text),
+        _ => dim(&text),
+    };
+    let mut row = format!("{} {} {body}", paint(c, mark), dim(&t.id));
+    if !t.note.is_empty() {
+        row.push_str(&format!("\n  {}     {}", " ".repeat(9), faint(&format!("↳ {}", clip(&t.note, width.saturating_sub(12))))));
+    }
+    row
+}
+
+/// One cat's local task list (`/tasks <name>`, `kot task list --cat`):
+///
+/// ```text
+///   喵 meow  local tasks · 3/4 finished · ◐ building  heard 1.2s ago
+///       ✓ L1 Inspect /tmp/meow-greet source
+///       ✓ L2 Clean old build artifacts
+///            ↳ rm -f hello removed the stale binary
+///       ◐ L3 Build hello from scratch with 600s Bash timeout
+///       ○ L4 Verify binary runs and send root the output
+/// ```
+pub fn local_tasks_text(seen: &[crate::activity::Seen], roster: &Roster, name: &str) -> String {
+    let name = name.trim_start_matches('@');
+    let Some(s) = seen.iter().find(|s| seen_name(s, roster) == name) else {
+        return format!("  {}", dim(&format!("no activity from {name} — not running an agent loop on a build that reports it, or out of this node's earshot")));
+    };
+    let a = &s.activity;
+    let t = theme();
+    let heard = if s.age_ms > ACTIVITY_STALE_MS {
+        warn(&format!("last heard {} ago — may be out of date", human(s.age_ms / 1000)))
+    } else {
+        dim(&format!("heard {} ago", millis(s.age_ms)))
+    };
+    let mut out = vec![String::new()];
+    if a.tasks_total == 0 {
+        out.push(format!("  {}  {}  {heard}", sealed(name), dim("local tasks · none — it hasn't written any down this session")));
+        return out.join("\n");
+    }
+    let doing = a.tasks.iter().find(|t| t.status == "doing").map(|d| format!(" · {}", paint(t.warm, &format!("◐ {}", d.id)))).unwrap_or_default();
+    out.push(format!(
+        "  {}  {}{doing}  {heard}",
+        sealed(name),
+        dim(&format!("local tasks · {}/{} finished", a.tasks_finished, a.tasks_total))
+    ));
+    let width = term_width().saturating_sub(10).max(20);
+    let shown = a.tasks.len() as u32;
+    if shown < a.tasks_total {
+        out.push(format!("      {}", faint(&format!("… {} older finished ones not carried", a.tasks_total - shown))));
+    }
+    for task in &a.tasks {
+        out.push(format!("      {}", task_line(task, width)));
+    }
+    out.join("\n")
 }
 
 /// The full snapshot, one block per cat (`/activity [name]`,
@@ -1313,8 +1383,11 @@ pub fn activity_text(seen: &[crate::activity::Seen], roster: &Roster, only: Opti
             let meta = if f.meta.is_empty() { String::new() } else { format!("  {}", dim(&f.meta)) };
             out.push(format!("  {} {} {}  {}{meta}", " ".repeat(9), paint(c, mark), plain(&f.tool), dim(&clip(&f.arg, inner.saturating_sub(30)))));
         }
-        for (i, todo) in a.todo.iter().enumerate() {
-            out.push(format!("  {} {}", if i == 0 { label("todo") } else { " ".repeat(9) }, plain(&clip(todo, inner))));
+        if a.tasks_total > 0 {
+            out.push(format!("  {} {}", label("tasks"), dim(&format!("{}/{} finished — /tasks {} for the list", a.tasks_finished, a.tasks_total, seen_name(s, roster)))));
+            for t in a.tasks.iter().filter(|t| matches!(t.status.as_str(), "todo" | "doing")) {
+                out.push(format!("  {} {}", " ".repeat(9), task_line(t, inner)));
+            }
         }
         if !a.thought.is_empty() {
             let width = inner.max(20);
@@ -1336,7 +1409,7 @@ pub fn activity_text(seen: &[crate::activity::Seen], roster: &Roster, only: Opti
 #[cfg(test)]
 mod activity_tests {
     use super::*;
-    use crate::activity::{Activity, Finished, Flight, Seen};
+    use crate::activity::{Activity, Finished, Flight, Seen, TaskLine};
 
     fn roster() -> Roster {
         Roster(vec![("meow".into(), miot_keys::Identity::from_seed(&[7; 32]).account()), ("kuro".into(), miot_keys::Identity::from_seed(&[8; 32]).account())])
@@ -1364,7 +1437,13 @@ mod activity_tests {
                     ok: 9,
                     failed: 2,
                     recent: vec![Finished { tool: "Bash".into(), arg: "$ make".into(), ok: false, meta: "exit 2".into(), at: 60_000, ..Default::default() }],
-                    todo: vec!["L2 [doing] build it".into()],
+                    tasks: vec![
+                        TaskLine { id: "L1".into(), status: "done".into(), text: "configure".into(), note: "used defconfig".into() },
+                        TaskLine { id: "L2".into(), status: "doing".into(), text: "build it".into(), note: String::new() },
+                        TaskLine { id: "L3".into(), status: "todo".into(), text: "send root the output".into(), note: String::new() },
+                    ],
+                    tasks_finished: 1,
+                    tasks_total: 3,
                     thought: "the link step needs more time".into(),
                     ..Default::default()
                 },
@@ -1378,7 +1457,7 @@ mod activity_tests {
         assert!(row.contains("meow ◌ 42s"), "{row}");
         // Oldest of two in flight, timed from its own start; the recent
         // failure is flagged.
-        assert!(row.contains("kuro ⚙2 Bash 1m03s ✗Bash"), "{row}");
+        assert!(row.contains("kuro ⚙2 Bash 1m03s 1/3 ✗Bash"), "with its task progress: {row}");
     }
 
     #[test]
@@ -1393,7 +1472,7 @@ mod activity_tests {
     #[test]
     fn the_snapshot_has_everything_and_filters_by_name() {
         let all = strip_ansi(&activity_text(&cats(), &roster(), None));
-        for want in ["◌ thinking 42s", "⚙ waiting on tools 1m10s", "running 2", "$ cargo build", "✓ 9", "✗ 2", "exit 2", "L2 [doing] build it", "the link step needs more time"] {
+        for want in ["◌ thinking 42s", "⚙ waiting on tools 1m10s", "running 2", "$ cargo build", "✓ 9", "✗ 2", "exit 2", "1/3 finished — /tasks kuro", "◐ L2 build it", "○ L3 send root", "the link step needs more time"] {
             assert!(all.contains(want), "missing {want:?} in:\n{all}");
         }
         let one = strip_ansi(&activity_text(&cats(), &roster(), Some("@meow")));
@@ -1401,5 +1480,201 @@ mod activity_tests {
         let none = strip_ansi(&activity_text(&cats(), &roster(), Some("tama")));
         assert!(none.contains("no activity from tama"), "{none}");
         assert!(strip_ansi(&activity_text(&[], &roster(), None)).contains("no cat is reporting"));
+        // The snapshot shows only what's open; the finished one is for /tasks.
+        assert!(!all.contains("L1 configure"), "{all}");
+    }
+
+    #[test]
+    fn a_cats_task_list_shows_progress_status_and_notes() {
+        let t = strip_ansi(&local_tasks_text(&cats(), &roster(), "@kuro"));
+        assert!(t.contains("kuro  local tasks · 1/3 finished · ◐ L2"), "{t}");
+        assert!(t.contains("✓ L1 configure") && t.contains("↳ used defconfig"), "{t}");
+        assert!(t.contains("◐ L2 build it") && t.contains("○ L3 send root the output"), "{t}");
+        // In id order.
+        let at = |row: &str| t.find(row).unwrap_or_else(|| panic!("no {row:?} in {t}"));
+        assert!(at("✓ L1") < at("◐ L2 build") && at("◐ L2 build") < at("○ L3"), "{t}");
+
+        let mut c = cats();
+        c[1].activity.tasks_total = 30;
+        assert!(strip_ansi(&local_tasks_text(&c, &roster(), "kuro")).contains("… 27 older finished ones not carried"));
+        assert!(strip_ansi(&local_tasks_text(&cats(), &roster(), "meow")).contains("none — it hasn't written any down"));
+        assert!(strip_ansi(&local_tasks_text(&cats(), &roster(), "tama")).contains("no activity from tama"));
+    }
+}
+
+// ── markdown ────────────────────────────────────────────────────────────
+//
+// An artifact is markdown, written for a reader: in the REPL it's shown
+// rendered, not as source. Small on purpose — the subset cats actually
+// write (headings, emphasis, code, lists, quotes, links) — and it returns
+// ANSI lines like everything else here; wrapping is the REPL's own
+// (`client::insert_ansi`). `kot artifact` still prints the raw markdown, so
+// it pipes.
+
+/// `src` rendered for the terminal, indented two cells like the log.
+pub fn markdown(src: &str) -> String {
+    let t = theme();
+    let mut out = Vec::new();
+    let mut fence: Option<String> = None;
+    for raw in src.lines() {
+        let line = raw.trim_end();
+        let trimmed = line.trim_start();
+        if let Some(marker) = &fence {
+            if trimmed.starts_with(marker.as_str()) {
+                fence = None;
+                out.push(format!("    {}", faint("└")));
+            } else {
+                out.push(format!("    {} {}", faint("│"), paint(t.ink, &line.replace('\t', "    "))));
+            }
+            continue;
+        }
+        if trimmed.starts_with("```") || trimmed.starts_with("~~~") {
+            let marker = trimmed[..3].to_string();
+            let lang = trimmed[3..].trim();
+            out.push(format!("    {}{}", faint("┌"), if lang.is_empty() { String::new() } else { format!(" {}", dim(lang)) }));
+            fence = Some(marker);
+            continue;
+        }
+        if trimmed.is_empty() {
+            out.push(String::new());
+            continue;
+        }
+        let hashes = trimmed.chars().take_while(|c| *c == '#').count();
+        if (1..=6).contains(&hashes) && trimmed[hashes..].starts_with(' ') {
+            let text = inline(trimmed[hashes..].trim());
+            out.push(match hashes {
+                1 => format!("  {}", bold(t.accent, &strip_ansi(&text))),
+                2 => format!("  {}", bold(t.paper, &strip_ansi(&text))),
+                _ => format!("  {}", bold(t.ink, &strip_ansi(&text))),
+            });
+            continue;
+        }
+        if trimmed.len() >= 3 && trimmed.chars().all(|c| matches!(c, '-' | '*' | '_' | ' ')) && trimmed.chars().filter(|c| !c.is_whitespace()).count() >= 3 {
+            out.push(format!("  {}", rule(term_width().saturating_sub(4).min(60))));
+            continue;
+        }
+        if let Some(q) = trimmed.strip_prefix('>') {
+            out.push(format!("  {} {}", paint(t.ink, "▌"), dim(&strip_ansi(&inline(q.trim_start())))));
+            continue;
+        }
+        let indent = line.len() - trimmed.len();
+        let pad = " ".repeat(2 + indent);
+        if let Some(item) = trimmed.strip_prefix("- ").or_else(|| trimmed.strip_prefix("* ")).or_else(|| trimmed.strip_prefix("+ ")) {
+            // A task list's box, if it has one.
+            let (mark, item) = match item.strip_prefix("[ ] ") {
+                Some(rest) => (dim("☐"), rest),
+                None => match item.strip_prefix("[x] ").or_else(|| item.strip_prefix("[X] ")) {
+                    Some(rest) => (paint(t.progress, "☑"), rest),
+                    None => (paint(t.accent, "•"), item),
+                },
+            };
+            out.push(format!("{pad}{mark} {}", inline(item)));
+            continue;
+        }
+        let digits = trimmed.chars().take_while(|c| c.is_ascii_digit()).count();
+        if digits > 0 && trimmed[digits..].starts_with(". ") {
+            out.push(format!("{pad}{} {}", paint(t.accent, &trimmed[..digits + 1]), inline(&trimmed[digits + 2..])));
+            continue;
+        }
+        out.push(format!("{pad}{}", inline(trimmed)));
+    }
+    if fence.is_some() {
+        out.push(format!("    {}", faint("└")));
+    }
+    out.join("\n")
+}
+
+/// Inline markdown in one line: `code` (nothing inside it is markup),
+/// **bold**, and [links](url) — the text, then the address, dim.
+fn inline(s: &str) -> String {
+    let t = theme();
+    let chars: Vec<char> = s.chars().collect();
+    let mut out = String::new();
+    let mut plain_run = String::new();
+    let mut i = 0;
+    let flush = |run: &mut String, out: &mut String| {
+        if !run.is_empty() {
+            out.push_str(&plain(run));
+            run.clear();
+        }
+    };
+    let find = |from: usize, pat: &[char]| (from..chars.len().saturating_sub(pat.len() - 1)).find(|&j| chars[j..j + pat.len()] == *pat);
+    while i < chars.len() {
+        if chars[i] == '`' {
+            if let Some(end) = find(i + 1, &['`']) {
+                flush(&mut plain_run, &mut out);
+                out.push_str(&paint(t.warm, &chars[i + 1..end].iter().collect::<String>()));
+                i = end + 1;
+                continue;
+            }
+        }
+        if chars[i..].starts_with(&['*', '*']) || chars[i..].starts_with(&['_', '_']) {
+            let pat = [chars[i], chars[i]];
+            if let Some(end) = find(i + 2, &pat).filter(|&e| e > i + 2) {
+                flush(&mut plain_run, &mut out);
+                out.push_str(&bold(t.paper, &strip_ansi(&inline(&chars[i + 2..end].iter().collect::<String>()))));
+                i = end + 2;
+                continue;
+            }
+        }
+        if chars[i] == '[' {
+            if let Some(close) = find(i + 1, &[']', '(']) {
+                if let Some(end) = find(close + 2, &[')']) {
+                    flush(&mut plain_run, &mut out);
+                    let text: String = chars[i + 1..close].iter().collect();
+                    let url: String = chars[close + 2..end].iter().collect();
+                    out.push_str(&format!("{} {}", paint(t.accent, &text), dim(&format!("({url})"))));
+                    i = end + 1;
+                    continue;
+                }
+            }
+        }
+        plain_run.push(chars[i]);
+        i += 1;
+    }
+    flush(&mut plain_run, &mut out);
+    out
+}
+
+#[cfg(test)]
+mod markdown_tests {
+    use super::*;
+
+    fn md(s: &str) -> String {
+        strip_ansi(&markdown(s))
+    }
+
+    #[test]
+    fn headings_emphasis_and_inline_code_lose_their_markup() {
+        let r = md("# /tmp/meow-greet: Rebuild\n\nBuilt with `rustc hello.rs` — **exit 0**, see [the log](http://x/y).");
+        assert!(r.contains("  /tmp/meow-greet: Rebuild"), "{r}");
+        assert!(r.contains("Built with rustc hello.rs — exit 0, see the log (http://x/y)."), "{r}");
+        assert!(!r.contains("**") && !r.contains('`') && !r.contains("# "), "{r}");
+    }
+
+    #[test]
+    fn code_blocks_keep_their_contents_verbatim_behind_a_gutter() {
+        let r = md("```rust\nfn main() { println!(\"**not bold**\"); }\n```\nafter");
+        assert!(r.contains("┌ rust"), "{r}");
+        assert!(r.contains("│ fn main() { println!(\"**not bold**\"); }"), "markup inside code is left alone: {r}");
+        assert!(r.contains("└") && r.contains("  after"), "{r}");
+        // An unclosed fence still closes at the end.
+        assert!(md("```\nx").ends_with('└'));
+    }
+
+    #[test]
+    fn lists_quotes_and_rules() {
+        let r = md("- one\n  - nested `x`\n1. first\n12. twelfth\n- [ ] open\n- [x] done\n> quoted **text**\n---");
+        assert!(r.contains("  • one") && r.contains("    • nested x"), "{r}");
+        assert!(r.contains("  1. first") && r.contains("  12. twelfth"), "{r}");
+        assert!(r.contains("☐ open") && r.contains("☑ done"), "{r}");
+        assert!(r.contains("▌ quoted text"), "{r}");
+        assert!(r.contains("──"), "{r}");
+    }
+
+    #[test]
+    fn unmatched_markers_are_left_as_written() {
+        let r = md("a ** b and a lone ` tick and [not a link]");
+        assert!(r.contains("a ** b and a lone ` tick and [not a link]"), "{r}");
     }
 }

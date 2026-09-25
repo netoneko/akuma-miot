@@ -330,6 +330,14 @@ impl Client {
         }
     }
 
+    /// One cat's own local task list (`LocalTask`), from its live record.
+    pub async fn local_tasks_text(&mut self, cat: &str) -> String {
+        match self.get_json("/activity").await.and_then(|v| serde_json::from_value::<Vec<Seen>>(v).map_err(|e| e.to_string())) {
+            Ok(seen) => ui::local_tasks_text(&seen, &self.roster, cat),
+            Err(e) => format!("  {}", ui::alert(&format!("no /activity from {} ({e}) — an older build?", self.node))),
+        }
+    }
+
     pub async fn print_peers(&mut self) {
         println!("{}", self.peers_text().await);
     }
@@ -814,10 +822,81 @@ fn insert_ansi(terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>, s: &s
         return;
     }
     let text: Text = s.into_text().unwrap_or_else(|_| Text::raw(s.to_string()));
+    let cols = terminal.size().map(|a| a.width).unwrap_or(100).max(20);
+    // Wrapped here, not by the Paragraph: the insert's height has to be
+    // the rows actually drawn. Unwrapped, every line past the terminal's
+    // width was cut off at the edge — an artifact, mostly long markdown
+    // paragraphs, came out as a column of truncated first lines.
+    let text = wrap_text(text, cols);
     let height = text.lines.len().max(1) as u16;
     let _ = terminal.insert_before(height, |buf| {
         Paragraph::new(text).render(buf.area, buf);
     });
+}
+
+/// Word-wrap styled text to `cols` cells, keeping each character's style:
+/// break at the last space that fits, or mid-word if a word alone is wider
+/// than the line. Widths are ratatui's own (`Span::width`), so the row count
+/// is exactly what gets drawn.
+fn wrap_text(text: Text<'_>, cols: u16) -> Text<'static> {
+    use ratatui::style::Style;
+    use ratatui::text::{Line, Span};
+    let cols = cols.max(1) as usize;
+    let width = |c: char| Span::raw(c.to_string()).width();
+    // One styled row back into spans, runs of one style merged.
+    let to_line = |cells: &[(char, Style)]| {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        let mut run = String::new();
+        let mut style = cells.first().map(|c| c.1).unwrap_or_default();
+        for &(ch, st) in cells {
+            if st != style && !run.is_empty() {
+                spans.push(Span::styled(std::mem::take(&mut run), style));
+            }
+            style = st;
+            run.push(ch);
+        }
+        if !run.is_empty() {
+            spans.push(Span::styled(run, style));
+        }
+        Line::from(spans)
+    };
+    let mut out: Vec<Line<'static>> = Vec::new();
+    for line in text.lines {
+        let base = line.style;
+        let cells: Vec<(char, Style)> = line.spans.iter().flat_map(|sp| {
+            let st = base.patch(sp.style);
+            sp.content.chars().filter(|c| *c != '\r').map(move |c| (c, st))
+        }).collect();
+        let mut row: Vec<(char, Style)> = Vec::new();
+        let mut used = 0;
+        for cell in cells {
+            let w = width(cell.0);
+            if used + w > cols && !row.is_empty() && cell.0 == ' ' {
+                // The row is exactly full: break here, the space goes.
+                out.push(to_line(&std::mem::take(&mut row)));
+                used = 0;
+                continue;
+            }
+            if used + w > cols && !row.is_empty() {
+                // Back to the last space, if there is one past the start —
+                // the rest of the word moves down with this character.
+                match row.iter().rposition(|c| c.0 == ' ').filter(|&i| i > 0) {
+                    Some(i) => {
+                        let carry: Vec<(char, Style)> = row.split_off(i + 1);
+                        row.pop();
+                        out.push(to_line(&row));
+                        row = carry;
+                    }
+                    None => out.push(to_line(&std::mem::take(&mut row))),
+                }
+                used = row.iter().map(|c| width(c.0)).sum();
+            }
+            row.push(cell);
+            used += w;
+        }
+        out.push(to_line(&row));
+    }
+    Text::from(out)
 }
 
 /// Raw mode, restored on drop (including an early return or a panic
@@ -978,6 +1057,10 @@ impl Input {
                 }
             }
             v
+        } else if ["/tasks ", "/activity ", "/dm "].iter().any(|c| draft.starts_with(c)) && start == draft.find(' ').map(|i| i + 1).unwrap_or(0) {
+            // A command that takes a cat's name as its argument: the bare
+            // name, no `@`.
+            roster.names().filter(|n| n.starts_with(word.as_str())).map(str::to_string).collect()
         } else {
             Vec::new()
         };
@@ -1092,9 +1175,20 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
             Ok(()) => send(format!("  {}", ui::ok("✓ cleared"))),
             Err(e) => send(format!("  {}", ui::alert(&format!("refused: {e}")))),
         },
-        ("/tasks", _) => {
+        // Bare: the litter's tasks, on chain. With a cat's name: that
+        // cat's own local list (`LocalTask`), from its live record.
+        ("/tasks", "") => {
             let t = c.tasks_text().await;
             send(t);
+        }
+        ("/tasks", who) => {
+            let name = who.trim_start_matches('@');
+            if c.roster.account(name).is_some() {
+                let t = c.local_tasks_text(name).await;
+                send(t);
+            } else {
+                send(format!("  {}", ui::warn(&format!("no such cat: @{name} — /tasks alone lists the litter's tasks"))));
+            }
         }
         ("/peers", _) => {
             let t = c.peers_text().await;
@@ -1106,15 +1200,17 @@ async fn run_command(c: &mut Client, line: &str, tx: &mpsc::UnboundedSender<Stri
         }
         // Same id-shape routing as `Client::print_artifact`/`ArtifactRead`:
         // a `t`-prefixed id is a closed task's, anything else standalone.
-        ("/artifact", id) if !id.is_empty() => {
+        // `/artifacts <id>` too — the list shows ids, and typing one after
+        // the command that listed them is the natural next step.
+        ("/artifact" | "/artifacts", id) if !id.is_empty() => {
             let path = if id.trim_start().starts_with(['t', 'T']) { format!("/artifact/{id}") } else { format!("/note/{id}") };
             match c.get_json(&path).await {
-                Ok(a) if a["found"] == true => send(a["body"].as_str().unwrap_or("").to_string()),
+                Ok(a) if a["found"] == true => send(ui::markdown(a["body"].as_str().unwrap_or(""))),
                 _ => send(format!("  {}", ui::alert(&format!("no artifact for {id}")))),
             }
         }
         ("/note", id) if !id.is_empty() => match c.get_json(&format!("/note/{id}")).await {
-            Ok(a) if a["found"] == true => send(a["body"].as_str().unwrap_or("").to_string()),
+            Ok(a) if a["found"] == true => send(ui::markdown(a["body"].as_str().unwrap_or(""))),
             _ => send(format!("  {}", ui::alert(&format!("no note {id}")))),
         },
         ("/notes", _) => match c.get_json("/notes").await {
@@ -1402,4 +1498,44 @@ pub async fn repl(mut c: Client) {
     drop(terminal);
     drop(guard);
     println!("\n  {}", ui::dim("bye."));
+}
+
+#[cfg(test)]
+mod wrap_tests {
+    use super::wrap_text;
+    use ratatui::style::{Color, Style};
+    use ratatui::text::{Line, Span, Text};
+
+    fn rows(t: &Text) -> Vec<String> {
+        t.lines.iter().map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect()).collect()
+    }
+
+    #[test]
+    fn long_lines_wrap_at_words_and_nothing_is_lost() {
+        let t = wrap_text(Text::raw("Rebuilt from scratch after the upgrade/restart; all four LocalTask steps green"), 30);
+        let r = rows(&t);
+        assert_eq!(r, vec!["Rebuilt from scratch after the", "upgrade/restart; all four", "LocalTask steps green"]);
+        assert!(r.iter().all(|l| Span::raw(l.as_str()).width() <= 30));
+    }
+
+    #[test]
+    fn a_word_wider_than_the_line_is_broken_and_short_lines_are_untouched() {
+        assert_eq!(rows(&wrap_text(Text::raw("abcdefghij"), 4)), vec!["abcd", "efgh", "ij"]);
+        assert_eq!(rows(&wrap_text(Text::raw("short\n\nnext"), 40)), vec!["short", "", "next"]);
+    }
+
+    #[test]
+    fn wide_characters_count_as_two() {
+        // 喵 is two cells: three of them fill six.
+        assert_eq!(rows(&wrap_text(Text::raw("喵喵喵喵"), 6)), vec!["喵喵喵", "喵"]);
+    }
+
+    #[test]
+    fn styles_survive_the_break() {
+        let red = Style::default().fg(Color::Red);
+        let t = wrap_text(Text::from(Line::from(vec![Span::raw("aaa "), Span::styled("bbb ccc", red)])), 7);
+        assert_eq!(rows(&t), vec!["aaa bbb", "ccc"]);
+        assert_eq!(t.lines[1].spans[0].style, red);
+        assert_eq!(t.lines[0].spans[1].style, red);
+    }
 }

@@ -28,6 +28,10 @@ pub const RECENT: usize = 6;
 pub const THOUGHT_CHARS: usize = 320;
 /// Most of one call's argument kept.
 pub const ARG_CHARS: usize = 80;
+/// Most local tasks carried in one record, and how much of each one's text
+/// and note.
+pub const TASKS: usize = 24;
+pub const TASK_CHARS: usize = 120;
 
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(default)]
@@ -57,14 +61,31 @@ pub struct Activity {
     pub recent: Vec<Finished>,
     /// The tail of the last turn's reasoning, if the model sent any.
     pub thought: String,
-    /// The cat's own open local tasks (`LocalTask`), one line each —
-    /// `L2 [doing] build it`.
-    pub todo: Vec<String>,
+    /// The cat's own local task list (`LocalTask`), in id order — every open
+    /// one and the newest finished, at most [`TASKS`] (it rides every status
+    /// poll), text cut to [`TASK_CHARS`].
+    pub tasks: Vec<TaskLine>,
+    /// Finished (`done`/`failed`/`dropped`) and all, over the whole list,
+    /// not just what's in `tasks` — the progress figure.
+    pub tasks_finished: u32,
+    pub tasks_total: u32,
     /// The last turn's context use, and the window if known.
     pub tokens: u32,
     pub window: Option<u32>,
     /// When this record was made.
     pub at: u64,
+}
+
+/// One local task, as the operator sees it.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+#[serde(default)]
+pub struct TaskLine {
+    pub id: String,
+    /// `todo`, `doing`, `done`, `failed`, `dropped`.
+    pub status: String,
+    pub text: String,
+    /// What came of it, for `done`/`failed`.
+    pub note: String,
 }
 
 /// A tool call in flight.

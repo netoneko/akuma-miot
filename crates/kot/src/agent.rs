@@ -759,7 +759,7 @@ impl Host for CatHost {
     }
     fn activity(&self, a: &Activity) {
         let mut a = a.clone();
-        a.todo = self.0.local.lock().unwrap().open().map(|t| format!("{} [{}] {}", t.id, t.status, t.text)).collect();
+        (a.tasks, a.tasks_finished, a.tasks_total) = self.0.local.lock().unwrap().progress(crate::activity::TASKS);
         self.0.activity.send_replace(Some(a));
     }
 
