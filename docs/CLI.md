@@ -121,6 +121,13 @@ The composer occupies N lines at the bottom. To print new output: clear the
 composer, write the lines, redraw the composer. Output above never moves and
 is never rewritten.
 
+As built (2026-09-25) it is three rows: **activity** (one phrase per cat —
+`活 meow ◌ 42s 3/5 · kuro ⚙2 Bash 1m03s · tama · ✗Bash`, from any node's
+`GET /activity`, redrawn every second), the **hairline** (node → primary ·
+head), and the **prompt**. Anything inserted above is word-wrapped to the
+terminal first, so a long line is never cut off at the edge (it used to be,
+which made artifacts unreadable).
+
 **Not a TTY** (piped, redirected, CI) → no composer, no colour, no cursor
 tricks. Just the log, one line at a time.
 
@@ -248,7 +255,9 @@ subcommands outside it — and they are the same verbs.
 | `/task <text>` | open a parent task (operator only) |
 | `/plan` | show the current plan |
 | `/tasks` | one line per live task: id, status, assignee, lease |
-| `/artifact <id>` | print a closed parent's report |
+| `/tasks <cat>` | that cat's own local task list (`LocalTask`): progress, status, each finished step's note — from its live activity, not the chain (2026-09-25) |
+| `/activity [cat]` | what each cat is doing right now: loop phase and for how long, what woke it, calls in flight, ✓/✗ and recent results, open local tasks, last reasoning (2026-09-25) |
+| `/artifact <id>`, `/artifacts <id>` | print a report, rendered from markdown (headings, emphasis, code blocks, lists, links) and wrapped to the terminal; `/artifacts` alone lists them |
 | `/note <id>`, `/notes` | print one standalone note (no task), or list them all |
 | `/peers` | the roster, with who is leader |
 | `/obs [on\|off\|tasks\|all]` | §3 |
@@ -266,8 +275,10 @@ sign one extrinsic or read state, print, exit.
   miot run --as tama              run an agent loop (this is the cat)
   miot task open "debate & report"
   miot task list
-  miot artifact t42               → markdown on stdout, pipe it anywhere
+  miot artifact t42               → markdown on stdout, pipe it anywhere (raw, not rendered)
   miot peers
+  kot activity [cat]              what each cat is doing right now (2026-09-25)
+  kot task list --cat meow        a cat's own local task list
   miot log [--task t42] [--follow]
 ```
 
@@ -360,6 +371,9 @@ Copied from Akuma. `assets/` holds the vendored art.
   arriving mid-stream. Options: buffer the turn and print it whole, or print a
   `tama is thinking…` line that is replaced on completion (a rewrite, which
   §0 resists). Leaning toward buffering with a spinner on the composer line.
+  **Done that way, 2026-09-25:** a turn is printed whole when it lands, and
+  the composer's activity row is the spinner — phase and elapsed time per
+  cat, calls in flight. `/activity` prints the detail into scrollback.
 - **Tagging semantics on chain — resolved 2026-09-22, for now.** `say`'s `to`
   field stays `Option<AccountId>` (singular) rather than growing a `Vec` —
   no pallet/primitives change. Multiple tags in one line become **multiple

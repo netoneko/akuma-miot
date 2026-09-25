@@ -56,12 +56,12 @@ and the evidence is on chain or in a journal. Where it's shaky, it says so.
 | cat | OS › what it runs in › machine | arch | agent name | model | reached at |
 |---|---|---|---|---|---|
 | 喵 meow | **Akuma** › bare metal › the HP box ("the dumpster") | amd64 | `dumpster-akuma-amd64` | GLM (`glm-5.3`, z.ai coding plan) | `192.168.1.120:9944` (`.123` until 2026-09-24) |
-| 玉 tama | Linux (Pop!_OS) › bare metal › ryzen | amd64 | `ryzen-linux-amd64` | qwen3-4b, `llama-server` on ryzen `:8081` | `192.168.1.126:9944` |
+| 玉 tama | Linux (Pop!_OS) › bare metal › ryzen | amd64 | `ryzen-linux-amd64` | qwen3-4b, ryzen's shared `llama-server` `:8081` (slot 1 of 2, since 2026-09-25) | `192.168.1.126:9944` |
 | 黑 kuro | Linux (Ubuntu) › Lima VM `fc` › macOS on the mac | arm64 | `mac-linux-aarch64` | qwen3:4b, `llama-server` on the mac `:8083` | `192.168.1.203:9944` |
 | 咪 mimi | **Akuma** › Firecracker › Lima VM `fc` › macOS (nested virt) | arm64 | `mac-akuma-aarch64` | qwen3:4b, mac `:8084` | `192.168.1.203:9945` (socat relay in `fc`) |
-| 空 sora | **Akuma** › Firecracker › ryzen (real KVM, no nesting) | amd64 | `ryzen-akuma-amd64` | qwen3-4b, ryzen `:8082` | `192.168.1.50:9944` |
-| 猫 yuki | Linux (Ubuntu 24.04) › `systemd-nspawn` › EC2 `t4g.nano` | arm64 | `kot-yuki` (container #1) | OpenRouter | `kot.akuma.sh:9441` |
-| 猫 shiro | Linux (Ubuntu 24.04) › `systemd-nspawn` › the same EC2 box | arm64 | `kot-shiro` (container #2) | OpenRouter | `kot.akuma.sh:9442` |
+| 空 sora | **Akuma** › Firecracker › ryzen (real KVM, no nesting), under systemd since 2026-09-25 | amd64 | `ryzen-akuma-amd64` | qwen3-4b, the same shared server (dials `192.168.1.49:8082`, forwarded) | `192.168.1.50:9944` |
+| 猫 yuki | Linux (Ubuntu 24.04) › `systemd-nspawn` › EC2 `t4g.nano` | arm64 | `kot-yuki` (container #1) | OpenRouter (`kimi-k2`; account out of credit as of 2026-09-25) | `kot.akuma.sh:9441` |
+| 猫 shiro | Linux (Ubuntu 24.04) › `systemd-nspawn` › the same EC2 box | arm64 | `kot-shiro` (container #2) | OpenRouter (`qwen3-coder`; same account, same state) | `kot.akuma.sh:9442` |
 
 Three OS › platform combinations run Akuma: bare-metal amd64, Firecracker on
 real KVM (amd64), and Firecracker nested inside a Linux VM on macOS (arm64).
@@ -117,6 +117,14 @@ kot --node https://kot.akuma.sh:9441 --theme ink   # the REPL
 ```
 
 ## Honest limits
+
+- **2026-09-25: three outages, all explained** (HANDOFF, "Outages of
+  2026-09-25"). ryzen ran out of memory (two llama-servers, zram swap) and
+  took tama and sora with it; sora then stayed down because its network was
+  hand-made; yuki and shiro went deaf when one silent connection blocked
+  kot's TLS accept loop. All fixed; after it, six of seven were in the mesh
+  (mimi down, not investigated). yuki and shiro follow along but can't think:
+  their OpenRouter account is out of credit.
 
 - **Never all seven on the same build at once.** The 2026-09-24 rollout
   reached tama, kuro, yuki and shiro. meow was powered off overnight on the

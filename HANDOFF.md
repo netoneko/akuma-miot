@@ -386,6 +386,109 @@ to forward to (`CLAUDE.md`, known gaps), so AWS cats can't post while the
 primary is at home. The router forwards would fix that, and would make
 pull work for them again. Push is the fallback, not a replacement.
 
+## Watching the litter (2026-09-25)
+
+What a cat is doing between chain events is visible now, none of it on
+chain. Full description: `docs/AGENT_STATE_MACHINE.md`, "Watching it work".
+
+- **Reasoning** (GLM's `reasoning_content`, qwen's `<think>`) is shown on
+  stdout and kept in a per-cat JSONL transcript,
+  `~/.akuma/kot/<name>.transcript.jsonl` (every prompt, reply, call and full
+  result). It used to be thrown away in `miot-llm`.
+- **Live activity**: each cat POSTs one record to its own node (phase, what
+  woke it, calls in flight, ✓/✗, local tasks, last reasoning); nodes carry it
+  on the status exchange, so any node serves every cat's (`GET /activity`).
+  REPL: a live row above the hairline, `/activity [cat]`, `/tasks <cat>`;
+  CLI: `kot activity`, `kot task list --cat`.
+- **The model sees its own calls in flight**: `Running`/`Cancel`, a "still
+  running" section every turn, and one notice when a call has been silent
+  2 minutes. `Bash` streams its output, and keeps it on timeout or cancel.
+- **Local tasks** (`LocalTask`): a cat's own to-do list next to its session
+  file, keyed by epoch. It survives a process restart; open ones ride every
+  wake's prompt, which is what let meow resume after an upgrade.
+- **REPL**: long lines are word-wrapped before they're inserted (they were
+  cut off at the terminal edge, which made artifacts unreadable), and
+  `/artifact`/`/artifacts <id>`/`/note` render markdown.
+
+Only nodes on this build report activity; as of this writing meow, yuki and
+shiro do.
+
+## Outages of 2026-09-25: ryzen, sora, the AWS pair
+
+**ryzen ran out of memory.** Two llama-servers (one per ryzen cat, ~5 GB
+each at `-c 8192`) on a 13.7 GB laptop that also runs a desktop and Steam.
+Swap is zram — RAM too — so instead of dying it thrashed for 20 minutes
+(sshd accepted TCP and never sent a banner; journald's watchdog fired). The
+OOM killer was tripped by tama's kot asking for the last page and picked a
+4 MB `steamwebhelper`. Fixed: **one shared llama-server**, `--parallel 2 -c
+16384` (8192 per cat, unchanged; `/v1/models` still says 8192), capped at
+`MemoryMax=7G` with no swap, so a runaway server is killed and restarted
+instead of wedging the box. 4.3 GB for both cats where two servers took ~10.
+sora still dials `192.168.1.49:8082`: a `systemd-socket-proxyd` socket there
+forwards to the shared server. `deploy.py llama` generates all of it
+(`LLAMAS`, `LLAMA_PROXIES`).
+
+**sora never came back after the reboot**, because its network was typed by
+hand and died with it. It's two systemd units now
+(`overlays/deploy/hosts/ryzen/`): `sora-net.service` (tap0 `192.168.1.49/32`,
+host route to `.50`, proxy-ARP, the existing `akuma-dnsmasq` container) and
+`sora.service` (Firecracker on ryzen's own `akuma-vm.json`/`disk.img`, root —
+the laptop user isn't in `kvm` — console in `boot.log`). Not yet proven
+across a real ryzen reboot. The piece that was actually missing: **Docker
+sets `FORWARD` to `DROP`**, so nothing off the box reached the guest (6,985
+packets dropped by the time it was found); tama, on the same host, forwards
+nothing and saw sora fine, which hid it. `sora-net` adds two accepts,
+Wi-Fi ↔ tap0, in `DOCKER-USER`.
+
+**yuki and shiro went deaf.** `TlsListener::accept` ran each mTLS handshake
+inline, one at a time, with no timeout. One client that connected and never
+sent a ClientHello (a scanner, through nginx's stream proxy) blocked every
+connection after it for good: `Recv-Q 129` on :9944, the node silent to the
+mesh and the operator while its own outbound polling and agent loop carried
+on. Handshakes now run in their own tasks, each with a 10 s timeout
+(`tls::HANDSHAKE_TIMEOUT`); tests `silent_connections_do_not_block_a_real_client`
+(200 silent clients) and `dropping_the_listener_frees_the_port`. Every node had
+it; the AWS pair are the ones facing the internet. **Also, separately: their
+OpenRouter account is out of credit** — every turn is `402 Payment Required`.
+They follow the chain and are reachable, but can't think until it's topped up
+or they're moved to GLM.
+
+**meow's kot died silently mid-`Bash`** and herd restarted it; the `apk add`
+it was running finished and stayed a zombie (`PPid: 23`, the dead kot's
+worker thread — nobody reparents it, nobody reaps it). This is the case
+`../akuma/docs/archive/AKUMA_AMD64_BARE_METAL_SELFHOST.md` documents as fixed
+(`9316a6b2`), and meow's kernel (`c9586004`) contains that fix — so its fix
+doesn't cover however kot died this time. Why it died left no trace: the
+generated `start.sh` didn't send stderr to herd's log, so a panic or a failed
+allocation had nowhere to go. It does now (`exec … 2>&1`, template and meow).
+
+## Compaction: what a window would cost (measured 2026-09-25)
+
+A node keeps the current state and the last 4,096 events in memory
+(`LOG_CAP`); blocks live on disk. But **every start replays every block since
+the last checkpoint**, and checkpoints happen only on `/clear` or
+`kot compact`. With the checkpoint at 1590, today's restarts each replayed
+~15,600 blocks: yuki (t4g.nano) 195.6 s, tama 39.4 s, meow ≤51 s — minutes of
+a node being unreachable after every start. It grows even when idle: a block
+seals every 6 s, empty or not, 14,400 a day.
+
+Measured on the live chain: the state snapshot a compaction writes is
+**9,094 bytes**; blocks average **41 bytes** (most are ~16-byte empty seals).
+A 4-hour window is at most 2,400 blocks (~100 KB), so a compaction is one
+~9 KB write plus deleting ≤2,400 rows, six times a day, and the worst-case
+replay drops to ~30 s on yuki and ~6-8 s elsewhere. A lagging peer adopts
+the 9 KB snapshot instead of pulling blocks.
+
+**The real cost is that a checkpoint is also the session boundary today.**
+When `last_checkpoint` moves, every cat resets its conversation, clears its
+`question` and empties its local tasks (`agent.rs` `watch_chain`); a
+restarted node's `/events` (the REPL's replay) starts at the checkpoint too.
+Seen live: a manual compaction emptied meow's task list, and the next "please
+proceed with your task" reached a cat with nothing to proceed from. So
+automatic compaction needs a session id of its own first: `/clear` starts a
+session, compaction only prunes and snapshots, and cats key on the session.
+Not built yet (Next, item 0a).
+
 ## Block seal times (2026-09-24)
 
 Every block body now ends with the primary's wall clock at seal time
@@ -707,7 +810,9 @@ when asked). `docs/LOCAL_SIM.md` has the full writeup.
   current agent ids so `deploy.sh`'s `$HOME/.akuma/kot/$a.seed` path
   actually resolves. **Lesson: never run `kot id` against a seed-file path
   to "check" it — it writes.**
-- **`ryzen-akuma-amd64` is dead right now, pre-existing — confirmed live,
+- **Superseded 2026-09-25: sora (`ryzen-akuma-amd64`) runs, under systemd —
+  "Outages of 2026-09-25" above.** Kept for the history:
+  **`ryzen-akuma-amd64` is dead right now, pre-existing — confirmed live,
   2026-09-23, not caused by anything this session touched.** `firecracker`
   is up on ryzen and the guest boots, but `kot` crash-loops inside it:
   `/home/netoneko/akuma/boot.log` on ryzen shows `[herd] Service kot exited
@@ -718,6 +823,23 @@ when asked). `docs/LOCAL_SIM.md` has the full writeup.
   minutes"), not a new bug. `deploy.sh`'s `LIVE` array still lists this
   agent; in practice the mesh runs fine at 4/5 (quorum is 3) without it.
   `../akuma` territory — see that handoff before spending more time here.
+- **Docker's `FORWARD DROP` hides behind "it works from the host"
+  (2026-09-25).** Anything forwarded through ryzen to a guest — sora on
+  tap0 — is dropped once Docker has started, while the host itself reaches
+  the guest fine. Check `iptables -L FORWARD -v` (packet counts on the
+  policy) before theorizing about proxy-ARP. `sora-net` owns the accepts now.
+- **A `watch` receiver made after the first send never sees it
+  (2026-09-25).** `post_activity` subscribed inside its own task; a GLM cat's
+  loop published before that task ran (no `/v1/models` round trip to yield
+  on), so it never showed up at all. Subscribe before spawning.
+- **Don't trust `pyte` for ratatui output (2026-09-25).** It has no handler
+  for `CSI n S` (scroll up), which `scrolling-regions` inserts use, so every
+  insert renders as garbage over the old screen. To check what the REPL
+  draws, drive it in a pty (answer its `CSI 6n` cursor query) and read the
+  raw bytes.
+- **zram is RAM (2026-09-25).** On ryzen, "swap" is compressed memory, so
+  swapping doesn't relieve pressure; the box thrashes instead of an OOM kill
+  landing. Give memory-hungry services `MemoryMax` and `MemorySwapMax=0`.
 
 ---
 
@@ -770,6 +892,14 @@ Cheapest tests to separate the two:
    smaller log), and see whether the failure point moves.
 
 ## Next, in order
+
+0a. **A session id apart from the checkpoint, then automatic compaction**
+   (2026-09-25; measured above, "Compaction: what a window would cost").
+   `/clear` bumps a session number in chain state, served on `/head`;
+   `watch_chain` resets a cat's conversation and local tasks on *that*, not
+   on `last_checkpoint`; the primary compacts on its own every N blocks (4 h
+   is 2,400). Decide what `/events` should keep across a compaction the
+   session spans — today a restarted node's replay starts at the checkpoint.
 
 0. **Future work on `kot`: the operator's roster name becomes `ken`, not
    `root`** (asked 2026-09-22; not started). It must stay configurable

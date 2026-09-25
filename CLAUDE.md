@@ -57,7 +57,13 @@ read that first, it is kept current and this file does not repeat it.
   back through the same inbox as wakes (HANDOFF, "The agent state machine"). `crates/miot` (the old node+client binary) was
   merged in and deleted 2026-09-22 (`docs/CLEANUP.md` item 2).
   `tests/election.rs` runs three real nodes over localhost HTTP, kills the
-  primary, revives it.
+  primary, revives it. `activity.rs` (2026-09-25) is each cat's live record
+  — never on chain, carried on the mesh status exchange, `GET /activity` —
+  and `local_tasks.rs` a cat's own to-do list (`LocalTask`); HANDOFF,
+  "Watching the litter".
+- `overlays/deploy/hosts/ryzen/` — sora's host side as systemd units
+  (`sora-net.service`, `sora.service`), 2026-09-25. ryzen's llama-server
+  (one, shared by tama and sora) comes from `deploy.py llama`.
 - `miot-cli` never shipped under that name — `docs/CLI.md` is its design of
   record, and `kot`'s client verbs are the implementation.
 
@@ -128,18 +134,30 @@ read that first, it is kept current and this file does not repeat it.
 - **`seq` in `/events` restarts when a node rebuilds its log** (demotion,
   rewind, adopted checkpoint). The agent loop resets its cursor; any other
   client holding one should too.
-- **A non-root broadcast (`say` with no `to`) wakes no cat's agent loop.**
+- ~~**A non-root broadcast (`say` with no `to`) wakes no cat's agent loop.**~~
+  **Fixed** (checked in the code 2026-09-25): `Effect::wakes()` is true for
+  every `Said`, and `Node::absorb` sends a broadcast out with the `"*"`
+  sentinel that each cat's filter accepts. Kept for the history:
   `Effect::wakes()` says it should (`to.is_some() || from_root`), but
   `Effect::to()` — what actually reaches the wire as the `wakes` hex field
   — collapses `to: None` to `None` regardless of `from_root`. A human
   watching the REPL/`kot log` still sees the text (rendering doesn't
   consult `wakes()`), which is why this went unnoticed. Found 2026-09-23,
   not fixed — `docs/LOCAL_SIM.md`.
-- **A failed `/submit` is never retried.** `Cat::submit` (`agent.rs`) makes
+- ~~**A failed `/submit` is never retried.**~~ **Fixed** (checked in the
+  code 2026-09-25): `Cat::submit` makes 4 attempts with backoff, retrying
+  an unreachable node or a stale nonce, not a refusal. Kept for the history: `Cat::submit` (`agent.rs`) makes
   one HTTP attempt; on failure the wake is gone for good — `seen`/`cursor`
   already advanced before the attempt. Task wakes get incidental cover from
   the chain's own re-nudge tick; a `"said"` DM has no backstop at all.
   Found 2026-09-23, not fixed — `docs/LOCAL_SIM.md`.
+
+- **A checkpoint is also the session boundary (2026-09-25).** Any
+  compaction (`/clear`, `kot compact`) moves `last_checkpoint`, and every cat
+  treats that as a new session: conversation, `question` and local tasks
+  gone. So compaction can't be automatic yet, and replay after a restart
+  grows by ~14,400 blocks a day until someone compacts. Measured cost and the
+  fix: HANDOFF, "Compaction: what a window would cost".
 
 ## Build, run, test
 

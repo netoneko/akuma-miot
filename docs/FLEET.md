@@ -8,7 +8,7 @@ compatible endpoint, `--jinja` for tool-call parsing), one model per cat.
 | host | RAM | free disk (2026-09-21) | GPU | role |
 |---|---|---|---|---|
 | **mac** (this box) | 48 GB unified | **15 GB** — nearly full, no external volume | Metal | leader + one worker, once disk is sorted |
-| **ryzen** | 13 GB | 24 GB | Radeon 780M iGPU, shares system RAM (no dedicated VRAM carve-out seen) | two workers, + a GLM experiment |
+| **ryzen** | 13 GB | 24 GB | Radeon 780M iGPU, shares system RAM (no dedicated VRAM carve-out seen) | two workers on **one shared llama-server** (2 slots × 8192, `MemoryMax=7G`) since 2026-09-25 — two servers ran it out of memory; swap is zram, i.e. RAM. + a GLM experiment |
 | **akuma** (trashcan) | 16 GB physical, **~10 GB planned budget** — reserved for the Rust toolchain (`rustc`'s LLVM codegen spikes hard, multiplied by `cargo`'s parallelism, during kernel builds) | — | — | **not local inference.** Calls z.ai's GLM API for feature-writing / kernel-compile work. |
 
 ## Cats → host → model
