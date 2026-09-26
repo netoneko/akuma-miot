@@ -85,12 +85,18 @@ read that first, it is kept current and this file does not repeat it.
   before changing `agent_state_machine.rs`.
 - `docs/TOOLING.md` — `Edit`/`MultiEdit`/`Grep`/`Glob`/`LS` (schemas and why
   they're shaped after Anthropic/Claude Code, not invented — including the
-  `file_path`-vs-`path` split), the Langfuse-shaped disk log (`crates/kot/
-  src/langfuse_log.rs`), and the real transcript numbers behind all of it:
-  meow's Bash-vs-WriteFile editing split, 127 Bash calls that were really
-  navigation, restart/reboot downtime, and why its prompt-cache hit rate is
-  near zero even mid-session (`age()`, not restarts). Added 2026-09-26;
-  says plainly what's designed vs built.
+  `file_path`-vs-`path` split), the `Reboot` tool, the Langfuse-shaped disk
+  log (`crates/kot/src/langfuse_log.rs`), the local-task nudge budget's fix
+  for a model that only ever promises (`last_unfulfilled_promise`), and
+  `deploy.py`'s new SSH/HTTP retries (`_run_retrying`) for the akuma box's
+  real, measured (800ms+ ping under load) network congestion — plus the
+  real transcript numbers behind all of it: meow's Bash-vs-WriteFile
+  editing split, 127 Bash calls that were really navigation, restart/reboot
+  downtime, why its prompt-cache hit rate is near zero even mid-session
+  (`age()`, not restarts), and the trap in reading Ollama pull progress
+  from a pre-allocated file's `ls` size instead of `du`. Added 2026-09-26;
+  says plainly what's designed vs built, and confirms the whole chain
+  (tools, cwd, nudge fix) working live on meow's actual box.
 - `docs/TEAHOUSE.md` — **the teahouse** (茶馆), the name of the mesh/chain:
   the seven-member topology as actually running (5 home + 2 AWS), with a
   diagram, what was shown live, and the honest limits. Current-state; it

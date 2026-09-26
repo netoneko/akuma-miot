@@ -53,6 +53,7 @@ import subprocess
 import sys
 import tempfile
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import NoReturn
@@ -235,6 +236,29 @@ def route(frm: str, to: str) -> str:
 
 
 # ---- transports ---------------------------------------------------------------
+# ssh/scp/limactl to these hosts isn't always answered on the first try —
+# the akuma box in particular (Kirill, 2026-09-26) goes unresponsive to a
+# single connect attempt while genuinely up and fully operational: a LAN
+# ping round-trip over 800ms during a heavy local `cargo build`, not an
+# outage. A single blip used to be a hard `die()`, forcing a manual re-run
+# once the box answered again — that manual "check reachability, retry" is
+# what this retries automatically now.
+ON_RETRIES = 3
+ON_RETRY_DELAY_S = 5
+
+
+def _run_retrying(argv: list[str], **kwargs) -> subprocess.CompletedProcess:
+    r = None
+    for attempt in range(1, ON_RETRIES + 1):
+        r = subprocess.run(argv, **kwargs)
+        if r.returncode == 0:
+            return r
+        if attempt < ON_RETRIES:
+            say(f"attempt {attempt}/{ON_RETRIES} failed, retrying in {ON_RETRY_DELAY_S}s: {(r.stderr or r.stdout or '').strip()[:200]}")
+            time.sleep(ON_RETRY_DELAY_S)
+    return r
+
+
 def on(a: Agent, cmd: str, stdin: str | None = None) -> str:
     """Run `cmd` as root on `a`'s host over its shape's transport, return stdout.
     `stdin`, if given, is fed to it: how a secret travels (see `put_secret`)."""
@@ -281,7 +305,7 @@ def on(a: Agent, cmd: str, stdin: str | None = None) -> str:
     if DRY_RUN:
         say(f"[dry-run] on {a.name}: {cmd}" + (" (+stdin)" if stdin is not None else ""))
         return ""
-    r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, input=stdin)
+    r = _run_retrying(argv, capture_output=True, text=True, timeout=timeout, input=stdin)
     if r.returncode != 0:
         die(f"{a.name}: {' '.join(argv[:2])}...: {cmd!r} failed (exit {r.returncode}): {r.stderr.strip() or r.stdout.strip()}")
     return r.stdout
@@ -341,13 +365,13 @@ def put(a: Agent, src: Path, dst: str) -> None:
         say(f"[dry-run] put {a.name}: {src} -> {dst}")
         return
     if a.shape == "linux":
-        r = subprocess.run(["scp", "-q", str(src), f"{a.host}:{dst}.new"], capture_output=True, text=True, timeout=PUT_TIMEOUT)
+        r = _run_retrying(["scp", "-q", str(src), f"{a.host}:{dst}.new"], capture_output=True, text=True, timeout=PUT_TIMEOUT)
         if r.returncode != 0:
             die(f"{a.name}: scp {src} failed: {r.stderr.strip()}")
         on(a, f"mv {dst}.new {dst}")
     elif a.shape == "lima":
         staged = f"/tmp/{Path(dst).name}.new"
-        r = subprocess.run(["limactl", "copy", str(src), f"fc:{staged}"], capture_output=True, text=True, timeout=PUT_TIMEOUT)
+        r = _run_retrying(["limactl", "copy", str(src), f"fc:{staged}"], capture_output=True, text=True, timeout=PUT_TIMEOUT)
         if r.returncode != 0:
             die(f"{a.name}: limactl copy {src} failed: {r.stderr.strip()}")
         on(a, f"mv {staged} {dst}")

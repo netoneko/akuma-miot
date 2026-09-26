@@ -144,8 +144,7 @@ turns run 44–56k tokens median — only ~5% of budget, nowhere near
 `FORCE_COMPACT_PCT`, and nothing else nudges a model this size to compact
 voluntarily. So the same ever-growing, cache-hostile history gets fully
 resent across every one of those 87 self-triggered reboots. This is the
-motivation for a reboot tool that compacts first (below) — still designed,
-not yet built as of this writing.
+motivation for the `Reboot` tool below, built the same day.
 
 ## The Langfuse-shaped disk log
 
@@ -208,6 +207,35 @@ Tests: `reboot_is_not_offered_unless_enabled`,
 compacted summary lands in the persisted history file and that the host's
 `reboot()` was invoked, never a real `reboot -f`.
 
+## The nudge budget vs. a model that only ever promises
+
+Found live the same day, watching meow directly (not from the transcript
+this time — `/activity`-style tailing while it was happening): from ~15:53
+to 16:22 it answered three consecutive local-task nudges with a promise
+("Firing it now, nya:", "Grepping the real stop-fn name + firing the fixed
+chain, one pounce, nya:") and no tool call. `maybe_nag`'s budget
+(`MAX_LOCAL_TASK_NUDGES`, 3) counts a nudge the moment it's *sent*, not
+whether the reply actually did anything — so three empty promises in a row
+looks identical to three nudges into true silence, and the budget ran out
+("This is the last reminder on these") right as an operator message
+happened to arrive and rescue it. Without that message, it would have gone
+idle for good.
+
+Fix: `AgentStateMachine::awaiting_nudge_reply`/`last_unfulfilled_promise`
+track whether the *previous* nudge got a real tool call. If not, the next
+nudge quotes the unfulfilled promise back verbatim ("Last time you said
+this, then called no tool: \"...\". ... call the tool in this response, not
+another promise") so the model can't just repeat itself. **The budget
+itself is unchanged, deliberately** — a model that only ever promises needs
+the same backstop as one that never answers, or nagging it burns turns
+forever exactly the way the bound exists to prevent. This was a rule-based
+fix, not a text-classification one: whether the previous turn called a tool
+is a certain, structured fact from the API (`turn.calls.is_empty()`), not
+something to infer from the prose — no "intent detection" crate needed or
+appropriate here.
+
+Test: `a_nudge_that_gets_only_a_promise_is_quoted_back_next_time`.
+
 ## Verified live against a real model, not just the fake-server tests
 
 2026-09-26, `kot chat --llm http://localhost:11434 --model qwen3:4b` (Ollama,
@@ -225,10 +253,16 @@ from a real model, not the scripted fake server the unit tests use:
   defaults the same way the other two do) and covered by
   `ls_with_no_path_at_all_defaults_to_the_working_directory`.
 
-GLM-4.7-Flash itself never finished pulling in this session (Ollama's
-download stalled twice at exactly the same byte count, 19,019,269,280 —
-restarted, not yet confirmed fixed) — qwen3:4b stood in as one of the three
-real target families while that's unresolved.
+GLM-4.7-Flash itself never finished pulling in this session — `qwen3:4b`
+stood in as one of the three real target families while that ran. A trap
+worth naming so nobody re-falls into it: Ollama pre-allocates a pull's
+blob at its full final size before any content lands, so `ls -la`'s size
+on the `*-partial` file is always the download's final size, never its
+progress — watching it made two separate restarts here look like a dead
+stall (stuck at exactly 19,019,269,280 bytes) when the pull may well have
+been progressing the whole time. `du` on the same file shows real bytes on
+disk; measured properly after a third, genuinely fresh restart, it was
+moving at ~1.1 MB/s — slow (hours, for 19 GB) but not actually stuck.
 
 ## Working directory matters now, for meow
 
@@ -242,6 +276,43 @@ actual source checkout, not wherever herd/systemd happens to start it
 shapes** — a `linux`-shape agent (tama) would need the same threaded into
 `kot.service.tmpl`'s `WorkingDirectory=` if it's ever needed there; not
 built, since nothing needs it yet.
+
+## `deploy.py` retries now — the akuma box answers, slowly, not never
+
+Staging this session's binary on meow's box (`dumpster-akuma-amd64`) hit
+the same failure repeatedly: `_put_via_http`'s HTTP `GET` would succeed
+(logged, 200), and the very next `ssh` call — a *different* connection,
+moments later — would die at the connection layer (exit 255). Kirill's own
+observation nailed it: the box wasn't down, its LAN ping round-trip was
+measured over 800 ms during what's presumably a heavy local `cargo build`
+(normal: 50-75 ms), and it dropped back to normal once the build let up.
+Congestion, not an outage — consistent with `../akuma/docs/
+SELF_HOSTING_AMD64.md`'s open question about intermittent network silence
+on this box, from the same day.
+
+`overlays/deploy/deploy.py`'s `on()`/`put()` used to `die()` on the first
+failure, which meant re-running `up` by hand and hoping the box answered
+this time — exactly what was happening for real, several times, before
+this fix. `_run_retrying` (`ON_RETRIES` = 3, `ON_RETRY_DELAY_S` = 5) wraps
+every `ssh`/`scp`/`limactl copy` call `on()`/`put()` makes; a failure logs
+and retries rather than dying immediately. This isn't theoretical — it's
+what actually got both this session's real deploys (the tool set, then the
+nudge-guard fix) to land: one needed 1 retry, the other 2, and one attempt
+still needed a fully manual re-run afterward because even 3 tries within
+one `_run_retrying` call weren't enough that time (each dead SSH attempt
+itself took minutes to fail, not seconds — the congestion was on the order
+of many minutes, not a quick blip).
+
+## Confirmed live: the whole chain actually works
+
+After staging, `dumpster-akuma-amd64` was redeployed for real (killing the
+running process, not just `NO_ENABLE=1` staging) and watched come back:
+binary md5 on the box matched the local build exactly
+(`679b554099f8d57e0cd96dc685b7c667`), new PIDs came up, and its history
+restored cleanly — 1124 messages, 0 trimmed. Its very next nudge (fresh
+budget, since restart doesn't persist `local_nudges`/`awaiting_nudge_reply`
+— only history/local-tasks survive a restart) got a real `Bash` call, not
+another empty promise.
 
 ## Not done yet
 
