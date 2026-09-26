@@ -1,6 +1,6 @@
 # Handoff
 
-**Latest: 2026-09-26** — read "Tokens, racing tool calls, a multiline composer" first: why meow was sending ~75k tokens a turn and what bounds it now, GLM on `glm-5.3-flash` with a configured 1M window, `Bash`/`ReadFile`/`WriteFile` in one lane (meow's shredded files), a composer that grows, headers that don't break at 94 columns, and a WAV plus `wavplay` staged on meow's box. Then the 2026-09-25 sections: a kernel CoW bug that killed meow's kot, fixed; followers renamed *patrons*; GLM reasoning `low`; yuki/shiro asleep; writes carried off nodes that can call nobody; conversations that survive a restart; every tool on every wake; `akuma-litter` as the cats' git drop box; `MIOT_CONTEXT`. Older framing, kept: State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
+**Latest: 2026-09-26** — `git push` from the trashcan works now (a kernel `fstat` bug, not pack size): "Why git push died on the trashcan". Then read "Tokens, racing tool calls, a multiline composer": why meow was sending ~75k tokens a turn and what bounds it now, GLM on `glm-5.3-flash` with a configured 1M window, `Bash`/`ReadFile`/`WriteFile` in one lane (meow's shredded files), a composer that grows, headers that don't break at 94 columns, and a WAV plus `wavplay` staged on meow's box. Then the 2026-09-25 sections: a kernel CoW bug that killed meow's kot, fixed; followers renamed *patrons*; GLM reasoning `low`; yuki/shiro asleep; writes carried off nodes that can call nobody; conversations that survive a restart; every tool on every wake; `akuma-litter` as the cats' git drop box; `MIOT_CONTEXT`. Older framing, kept: State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
@@ -710,8 +710,8 @@ the tools". And the litter all took **root's "leave yourself a task to build
 M2"** as their own — it was a broadcast; a direct message (`/dm meow`) would
 have reached only meow.
 
-**`git push` from the metal box fails on a big pack** (an Akuma kernel bug,
-open): meow's first push to the empty `akuma-litter` died with `send-pack:
+**`git push` from the metal box fails on a big pack** (an Akuma kernel bug;
+fixed 2026-09-26, and it wasn't size: "Why git push died on the trashcan"): meow's first push to the empty `akuma-litter` died with `send-pack:
 unexpected disconnect while reading sideband packet` / `fatal: close failed
 on standard output: Bad file descriptor` from git's `pack-objects` child. The
 repo was then seeded from the mac with `akuma`'s `main` and `even-more-cats`,
@@ -842,6 +842,40 @@ meow's in-progress HDA driver is the obvious suspect, but that's unconfirmed.
 Otherwise the HDA work is going well: meow has written the driver patch
 almost entirely on its own, milestone by milestone, from the runbook
 (`../akuma/docs/runbooks/add-intel-hda-audio.md`).
+
+## Why git push died on the trashcan (2026-09-26, fixed)
+
+It was never about size. The "fails on a big pack" / "~26 MB" story was
+wrong. A 37-commit, 133 KB pack failed exactly the same way, whether it went
+to a pipe or a regular file. Each time git wrote every byte first and died
+only at exit: `fatal: close failed on standard output: Bad file descriptor`,
+exit 128, which `send-pack` reports as `unexpected disconnect while reading
+sideband packet`.
+
+The mechanism: `pack-objects --stdout` closes fd 1 itself (hashfile
+`CSUM_CLOSE`). Then git's `run_builtin` epilogue calls `fstat(1)`. If that
+returns `EBADF`, the fd is already closed and git is done. If it returns a
+character device, git goes on to `fclose(stdout)`, and that `close(1)`
+fails with `EBADF`. The failing piece was Akuma's `sys_fstat`
+(`amd64/src/fd.rs`): its by-number console preamble answered `S_IFCHR` for
+**any** unbound 0/1/2. That includes one a registered process has just
+closed, and it should only cover kernel threads.
+
+The fix is `../akuma` `c715553b` on meow's `amd64-audio`, on top of meow's
+unbooted HDA M7f `c05c9b1f`. The preamble now runs only when
+`current_process()` is `None`, and the fd smoke test closes fd 2 and expects
+`EBADF`. Built on the box with `kbuild` (2 min, warm cache), then
+`kinstall` and `reboot -f`. `uname` reports `c715553b`, the self-test count
+went 748 → 751 passed, and the 3 `spawn: … registered table holds fd N`
+failures are the same ones the previous boot had. Then the box's first
+`git push litter amd64-audio` landed. The same fix is in Kirill's local
+`../akuma` (`even-more-cats`), uncommitted.
+
+Not done: the same by-number rule still sends a `write(1)` after `close(1)`
+to the serial console, not `EBADF` (`console_end`, used by `sys_write`,
+`ioctl`, `poll`, `pread`). Linux would refuse it. It's left alone because
+widening the change on a box with no remote way back from a bad boot wasn't
+worth it for this fix.
 
 ## Block seal times (2026-09-24)
 
@@ -1304,8 +1338,9 @@ Cheapest tests to separate the two:
 - **neobeav as a patron** needs a key `kot` can sign with (a kot seed), or
   `kot id` learning to read/write OpenSSH ed25519 keys, which would also let
   a cat's git identity be its chain identity.
-- **Git on Akuma:** `pack-objects` dies with EBADF on a large pipe write
-  (~26 MB, meow's own measurement). A kernel bug to chase in `../akuma`.
+- ~~**Git on Akuma:** `pack-objects` dies with EBADF on a large pipe write.~~
+  Fixed 2026-09-26, and not size-related: "Why git push died on the
+  trashcan".
 - **Box hygiene:** `sync` (x86_64 162) is ENOSYS; the `[unregister] stale
   tid` guard fires hundreds of times under spawn load (defended, noisy).
 - **GitHub tokens** for meow/tama/kuro/sora expire on whatever date Kirill

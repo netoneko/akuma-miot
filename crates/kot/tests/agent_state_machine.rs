@@ -1122,6 +1122,56 @@ async fn an_old_result_shrinks_to_a_stub() {
     assert!(aged.contains("[#0 Bash] $ head -c 900") && aged.contains("Inspect {\"id\": 0}"), "a stub in its place: {aged}");
 }
 
+/// A restart alone changes none of the bytes already sent — a real
+/// provider's prefix cache could still hit across it. What actually
+/// invalidates that prefix is `age()`, on its own clock (`RESULT_TURNS`
+/// turns after a result was fed), whether or not a restart happens to land
+/// first. Written after meow's real transcript showed near-zero cache
+/// credit mid-session too, not just right after a restart — this is the
+/// structural check for why: restoring is byte-exact, aging isn't.
+#[tokio::test]
+async fn a_restart_alone_keeps_the_prefix_a_cache_could_still_hit() {
+    use kot::agent_state_machine::RESULT_TURNS;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tama.history.7.json");
+    let payload = "Q".repeat(900);
+
+    // First life: a Bash result fed at turn 2 (big enough to be tracked for
+    // aging — see AGE_MIN_CHARS), one more plain turn after it.
+    let r = rig_seen(vec![calls(vec![("Bash", json!({"command": "head -c 900 /dev/zero | tr '\\0' Q"}))]), say("ok"), say("ok")], with_history(&path)).await;
+    r.wake("go");
+    r.until("result fed (turn 2)", |f, _| f.requests().len() == 2).await;
+    r.wake("still there?");
+    r.until("turn 3", |f, _| f.requests().len() == 3).await;
+    let (fake1, _) = r.finish().await;
+    assert!(fake1.all(2).contains(&payload), "still fresh going into the restart: {}", fake1.all(2));
+    let life1_last = fake1.requests().last().unwrap()["messages"].as_array().unwrap().clone();
+
+    // Restart. `turns_fed` (3) is restored from the same file, so the aging
+    // clock keeps running rather than resetting.
+    let fed_at_turn = 2u64;
+    let age_turn = fed_at_turn + RESULT_TURNS;
+    let turns_needed = age_turn - 3;
+    let r = rig_seen(vec![say("ok"); turns_needed as usize], with_history(&path)).await;
+    r.wake("still alive?");
+    r.until("first after restart", |f, _| f.requests().len() == 1).await;
+    let first_after_restart = r.fake.requests()[0]["messages"].as_array().unwrap().clone();
+    let n = life1_last.len();
+    assert_eq!(&first_after_restart[..n], life1_last.as_slice(), "a restart must not change anything already sent");
+
+    for i in 1..turns_needed {
+        r.wake(&format!("more {i}"));
+        let want = i as usize + 1;
+        r.until("next turn", move |f, _| f.requests().len() == want).await;
+    }
+    let (fake2, _) = r.finish().await;
+    let last = fake2.requests().len() - 1;
+    assert!(fake2.all(last - 1).contains(&payload), "still fresh the turn before aging: {}", fake2.all(last - 1));
+    let aged = fake2.all(last);
+    assert!(!aged.contains(&payload), "aged out right on schedule, restart or not: {aged}");
+    assert!(aged.contains("[#0 Bash]") && aged.contains("Inspect {\"id\": 0}"), "a stub in its place: {aged}");
+}
+
 /// Result ids carry on across a restart, so a restored `[#0 …]` never
 /// names a new, different result — and the old one says it's gone.
 #[tokio::test]

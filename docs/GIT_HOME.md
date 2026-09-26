@@ -25,8 +25,10 @@
   `litter` remote itself. The repo is seeded with `akuma`'s `main` and
   `even-more-cats` from the mac, because the first push from the metal box —
   the whole history — died inside git with EBADF (an Akuma bug), and a seeded
-  repo makes a cat's push only its own commits.
-- **Still to do:** a first successful push from a cat, and the tokens'
+  repo makes a cat's push only its own commits. The bug wasn't size (see
+  HANDOFF, "Why git push died on the trashcan"); fixed 2026-09-26, and the
+  box's first push, meow's `amd64-audio` at `c715553b`, landed.
+- **Still to do:** a first push made *by a cat itself*, and the tokens'
   expiry (whatever Kirill chose) remembered before it bites.
 
 The original status, before the decision: requested, not built; §3's

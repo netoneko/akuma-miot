@@ -510,6 +510,7 @@ pub fn local_tools() -> Vec<Tool> {
                 },
                 "required": ["path", "content"]
             })),
+        edit_tool::edit_tool(),
     ]
 }
 
@@ -688,6 +689,8 @@ pub fn task_tools() -> Vec<Tool> {
     tools.extend(note_tools());
     tools
 }
+
+mod edit_tool;
 
 #[cfg(test)]
 mod tests;

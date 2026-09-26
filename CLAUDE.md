@@ -196,10 +196,13 @@ read that first, it is kept current and this file does not repeat it.
   across turns (2026-09-26).** Before that they all ran at once and meow's
   edit scripts shredded its own files. A long build now holds up the file
   calls after it; that's the trade. `docs/AGENT_STATE_MACHINE.md`, "One lane".
-- **`git push` from the metal Akuma box fails on a big pack** (EBADF in
-  `pack-objects`, open kernel bug). `akuma-litter` is seeded from the mac so a
-  cat's push is small. An Akuma ssh session has no `$HOME`: set
-  `HOME=/root` before testing git there, or credentials look missing.
+- ~~**`git push` from the metal Akuma box fails on a big pack.**~~ **Fixed
+  2026-09-26** (`../akuma` `c715553b`, booted on the box, first push to
+  `akuma-litter` from it landed). It was never size: `fstat` on a closed
+  0/1/2 answered "console" instead of `EBADF`, so every `pack-objects
+  --stdout` died at exit, at any size. HANDOFF, "Why git push died on the
+  trashcan". An Akuma ssh session has no `$HOME`: set `HOME=/root` before
+  testing git there, or credentials look missing.
 - **sora's guest and the metal box need keys that live outside
   `../akuma/target`** (a `cargo clean` deleted the only way in, 2026-09-25):
   `~/.akuma/kot/fcguest.ssh-key` for sora's guest (in its image's

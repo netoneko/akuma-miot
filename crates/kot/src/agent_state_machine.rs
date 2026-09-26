@@ -21,8 +21,8 @@
 //! - **Queries run on their own.** A query tool (`Bash`, `ReadFile`,
 //!   `Peers`, ...) is spawned, not awaited; its result lands in the inbox
 //!   and is fed to the model on a later turn, labelled with an id.
-//! - **One lane for the host's files.** `Bash`, `ReadFile` and `WriteFile`
-//!   run one at a time, in the order they were called, across turns
+//! - **One lane for the host's files.** `Bash`, `ReadFile`, `WriteFile` and
+//!   `Edit` run one at a time, in the order they were called, across turns
 //!   ([`AgentStateMachine::lane`]). Found live 2026-09-25: they all ran at
 //!   once, so meow's `sed -i` on `hda.rs` started while its previous turn's
 //!   edit-and-build script was still rewriting it, a note's `WriteFile`
@@ -258,10 +258,13 @@ they arrive; you don't have to reply in the same response you call a tool.\n\
 nothing comes back from them.\n\
 - Your work stops when you stop calling tools. If you say you'll do something next, call \
 its tool in that same response — a message alone doesn't start anything.\n\
-- Bash, ReadFile and WriteFile run one at a time, in the order you call them — across \
+- Bash, ReadFile, WriteFile and Edit run one at a time, in the order you call them — across \
 responses too: one waits for the one before it to finish, so a later edit never races an \
 earlier script. Running shows a waiting one as queued. Put a long build last, or it holds \
 up everything after it.\n\
+- Edit changes one exact stretch of text in a file — old_string must match the file exactly \
+once (whitespace and all) unless you pass replace_all. It fails, saying why, rather than \
+guess: ReadFile first to get the text exact, or use WriteFile for a full rewrite.\n\
 - Bash waits 30 seconds unless you pass timeout (seconds, up to 3600). Give anything slow, \
 like a build, a big enough timeout, and tell whoever asked that it's running; its output \
 comes back when it finishes, however long that takes.\n\
@@ -470,7 +473,7 @@ struct AgentStateMachine<H: Host> {
     act: Activity,
     /// Each query in flight's buffer and cancel switch, by flight id.
     live: std::collections::HashMap<u64, Arc<Live>>,
-    /// Held by whichever `Bash`/`ReadFile`/`WriteFile` is running. Tokio's
+    /// Held by whichever `Bash`/`ReadFile`/`WriteFile`/`Edit` is running. Tokio's
     /// mutex is fair, so calls take it in the order they were dispatched.
     lane: Arc<tokio::sync::Mutex<()>>,
     /// Stall notices waiting for a turn.
@@ -1355,8 +1358,8 @@ impl<H: Host> AgentStateMachine<H> {
     }
 }
 
-/// `Bash`/`ReadFile`/`WriteFile` on this host — the same for every cat and
-/// for `kot chat`. No sandbox.
+/// `Bash`/`ReadFile`/`WriteFile`/`Edit` on this host — the same for every
+/// cat and for `kot chat`. No sandbox.
 fn local_tool(c: &Call, live: Arc<Live>) -> Option<Query> {
     match c.name.as_str() {
         "Bash" => {
@@ -1437,6 +1440,34 @@ fn local_tool(c: &Call, live: Arc<Live>) -> Option<Query> {
                 }
             }))
         }
+        // Schema in `miot_llm::edit_tool` — see its header for where the
+        // shape (and the "must match exactly once" rule) comes from.
+        "Edit" => {
+            let path = c.str("path").unwrap_or_default();
+            let old = c.str("old_string").unwrap_or_default();
+            let new = c.str("new_string").unwrap_or_default();
+            let replace_all = c.args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+            Some(Box::pin(async move {
+                let content = match tokio::fs::read_to_string(&path).await {
+                    Ok(s) => s,
+                    Err(e) => return ToolOut::new(path, false).body(e.to_string()),
+                };
+                let n = content.matches(&old).count();
+                if n == 0 {
+                    return ToolOut::new(path, false).meta("old_string not found").body("Nothing written — ReadFile to get it exact.".to_string());
+                }
+                if n > 1 && !replace_all {
+                    return ToolOut::new(path, false)
+                        .meta(format!("old_string matches {n} times"))
+                        .body("Nothing written — old_string must be unique, or pass replace_all.".to_string());
+                }
+                let updated = if replace_all { content.replace(&old, &new) } else { content.replacen(&old, &new, 1) };
+                match tokio::fs::write(&path, &updated).await {
+                    Ok(()) => ToolOut::new(path, true).meta(if replace_all { format!("{n} replaced") } else { "1 replaced".to_string() }),
+                    Err(e) => ToolOut::new(path, false).body(e.to_string()),
+                }
+            }))
+        }
         _ => None,
     }
 }
@@ -1447,7 +1478,7 @@ fn gist(c: &Call) -> String {
     let s = |k: &str| c.str(k).unwrap_or_default();
     match c.name.as_str() {
         "Bash" => format!("$ {}", s("command")),
-        "ReadFile" | "WriteFile" => s("path"),
+        "ReadFile" | "WriteFile" | "Edit" => s("path"),
         "SendMessage" => {
             let to = s("to");
             let to = if to.is_empty() { "litter".to_string() } else { to.trim_start_matches('@').to_string() };
