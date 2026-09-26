@@ -950,6 +950,15 @@ impl Host for CatHost {
         Some(kot_dir().join(format!("{}.transcript.jsonl", self.0.name)))
     }
 
+    /// `~/.akuma/kot/<name>.langfuse.jsonl` — next to the plain transcript.
+    /// Built and unit-tested 2026-09-26 (`docs/TOOLING.md`) but never
+    /// wired to a real cat until now — the trait default (`None`) meant no
+    /// cat was actually writing one, found while trying to pull stats from
+    /// it live.
+    fn langfuse_log(&self) -> Option<PathBuf> {
+        Some(kot_dir().join(format!("{}.langfuse.jsonl", self.0.name)))
+    }
+
     fn about(&self) -> String {
         format!(
             "Where: a cat in the Akuma Miot litter, account {}, talking to its node at {}",
