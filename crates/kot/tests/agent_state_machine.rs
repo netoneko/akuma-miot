@@ -688,6 +688,32 @@ async fn an_ignored_check_in_with_open_local_tasks_gets_nudged() {
     assert_eq!(seen.lock().unwrap().sent, vec!["done", "continuing"]);
 }
 
+/// A nudge answered with only a promise ("firing it now", no tool call) is
+/// indistinguishable from true silence to the nudge budget — found live,
+/// meow, 2026-09-26: three nudges in a row like this burned the whole
+/// budget on nothing but talk. The next nudge now quotes the unfulfilled
+/// one back, so it can't just repeat itself.
+#[tokio::test]
+async fn a_nudge_that_gets_only_a_promise_is_quoted_back_next_time() {
+    let r = rig_seen(
+        vec![calls(vec![("Bash", json!({"command": "echo x"}))]), say("done"), text(""), text("Firing it now, nya:"), say("actually did it")],
+        Seen { check: true, local_nag: Some(Duration::from_millis(80)), reminder: Some("(open tasks: L2)".into()), ..Seen::default() },
+    )
+    .await;
+    r.wake("build the kernel");
+    r.until("check-in answered with nothing", |_, s| s.shown.iter().any(|l| l.contains("check-in: nothing more to do"))).await;
+    r.until("second nudge landed", |f, _| f.requests().len() == 5).await;
+    let (fake, seen) = r.finish().await;
+    let first_nudge = fake.fed(3);
+    assert!(!first_nudge.contains("Last time you said"), "nothing to quote yet, first time: {first_nudge}");
+    let second_nudge = fake.fed(4);
+    assert!(
+        second_nudge.contains("Last time you said this, then called no tool") && second_nudge.contains("Firing it now, nya:"),
+        "quotes the unfulfilled promise back: {second_nudge}"
+    );
+    assert_eq!(seen.lock().unwrap().sent, vec!["done", "actually did it"]);
+}
+
 /// A cat with nothing open on its local list is left alone — the nudge only
 /// fires when there's actually something to remind it about.
 #[tokio::test]

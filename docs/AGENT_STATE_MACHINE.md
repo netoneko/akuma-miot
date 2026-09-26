@@ -271,6 +271,15 @@ What it doesn't cover:
   covered:** a model that ignores the check-in with *no* open local task —
   a bare "I'll get to it" with nothing written down has nothing to nudge it
   back with.
+- ~~A nudge answered with a promise, not a tool call, burns the budget the
+  same as true silence.~~ **Covered (2026-09-26):** found live, meow — three
+  nudges in a row each got "Firing it now, nya:" and no tool call, and the
+  budget (3) ran out right as an operator message happened to arrive and
+  save it. The next nudge now quotes the unfulfilled one back
+  (`last_unfulfilled_promise`), so it can't just repeat itself — the budget
+  itself is unchanged, on purpose: a model that only ever promises needs
+  the same backstop as one that never answers at all, or nagging it burns
+  turns forever exactly the way the bound was meant to prevent.
 
 ## Also seen in the same log, not fixed here
 

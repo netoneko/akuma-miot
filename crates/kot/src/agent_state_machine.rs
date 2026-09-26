@@ -55,7 +55,14 @@
 //!   `LocalTask`, idling past [`Host::local_nag_after`] queues a real wake
 //!   ([`AgentStateMachine::maybe_nag`]) — the same shape as a chain task's
 //!   `nudge`, bounded by [`MAX_LOCAL_TASK_NUDGES`] and reset once a turn
-//!   starts a query again.
+//!   starts a query again. A nudge answered with only a promise ("firing it
+//!   now", no tool call) burns the budget exactly like true silence would —
+//!   found live 2026-09-26, meow, three such nudges in a row before an
+//!   operator message happened to arrive right as the budget ran out. The
+//!   next nudge now quotes the unfulfilled one back
+//!   ([`AgentStateMachine::last_unfulfilled_promise`]), so it can't just
+//!   repeat itself — still bounded the same way, since a model that only
+//!   ever promises needs the same backstop as one that never answers.
 //! - **Long results.** A result is fed as its head and tail (build errors
 //!   are at the end, a README's point at its start); `Inspect` with an
 //!   `offset` pages through the middle. `Bash` takes a `timeout` up to
@@ -546,6 +553,20 @@ struct AgentStateMachine<H: Host> {
     /// bounded by [`MAX_LOCAL_TASK_NUDGES`], reset by [`AgentStateMachine::turn`]
     /// the moment a turn actually starts one.
     local_nudges: u32,
+    /// Set by [`AgentStateMachine::maybe_nag`] right when it sends a nudge;
+    /// read and cleared by the very next [`AgentStateMachine::turn`]. Found
+    /// live 2026-09-26: meow answered three nudges in a row with a promise
+    /// ("Firing it now, nya:") and no tool call, each one indistinguishable
+    /// from true silence to the budget above, which burned all three
+    /// nudges on nothing but talk before root happened to send a real
+    /// message. `calls.is_empty()` on the reply to a nudge is a certain
+    /// signal, not a guess — no need to parse the text for what it meant.
+    awaiting_nudge_reply: bool,
+    /// What it said last time it was nudged and then called nothing — quoted
+    /// back in the next nudge so the model can't just repeat the same empty
+    /// promise without being called on it. `None` once a nudge gets an
+    /// actual tool call, or there's been no nudge yet.
+    last_unfulfilled_promise: Option<String>,
 }
 
 /// Think until `inbox` closes and nothing is left in flight.
@@ -613,6 +634,8 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         notices: Vec::new(),
         idle_since: None,
         local_nudges: 0,
+        awaiting_nudge_reply: false,
+        last_unfulfilled_promise: None,
         restart_note: None,
     };
     if let Some(path) = m.host.history_path() {
@@ -812,6 +835,8 @@ impl<H: Host> AgentStateMachine<H> {
                 self.notices.clear();
                 self.check_armed = false;
                 self.local_nudges = 0;
+                self.awaiting_nudge_reply = false;
+                self.last_unfulfilled_promise = None;
                 self.idle_since = None;
                 wakes.clear();
                 results.clear();
@@ -918,13 +943,24 @@ impl<H: Host> AgentStateMachine<H> {
         } else {
             ""
         };
+        // Called out by name, quoting the exact promise, so it can't just
+        // repeat the same "firing it now" with no tool call again — see
+        // `last_unfulfilled_promise`'s own comment for what happened live.
+        let callout = match self.last_unfulfilled_promise.take() {
+            Some(said) => format!(
+                "\nLast time you said this, then called no tool: \"{said}\". A message alone didn't do it then either — call the tool in \
+                 this response, not another promise.",
+            ),
+            None => String::new(),
+        };
         let text = format!(
-            "(Idle {} with open local tasks.{tail}\n{reminder}\nDo the next step now, or call LocalTask to update the list.)",
+            "(Idle {} with open local tasks.{tail}\n{reminder}\nDo the next step now, or call LocalTask to update the list.{callout})",
             ui::human(since.elapsed().as_secs())
         );
         self.host.show(ui::note(&format!("nudging {} on its open local tasks — idle {}", self.host.name(), ui::human(since.elapsed().as_secs()))));
         let kind = self.kinds.last().copied().unwrap_or("said");
         self.pending.push_back(Inbound::Wake { text, kind, ctx: self.ctx.clone() });
+        self.awaiting_nudge_reply = true;
         // Restart the clock: if this nudge also gets nothing back, the next
         // one waits a full interval again rather than firing right away.
         self.idle_since = Some(Instant::now());
@@ -1045,6 +1081,11 @@ impl<H: Host> AgentStateMachine<H> {
             self.kinds.dedup();
             self.ctx = wakes.last().map(|w| w.2.clone()).unwrap_or_default();
         }
+        // A real wake settles whether the *previous* nudge (if any) got a
+        // tool call or another empty promise — see `awaiting_nudge_reply`'s
+        // own comment. A follow-up turn (`wakes` empty) is never itself the
+        // nudge's reply, so this only fires on an actual wake.
+        let awaiting_nudge_reply = !wakes.is_empty() && std::mem::take(&mut self.awaiting_nudge_reply);
 
         self.turns_fed += 1;
         let mut msg: Vec<String> = wakes.iter().map(|w| w.0.clone()).collect();
@@ -1258,11 +1299,19 @@ impl<H: Host> AgentStateMachine<H> {
         self.check_armed = !check && !results.is_empty() && wrote && started_nothing && self.host.check_before_idle();
         if turn.calls.is_empty() {
             let text = turn.text.trim();
+            if awaiting_nudge_reply && !text.is_empty() {
+                // Answered the nudge with talk, not a tool call — quoted
+                // back next time so it can't just repeat itself.
+                self.last_unfulfilled_promise = Some(text.to_string());
+            }
             if text.is_empty() {
                 self.host.show(ui::note("no tool call, no text — turn wasted"));
             } else {
                 self.host.spoke(text, &self.ctx);
             }
+        } else if awaiting_nudge_reply {
+            // A real tool call is proof enough, whatever it called.
+            self.last_unfulfilled_promise = None;
         }
         self.host.after_turn(&cost);
         self.settle();
