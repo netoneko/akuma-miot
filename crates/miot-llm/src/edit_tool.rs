@@ -17,10 +17,15 @@
 //!   retry against (re-read, narrow the match) when it fails.
 //! - Claude Code's own `Edit` tool: one tool per verb (matching kot's
 //!   existing `ReadFile`/`WriteFile` convention, rather than Anthropic's
-//!   single multi-command tool with a `command` field) and the
-//!   `old_string`/`new_string`/`replace_all` field names, `replace_all`
+//!   single multi-command tool with a `command` field), the
+//!   `old_string`/`new_string`/`replace_all` field names (`replace_all`
 //!   being Claude Code's extension over the bare Anthropic tool for a
-//!   rename-across-the-file edit.
+//!   rename-across-the-file edit), and `file_path` rather than kot's own
+//!   `ReadFile`/`WriteFile` convention of just `path` — kept for maximum
+//!   compatibility with what GLM/Qwen have actually seen, since a tool
+//!   naming one specific file is `file_path` in the real thing (a
+//!   directory or search scope, `Grep`/`Glob`/`LS` in `fs_tools.rs`, stays
+//!   `path` — that split is real Claude Code behavior too).
 //!
 //! Not a derivative-work concern: a tool's name and JSON parameter names are
 //! functional API surface — closer to a method signature than to creative
@@ -45,11 +50,11 @@ pub fn edit_tool() -> Tool {
         .with_schema(serde_json::json!({
             "type": "object",
             "properties": {
-                "path": {"type": "string"},
+                "file_path": {"type": "string"},
                 "old_string": {"type": "string"},
                 "new_string": {"type": "string"},
                 "replace_all": {"type": "boolean", "description": "replace every occurrence instead of requiring exactly one — default false"}
             },
-            "required": ["path", "old_string", "new_string"]
+            "required": ["file_path", "old_string", "new_string"]
         }))
 }

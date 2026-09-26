@@ -106,13 +106,16 @@ EOF) drains every query and record still in flight, then returns.
   handled meanwhile. On timeout the shell is killed (`kill_on_drop`) and the
   model is told it can ask for longer. A child the shell forked may outlive
   it.
-- **One lane** (2026-09-26): `Bash`, `ReadFile`, `WriteFile` and `Edit` run
-  one at a time, in the order they were called, across turns too. (`Edit`
-  added later the same day — a targeted find/replace tool, `crates/
-  miot-llm/src/edit_tool.rs`, shaped after Anthropic's text editor tool and
-  Claude Code's own `Edit`, since GLM and Qwen are both trained as drop-ins
-  for that shape. It goes through the same lane as the other three: it
-  reads and writes a file same as `WriteFile` does.) Each call takes
+- **One lane** (2026-09-26): every tool that touches this host's
+  filesystem — `Bash`, `ReadFile`, `WriteFile`, `Edit`, `MultiEdit`, `LS`,
+  `Glob`, `Grep` — runs one at a time, in the order it was called, across
+  turns too. `Edit`/`MultiEdit`/`LS`/`Glob`/`Grep` (`crates/miot-llm/src/
+  edit_tool.rs`, `fs_tools.rs`) were added later the same day, shaped after
+  Claude Code's own tool set — GLM and Qwen are both trained as drop-ins
+  for it — with `docs/TOOLING.md` carrying the fuller reasoning and the
+  transcript numbers behind it. They go through the same lane as the
+  original three: each one reads or writes a file the same as `ReadFile`/
+  `WriteFile` do. Each call takes
   its place in a fair mutex when it's dispatched, not when its task first
   runs. Before this they all ran at once. meow's transcript for the evening
   of 2026-09-25 shows 12 overlaps, including a `sed -i` on `hda.rs` that

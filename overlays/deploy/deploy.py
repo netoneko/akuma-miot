@@ -103,6 +103,12 @@ class Agent:
     # llama-server reports its own). Without it a GLM cat never got a budget
     # warning or a force-compaction, and meow re-sent ~75k tokens a turn.
     context_window: int | None = None
+    # `Host::reboot_tool` (docs/TOOLING.md) — compacts, then actually
+    # reboots the host. Off by default; on only for meow below, since it's
+    # the one cat whose own workflow already reboots the box it runs on
+    # (kernel builds) with, per its real transcript, zero `Compact` calls
+    # across 87 of its own reboots.
+    reboot_tool: bool = False
 
 
 # The GLM cats' model, since 2026-09-25 (Kirill): flash, reasoning `low`.
@@ -115,7 +121,7 @@ GLM_CONTEXT_WINDOW = 1_000_000
 
 
 AGENTS: list[Agent] = [
-    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW),
+    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW, reboot_tool=True),
     Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW),
     Agent("mac-linux-aarch64", "lima", "fc", "aarch64", "kuro", "http://192.168.5.2:11434", "gemma4-yolo-4b"),
     Agent("ryzen-akuma-amd64", "fcguest", "ryzen", "x86_64", "sora", "http://192.168.1.49:8082", "qwen3-4b"),
@@ -516,6 +522,8 @@ def env_for(name: str) -> str:
         lines.append(f"MIOT_LLM={a.llm}")
     if a.context_window:
         lines.append(f"MIOT_CONTEXT_WINDOW={a.context_window}")
+    if a.reboot_tool:
+        lines.append("MIOT_REBOOT_TOOL=true")
     lines += [
         f'MIOT_ROOT_PUBKEY="{mesh["MIOT_ROOT_PUBKEY"]}"',
         f'MIOT_LEADER={mesh["MIOT_LEADER"]}',

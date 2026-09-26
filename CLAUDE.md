@@ -83,6 +83,14 @@ read that first, it is kept current and this file does not repeat it.
   held results, the check-in before idling, how long tool output is fed
   and paged. Written 2026-09-24 after meow's kernel build stalled; read it
   before changing `agent_state_machine.rs`.
+- `docs/TOOLING.md` — `Edit`/`MultiEdit`/`Grep`/`Glob`/`LS` (schemas and why
+  they're shaped after Anthropic/Claude Code, not invented — including the
+  `file_path`-vs-`path` split), the Langfuse-shaped disk log (`crates/kot/
+  src/langfuse_log.rs`), and the real transcript numbers behind all of it:
+  meow's Bash-vs-WriteFile editing split, 127 Bash calls that were really
+  navigation, restart/reboot downtime, and why its prompt-cache hit rate is
+  near zero even mid-session (`age()`, not restarts). Added 2026-09-26;
+  says plainly what's designed vs built.
 - `docs/TEAHOUSE.md` — **the teahouse** (茶馆), the name of the mesh/chain:
   the seven-member topology as actually running (5 home + 2 AWS), with a
   diagram, what was shown live, and the honest limits. Current-state; it

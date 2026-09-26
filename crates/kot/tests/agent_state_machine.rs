@@ -149,6 +149,12 @@ struct Seen {
     history: Option<std::path::PathBuf>,
     /// `Host::restart_note`.
     restart: Option<String>,
+    /// `Host::reboot_tool` — off unless a test is about it. A test that
+    /// turns this on runs on a throwaway process (`cargo test`'s own), so
+    /// the tool's actual `reboot -f` is left to fire — the assertions are
+    /// about the compaction/gating around it, not stopping a real reboot
+    /// from a test.
+    reboot_tool: bool,
 }
 
 struct TestHost(Arc<Mutex<Seen>>);
@@ -218,6 +224,14 @@ impl Host for TestHost {
     }
     fn langfuse_log(&self) -> Option<std::path::PathBuf> {
         self.0.lock().unwrap().langfuse.clone()
+    }
+    fn reboot_tool(&self) -> bool {
+        self.0.lock().unwrap().reboot_tool
+    }
+    /// Records that it was called, real reboot deliberately never fires —
+    /// see the `reboot_tool` field's own comment.
+    fn reboot(&self) {
+        self.0.lock().unwrap().shown.push("[test] would reboot now".into());
     }
     fn transcript(&self) -> Option<std::path::PathBuf> {
         self.0.lock().unwrap().transcript.clone()
@@ -1303,7 +1317,7 @@ async fn bash_and_file_calls_run_one_at_a_time_in_order() {
         calls(vec![
             ("Bash", json!({"command": slow_write})),
             ("ReadFile", json!({"path": f.display().to_string()})),
-            ("Edit", json!({"path": f.display().to_string(), "old_string": "written", "new_string": "edited"})),
+            ("Edit", json!({"file_path": f.display().to_string(), "old_string": "written", "new_string": "edited"})),
         ]),
         text("ok"),
     ])
@@ -1324,7 +1338,7 @@ async fn edit_replaces_one_exact_match() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("f.rs");
     std::fs::write(&f, "fn old_name() {}\n").unwrap();
-    let r = rig(vec![calls(vec![("Edit", json!({"path": f.display().to_string(), "old_string": "old_name", "new_string": "new_name"}))]), text("ok")]).await;
+    let r = rig(vec![calls(vec![("Edit", json!({"file_path": f.display().to_string(), "old_string": "old_name", "new_string": "new_name"}))]), text("ok")]).await;
     r.wake("rename it");
     r.until("result", |f, _| f.requests().len() == 2).await;
     r.finish().await;
@@ -1336,7 +1350,7 @@ async fn edit_refuses_when_old_string_is_not_found() {
     let dir = tempfile::tempdir().unwrap();
     let f = dir.path().join("f.rs");
     std::fs::write(&f, "unchanged\n").unwrap();
-    let r = rig(vec![calls(vec![("Edit", json!({"path": f.display().to_string(), "old_string": "missing", "new_string": "x"}))]), text("ok")]).await;
+    let r = rig(vec![calls(vec![("Edit", json!({"file_path": f.display().to_string(), "old_string": "missing", "new_string": "x"}))]), text("ok")]).await;
     r.wake("rename it");
     r.until("result", |f, _| f.requests().len() == 2).await;
     let (fake, _) = r.finish().await;
@@ -1357,9 +1371,9 @@ async fn edit_refuses_an_ambiguous_match_unless_replace_all() {
     // another call, so the chain stops there instead of racing past the
     // request count each `until` below polls for.
     let r = rig(vec![
-        calls(vec![("Edit", json!({"path": f.display().to_string(), "old_string": "x", "new_string": "y"}))]),
+        calls(vec![("Edit", json!({"file_path": f.display().to_string(), "old_string": "x", "new_string": "y"}))]),
         text("noted — retrying with replace_all"),
-        calls(vec![("Edit", json!({"path": f.display().to_string(), "old_string": "x", "new_string": "y", "replace_all": true}))]),
+        calls(vec![("Edit", json!({"file_path": f.display().to_string(), "old_string": "x", "new_string": "y", "replace_all": true}))]),
         text("ok"),
     ])
     .await;
@@ -1371,6 +1385,134 @@ async fn edit_refuses_an_ambiguous_match_unless_replace_all() {
     let (fake, _) = r.finish().await;
     assert_eq!(std::fs::read_to_string(&f).unwrap(), "y y y\n");
     assert!(fake.fed(1).contains("matches 3 times"), "{}", fake.fed(1));
+}
+
+// ── Reboot: compact first, then the host's own side effect ─────────────
+
+/// Off by default: not even offered, so a model that's never had it turned
+/// on can't call it — and if it somehow did, the dispatch's own
+/// `if self.host.reboot_tool()` guard would still refuse it.
+#[tokio::test]
+async fn reboot_is_not_offered_unless_enabled() {
+    let r = rig(vec![calls(vec![("AboutMe", json!({}))]), text("ok")]).await;
+    r.wake("what tools do I have");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    assert!(!fake.tool_names(0).contains(&"Reboot".to_string()), "{:?}", fake.tool_names(0));
+}
+
+/// Enabled: compacts history to the model's own summary, persists it, and
+/// calls the host's `reboot()` — but never runs a real `reboot -f` itself;
+/// that's `CatHost`'s job, not this shared loop's.
+#[tokio::test]
+async fn reboot_compacts_then_calls_the_hosts_reboot() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tama.history.7.json");
+    let r = rig_seen(
+        vec![say("earlier work"), calls(vec![("Reboot", json!({"summary": "built up to step 3, next is step 4"}))])],
+        Seen { reboot_tool: true, history: Some(path.clone()), ..Seen::default() },
+    )
+    .await;
+    r.wake("keep going");
+    r.until("first", |f, _| f.requests().len() == 1).await;
+    r.wake("now reboot");
+    r.until("second", |f, _| f.requests().len() == 2).await;
+    let (fake, seen) = r.finish().await;
+    assert!(fake.tool_names(0).contains(&"Reboot".to_string()), "offered once enabled: {:?}", fake.tool_names(0));
+    let seen = seen.lock().unwrap();
+    assert!(seen.shown.iter().any(|l| l.contains("would reboot now")), "the host's own reboot() ran: {:?}", seen.shown);
+    assert!(seen.shown.iter().any(|l| l.contains("compacting before reboot")), "{:?}", seen.shown);
+    drop(seen);
+
+    // The compacted summary, not the earlier turn, is what's on disk.
+    let saved = std::fs::read_to_string(&path).unwrap();
+    assert!(saved.contains("built up to step 3"), "{saved}");
+    assert!(!saved.contains("earlier work"), "{saved}");
+}
+
+// ── MultiEdit, LS, Glob, Grep (miot-llm/src/fs_tools.rs) ────────────────
+
+#[tokio::test]
+async fn multi_edit_applies_every_edit_as_one_write() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f.rs");
+    std::fs::write(&f, "fn a() {}\nfn b() {}\n").unwrap();
+    let edits = json!([{"old_string": "a", "new_string": "aa"}, {"old_string": "b", "new_string": "bb"}]);
+    let r = rig(vec![calls(vec![("MultiEdit", json!({"file_path": f.display().to_string(), "edits": edits}))]), text("ok")]).await;
+    r.wake("rename both");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    r.finish().await;
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "fn aa() {}\nfn bb() {}\n");
+}
+
+/// All-or-nothing: the second edit fails (ambiguous), so the first is never
+/// written either, even though it would have succeeded alone.
+#[tokio::test]
+async fn multi_edit_writes_nothing_if_any_edit_fails() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f.rs");
+    std::fs::write(&f, "fn a() {}\nx x\n").unwrap();
+    let edits = json!([{"old_string": "a", "new_string": "aa"}, {"old_string": "x", "new_string": "y"}]);
+    let r = rig(vec![calls(vec![("MultiEdit", json!({"file_path": f.display().to_string(), "edits": edits}))]), text("ok")]).await;
+    r.wake("try both");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "fn a() {}\nx x\n", "nothing written: edit 1 alone would have succeeded");
+    assert!(fake.fed(1).contains("edit 2 of 2"), "{}", fake.fed(1));
+}
+
+#[tokio::test]
+async fn ls_lists_a_directory_marking_dirs_and_honouring_ignore() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("a.rs"), "").unwrap();
+    std::fs::write(dir.path().join("b.lock"), "").unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    let r = rig(vec![calls(vec![("LS", json!({"path": dir.path().display().to_string(), "ignore": ["*.lock"]}))]), text("ok")]).await;
+    r.wake("what's there");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("a.rs") && fed.contains("sub/") && !fed.contains("b.lock"), "{fed}");
+}
+
+#[tokio::test]
+async fn glob_finds_by_name_pattern_recursively() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::create_dir(dir.path().join("sub")).unwrap();
+    std::fs::write(dir.path().join("keep.rs"), "").unwrap();
+    std::fs::write(dir.path().join("sub/keep2.rs"), "").unwrap();
+    std::fs::write(dir.path().join("skip.txt"), "").unwrap();
+    let r = rig(vec![calls(vec![("Glob", json!({"pattern": "*.rs", "path": dir.path().display().to_string()}))]), text("ok")]).await;
+    r.wake("find rust files");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("keep.rs") && fed.contains("keep2.rs") && !fed.contains("skip.txt"), "{fed}");
+}
+
+#[tokio::test]
+async fn grep_content_mode_shows_matching_lines_with_numbers() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f.rs");
+    std::fs::write(&f, "one\ntwo needle\nthree\n").unwrap();
+    let r = rig(vec![calls(vec![("Grep", json!({"pattern": "needle", "path": dir.path().display().to_string(), "output_mode": "content", "-n": true}))]), text("ok")]).await;
+    r.wake("find it");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("2:") && fed.contains("needle") && !fed.contains("three"), "{fed}");
+}
+
+/// No matches is a successful search (grep's exit 1), not a tool failure.
+#[tokio::test]
+async fn grep_with_no_matches_is_still_ok() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("f.rs"), "nothing here\n").unwrap();
+    let r = rig(vec![calls(vec![("Grep", json!({"pattern": "needle", "path": dir.path().display().to_string()}))]), text("ok")]).await;
+    r.wake("find it");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    assert!(fake.fed(1).contains("[#0 Grep]") && fake.fed(1).contains("0 line(s)"), "{}", fake.fed(1));
 }
 
 /// A call from a later response waits for one still running from an

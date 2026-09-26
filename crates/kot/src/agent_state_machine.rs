@@ -21,8 +21,9 @@
 //! - **Queries run on their own.** A query tool (`Bash`, `ReadFile`,
 //!   `Peers`, ...) is spawned, not awaited; its result lands in the inbox
 //!   and is fed to the model on a later turn, labelled with an id.
-//! - **One lane for the host's files.** `Bash`, `ReadFile`, `WriteFile` and
-//!   `Edit` run one at a time, in the order they were called, across turns
+//! - **One lane for the host's files.** `Bash`, `ReadFile`, `WriteFile`,
+//!   `Edit`, `MultiEdit`, `LS`, `Glob` and `Grep` run one at a time, in the
+//!   order they were called, across turns
 //!   ([`AgentStateMachine::lane`]). Found live 2026-09-25: they all ran at
 //!   once, so meow's `sed -i` on `hda.rs` started while its previous turn's
 //!   edit-and-build script was still rewriting it, a note's `WriteFile`
@@ -241,6 +242,20 @@ pub trait Host: Send + Sync + 'static {
     fn transcript(&self) -> Option<PathBuf> {
         None
     }
+    /// Whether this cat gets the `Reboot` tool (compact, then actually
+    /// reboot the host) — off by default. `tools()` doesn't offer the tool
+    /// at all unless this says yes; `docs/TOOLING.md` has the reasoning and
+    /// which cat, if any, has it turned on.
+    fn reboot_tool(&self) -> bool {
+        false
+    }
+    /// The actual OS-level side effect of `Reboot`, once history is already
+    /// compacted — split out from [`reboot_tool`] on purpose: this crate's
+    /// test harness turns `reboot_tool` on to exercise the compaction and
+    /// gating around the call, and must never risk running a real `reboot
+    /// -f` on whatever machine happens to run `cargo test`. The default
+    /// does nothing — safe for any host that never sets `reboot_tool`.
+    fn reboot(&self) {}
     /// Where to append the Langfuse-ingestion-shaped log
     /// ([`crate::langfuse_log`]) — a `trace-create`/`generation-create`/
     /// `span-create` per line, disk-only, nothing sent anywhere. `None`:
@@ -266,13 +281,17 @@ they arrive; you don't have to reply in the same response you call a tool.\n\
 nothing comes back from them.\n\
 - Your work stops when you stop calling tools. If you say you'll do something next, call \
 its tool in that same response — a message alone doesn't start anything.\n\
-- Bash, ReadFile, WriteFile and Edit run one at a time, in the order you call them — across \
-responses too: one waits for the one before it to finish, so a later edit never races an \
-earlier script. Running shows a waiting one as queued. Put a long build last, or it holds \
-up everything after it.\n\
+- Bash, ReadFile, WriteFile, Edit, MultiEdit, LS, Glob and Grep run one at a time, in the \
+order you call them — across responses too: one waits for the one before it to finish, so a \
+later edit never races an earlier script. Running shows a waiting one as queued. Put a long \
+build last, or it holds up everything after it.\n\
 - Edit changes one exact stretch of text in a file — old_string must match the file exactly \
 once (whitespace and all) unless you pass replace_all. It fails, saying why, rather than \
-guess: ReadFile first to get the text exact, or use WriteFile for a full rewrite.\n\
+guess: ReadFile first to get the text exact, or use WriteFile for a full rewrite. MultiEdit is \
+the same rule, several edits at once, all-or-nothing.\n\
+- Grep and Glob search rather than guessing a path: Grep for content (output_mode picks \
+content/files_with_matches/count), Glob for a filename pattern. LS lists one directory, not \
+recursively.\n\
 - Bash waits 30 seconds unless you pass timeout (seconds, up to 3600). Give anything slow, \
 like a build, a big enough timeout, and tell whoever asked that it's running; its output \
 comes back when it finishes, however long that takes.\n\
@@ -299,6 +318,28 @@ pub fn shared_tools() -> Vec<Tool> {
     t.extend(miot_llm::budget_tools());
     t.extend(miot_llm::flight_tools());
     t
+}
+
+/// Only offered when [`Host::reboot_tool`] says so — not a shared tool.
+/// Not `miot_llm::local_tools()` either: unlike `Bash`/`ReadFile`/..., which
+/// every host gets, this one is a real system action (reboots the box this
+/// process runs on) that must stay opt-in per cat, so it lives next to the
+/// gate it's dispatched behind (`AgentStateMachine::turn`) rather than in
+/// the shared tool crate.
+fn reboot_tool() -> Tool {
+    Tool::new("Reboot")
+        .with_description(
+            "Compact your conversation to a summary you write, then reboot this host \
+             (busybox reboot -f, or a plain reboot -f). Only offered when explicitly enabled for \
+             this cat. Write down what you were doing and what's next before you call this — \
+             that summary, and your LocalTask list, are all that survive; the reboot itself does \
+             not wait for anything.",
+        )
+        .with_schema(serde_json::json!({
+            "type": "object",
+            "properties": {"summary": {"type": "string", "description": "everything about the conversation so far worth remembering"}},
+            "required": ["summary"]
+        }))
 }
 
 /// A call in flight, as `Running`/`Cancel` see it: what it has printed so
@@ -481,7 +522,8 @@ struct AgentStateMachine<H: Host> {
     act: Activity,
     /// Each query in flight's buffer and cancel switch, by flight id.
     live: std::collections::HashMap<u64, Arc<Live>>,
-    /// Held by whichever `Bash`/`ReadFile`/`WriteFile`/`Edit` is running. Tokio's
+    /// Held by whichever lane tool (`Bash`/`ReadFile`/`WriteFile`/`Edit`/
+    /// `MultiEdit`/`LS`/`Glob`/`Grep`) is running. Tokio's
     /// mutex is fair, so calls take it in the order they were dispatched.
     lane: Arc<tokio::sync::Mutex<()>>,
     /// Stall notices waiting for a turn.
@@ -988,6 +1030,9 @@ impl<H: Host> AgentStateMachine<H> {
                 }
             }
         }
+        if self.host.reboot_tool() {
+            t.push(reboot_tool());
+        }
         t
     }
 
@@ -1165,6 +1210,29 @@ impl<H: Host> AgentStateMachine<H> {
                     self.fresh.clear();
                     self.warned_tier = 0;
                     compacted = true;
+                }
+                // Gated by `Host::reboot_tool` — off by default, `tools()`
+                // doesn't even offer it unless the host says so (meow only,
+                // config: `docs/TOOLING.md`). Compacts first, same as
+                // `Compact` above, then actually reboots: 0 `compact`
+                // events across 96 of meow's real restarts, most of them
+                // its own `reboot -f`, is the finding this exists to fix —
+                // the conversation now leaves itself a note before the box
+                // goes down, instead of just losing whatever wasn't
+                // written to a `LocalTask`.
+                "Reboot" if self.host.reboot_tool() => {
+                    let summary = c.str("summary").unwrap_or_default();
+                    self.host.show(ui::note(&format!(
+                        "compacting before reboot: history replaced with a {}-char summary the model wrote; rebooting now",
+                        summary.len()
+                    )));
+                    self.log(serde_json::json!({"t": "compact", "forced": false, "reboot": true, "summary": summary}));
+                    self.history = vec![(Speaker::Assistant, summary)];
+                    self.fresh.clear();
+                    self.warned_tier = 0;
+                    compacted = true;
+                    self.persist();
+                    self.host.reboot();
                 }
                 // Instant, but still a result: it comes back like any other.
                 "TokenBudget" | "BrowseTools" | "Inspect" | "AboutMe" | "Running" | "Cancel" => {
@@ -1399,8 +1467,8 @@ impl<H: Host> AgentStateMachine<H> {
     }
 }
 
-/// `Bash`/`ReadFile`/`WriteFile`/`Edit` on this host — the same for every
-/// cat and for `kot chat`. No sandbox.
+/// `Bash`/`ReadFile`/`WriteFile`/`Edit`/`MultiEdit`/`LS`/`Glob`/`Grep` on
+/// this host — the same for every cat and for `kot chat`. No sandbox.
 fn local_tool(c: &Call, live: Arc<Live>) -> Option<Query> {
     match c.name.as_str() {
         "Bash" => {
@@ -1484,7 +1552,7 @@ fn local_tool(c: &Call, live: Arc<Live>) -> Option<Query> {
         // Schema in `miot_llm::edit_tool` — see its header for where the
         // shape (and the "must match exactly once" rule) comes from.
         "Edit" => {
-            let path = c.str("path").unwrap_or_default();
+            let path = c.str("file_path").unwrap_or_default();
             let old = c.str("old_string").unwrap_or_default();
             let new = c.str("new_string").unwrap_or_default();
             let replace_all = c.args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
@@ -1493,24 +1561,215 @@ fn local_tool(c: &Call, live: Arc<Live>) -> Option<Query> {
                     Ok(s) => s,
                     Err(e) => return ToolOut::new(path, false).body(e.to_string()),
                 };
-                let n = content.matches(&old).count();
-                if n == 0 {
-                    return ToolOut::new(path, false).meta("old_string not found").body("Nothing written — ReadFile to get it exact.".to_string());
+                match apply_edit(&content, &old, &new, replace_all) {
+                    Ok(updated) => match tokio::fs::write(&path, &updated).await {
+                        Ok(()) => ToolOut::new(path, true).meta(edit_meta(&content, &old, replace_all)),
+                        Err(e) => ToolOut::new(path, false).body(e.to_string()),
+                    },
+                    Err(msg) => ToolOut::new(path, false).meta(msg).body("Nothing written.".to_string()),
                 }
-                if n > 1 && !replace_all {
-                    return ToolOut::new(path, false)
-                        .meta(format!("old_string matches {n} times"))
-                        .body("Nothing written — old_string must be unique, or pass replace_all.".to_string());
+            }))
+        }
+        // Schema in `miot_llm::fs_tools` — see its header for the
+        // `file_path`/`path` split and what's not reproduced from real
+        // Grep/LS (`multiline`, `type`).
+        "MultiEdit" => {
+            let path = c.str("file_path").unwrap_or_default();
+            let edits: Vec<(String, String, bool)> = c
+                .args
+                .get("edits")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .map(|e| {
+                            (
+                                e.get("old_string").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                e.get("new_string").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                                e.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false),
+                            )
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            Some(Box::pin(async move {
+                let mut content = match tokio::fs::read_to_string(&path).await {
+                    Ok(s) => s,
+                    Err(e) => return ToolOut::new(path, false).body(e.to_string()),
+                };
+                let n = edits.len();
+                for (i, (old, new, replace_all)) in edits.iter().enumerate() {
+                    match apply_edit(&content, old, new, *replace_all) {
+                        Ok(updated) => content = updated,
+                        Err(msg) => {
+                            return ToolOut::new(path, false)
+                                .meta(format!("edit {} of {n}: {msg}", i + 1))
+                                .body("Nothing written — every edit must succeed before any of them are applied.".to_string());
+                        }
+                    }
                 }
-                let updated = if replace_all { content.replace(&old, &new) } else { content.replacen(&old, &new, 1) };
-                match tokio::fs::write(&path, &updated).await {
-                    Ok(()) => ToolOut::new(path, true).meta(if replace_all { format!("{n} replaced") } else { "1 replaced".to_string() }),
+                match tokio::fs::write(&path, &content).await {
+                    Ok(()) => ToolOut::new(path, true).meta(format!("{n} edit(s) applied")),
                     Err(e) => ToolOut::new(path, false).body(e.to_string()),
+                }
+            }))
+        }
+        "LS" => {
+            let path = c.str("path").unwrap_or_default();
+            let ignore: Vec<String> = c.args.get("ignore").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
+            Some(Box::pin(async move {
+                let mut dir = match tokio::fs::read_dir(&path).await {
+                    Ok(d) => d,
+                    Err(e) => return ToolOut::new(path, false).body(e.to_string()),
+                };
+                let mut names = Vec::new();
+                loop {
+                    match dir.next_entry().await {
+                        Ok(Some(e)) => {
+                            let name = e.file_name().to_string_lossy().into_owned();
+                            if ignore.iter().any(|pat| glob_match(pat, &name)) {
+                                continue;
+                            }
+                            let is_dir = e.file_type().await.map(|t| t.is_dir()).unwrap_or(false);
+                            names.push(if is_dir { format!("{name}/") } else { name });
+                        }
+                        Ok(None) => break,
+                        Err(_) => break,
+                    }
+                }
+                names.sort();
+                let n = names.len();
+                ToolOut::new(path, true).meta(format!("{n} entrie(s)")).body(names.join("\n"))
+            }))
+        }
+        "Glob" => {
+            let pattern = c.str("pattern").unwrap_or_default();
+            let base = c.str("path").filter(|s| !s.is_empty()).unwrap_or_else(|| ".".to_string());
+            Some(Box::pin(async move {
+                let name_pat = pattern.strip_prefix("**/").unwrap_or(&pattern);
+                let mut cmd = tokio::process::Command::new("find");
+                cmd.arg(&base).arg("-type").arg("f");
+                if pattern.contains('/') && !pattern.starts_with("**/") {
+                    cmd.arg("-path").arg(format!("*/{pattern}"));
+                } else {
+                    cmd.arg("-name").arg(name_pat);
+                }
+                let out = cmd.output().await;
+                let arg = format!("{pattern} under {base}");
+                match out {
+                    Ok(o) => {
+                        let paths: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect();
+                        if !o.status.success() && paths.is_empty() {
+                            return ToolOut::new(arg, false).body(String::from_utf8_lossy(&o.stderr).to_string());
+                        }
+                        let mut with_mtime = Vec::with_capacity(paths.len());
+                        for p in paths {
+                            let mtime = tokio::fs::metadata(&p).await.ok().and_then(|m| m.modified().ok()).unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                            with_mtime.push((mtime, p));
+                        }
+                        with_mtime.sort_by(|a, b| b.0.cmp(&a.0));
+                        let n = with_mtime.len();
+                        let body = with_mtime.into_iter().take(200).map(|(_, p)| p).collect::<Vec<_>>().join("\n");
+                        ToolOut::new(arg, true).meta(format!("{n} match(es)")).body(body)
+                    }
+                    Err(e) => ToolOut::new(arg, false).body(e.to_string()),
+                }
+            }))
+        }
+        "Grep" => {
+            let pattern = c.str("pattern").unwrap_or_default();
+            let path = c.str("path").filter(|s| !s.is_empty()).unwrap_or_else(|| ".".to_string());
+            let glob = c.str("glob");
+            let content_mode = c.str("output_mode").as_deref() == Some("content");
+            let count_mode = c.str("output_mode").as_deref() == Some("count");
+            let ci = c.args.get("-i").and_then(|v| v.as_bool()).unwrap_or(false);
+            let line_numbers = c.args.get("-n").and_then(|v| v.as_bool()).unwrap_or(false);
+            let before = c.args.get("-B").and_then(|v| v.as_u64());
+            let after = c.args.get("-A").and_then(|v| v.as_u64());
+            let around = c.args.get("-C").and_then(|v| v.as_u64());
+            let head_limit = c.args.get("head_limit").and_then(|v| v.as_u64()).map(|n| n as usize);
+            Some(Box::pin(async move {
+                let mut gcmd = tokio::process::Command::new("grep");
+                gcmd.arg("-r");
+                if count_mode {
+                    gcmd.arg("-c");
+                } else if !content_mode {
+                    gcmd.arg("-l");
+                } else if line_numbers {
+                    gcmd.arg("-n");
+                }
+                if ci {
+                    gcmd.arg("-i");
+                }
+                if content_mode {
+                    if let Some(n) = around {
+                        gcmd.arg(format!("-C{n}"));
+                    } else {
+                        if let Some(n) = before {
+                            gcmd.arg(format!("-B{n}"));
+                        }
+                        if let Some(n) = after {
+                            gcmd.arg(format!("-A{n}"));
+                        }
+                    }
+                }
+                if let Some(g) = &glob {
+                    gcmd.arg(format!("--include={g}"));
+                }
+                gcmd.arg("-E").arg(&pattern).arg(&path);
+                let arg = format!("{pattern} in {path}");
+                match gcmd.output().await {
+                    Ok(o) => {
+                        // grep: 0 matches found, 1 no matches (still a
+                        // successful search), >=2 a real error.
+                        if o.status.code().is_none_or(|c| c > 1) {
+                            return ToolOut::new(arg, false).body(String::from_utf8_lossy(&o.stderr).to_string());
+                        }
+                        let mut lines: Vec<String> = String::from_utf8_lossy(&o.stdout).lines().map(str::to_string).collect();
+                        if let Some(n) = head_limit {
+                            lines.truncate(n);
+                        }
+                        ToolOut::new(arg, true).meta(format!("{} line(s)", lines.len())).body(lines.join("\n"))
+                    }
+                    Err(e) => ToolOut::new(arg, false).body(e.to_string()),
                 }
             }))
         }
         _ => None,
     }
+}
+
+/// `old` must appear in `content` exactly once unless `replace_all` — the
+/// rule kept from Anthropic's `str_replace` (`miot_llm::edit_tool`'s
+/// header). `Err` names why, for the model to retry against.
+fn apply_edit(content: &str, old: &str, new: &str, replace_all: bool) -> Result<String, String> {
+    let n = content.matches(old).count();
+    if n == 0 {
+        return Err("old_string not found".to_string());
+    }
+    if n > 1 && !replace_all {
+        return Err(format!("old_string matches {n} times"));
+    }
+    Ok(if replace_all { content.replace(old, new) } else { content.replacen(old, new, 1) })
+}
+
+fn edit_meta(content: &str, old: &str, replace_all: bool) -> String {
+    let n = content.matches(old).count();
+    if replace_all { format!("{n} replaced") } else { "1 replaced".to_string() }
+}
+
+/// `*` and `?` only — enough for `LS`'s `ignore` list (`node_modules`,
+/// `*.lock`, ...). Not a full glob: no `**`, no character classes.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    fn go(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => (0..=s.len()).any(|i| go(&p[1..], &s[i..])),
+            (Some(b'?'), Some(_)) => go(&p[1..], &s[1..]),
+            (Some(&pc), Some(&sc)) if pc == sc => go(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    go(pattern.as_bytes(), name.as_bytes())
 }
 
 /// A call's gist, one line, for the running list and the log: the command,
@@ -1519,7 +1778,13 @@ fn gist(c: &Call) -> String {
     let s = |k: &str| c.str(k).unwrap_or_default();
     match c.name.as_str() {
         "Bash" => format!("$ {}", s("command")),
-        "ReadFile" | "WriteFile" | "Edit" => s("path"),
+        "ReadFile" | "WriteFile" => s("path"),
+        "Edit" | "MultiEdit" => s("file_path"),
+        "LS" => s("path"),
+        "Grep" | "Glob" => {
+            let path = s("path");
+            format!("{} in {}", s("pattern"), if path.is_empty() { ".".to_string() } else { path })
+        }
         "SendMessage" => {
             let to = s("to");
             let to = if to.is_empty() { "litter".to_string() } else { to.trim_start_matches('@').to_string() };

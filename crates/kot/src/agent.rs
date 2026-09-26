@@ -120,6 +120,10 @@ pub struct AgentConfig {
     pub llm: Llm,
     pub persona: String,
     pub roster: Roster,
+    /// `Host::reboot_tool` — off unless this cat's deploy config turns it
+    /// on (`docs/TOOLING.md`; `overlays/deploy/deploy.py`'s `Agent.
+    /// reboot_tool`, meow only as of 2026-09-26).
+    pub reboot_tool: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -160,6 +164,8 @@ struct Cat {
     /// Its own to-do list (`LocalTask`), next to the session file, emptied
     /// when the checkpoint moves (`watch_chain`).
     local: std::sync::Mutex<LocalTasks>,
+    /// `Host::reboot_tool` — see `AgentConfig::reboot_tool`.
+    reboot_tool: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -891,6 +897,18 @@ impl Host for CatHost {
         self.0.local.lock().unwrap().reminder()
     }
 
+    fn reboot_tool(&self) -> bool {
+        self.0.reboot_tool
+    }
+
+    /// Fire-and-forget: the box going down means there's no exit status
+    /// worth waiting for. busybox first (what meow already runs by hand on
+    /// the akuma box today), a plain `reboot -f` as a fallback on any
+    /// other host this ever gets turned on for.
+    fn reboot(&self) {
+        let _ = std::process::Command::new("/bin/sh").arg("-c").arg("sync; sleep 1; /bin/busybox reboot -f || reboot -f").spawn();
+    }
+
     /// `~/.akuma/kot/<name>.history.<epoch>.json`: the conversation, so a
     /// restart (a crash, a redeploy, the reboot a kernel build ends in) picks
     /// up where the cat was. The epoch is the session's: after a checkpoint
@@ -1017,7 +1035,7 @@ impl Host for CatHost {
 }
 
 /// A cat's connection to its own node, before any loop runs on it.
-fn new_cat(name: &str, identity: Identity, node: String, roster: Roster) -> Arc<Cat> {
+fn new_cat(name: &str, identity: Identity, node: String, roster: Roster, reboot_tool: bool) -> Arc<Cat> {
     // mTLS pinned to the roster's accounts (`crate::tls`) — same trust
     // boundary as `client.rs`'s `Client`, since a cat's node connection is
     // just another caller of a node, not a special case.
@@ -1038,6 +1056,7 @@ fn new_cat(name: &str, identity: Identity, node: String, roster: Roster) -> Arc<
         stats: tokio::sync::Mutex::new(CatStats::default()),
         activity: tokio::sync::watch::channel(None).0,
         local: std::sync::Mutex::new(LocalTasks::default()),
+        reboot_tool,
     })
 }
 
@@ -1109,7 +1128,7 @@ pub fn asleep_owes_reply(name: &str, me: &str, effect: &serde_json::Value, wakes
 /// switched off (yuki and shiro, 2026-09-25: their OpenRouter key ran dry)
 /// without leaving the litter wondering why it says nothing.
 pub async fn run_asleep(name: String, identity: Identity, node: String, roster: Roster) {
-    let cat = new_cat(&name, identity, node, roster);
+    let cat = new_cat(&name, identity, node, roster, false);
     let me = miot_keys::to_hex(&cat.account);
     println!("{}", ui::note(&format!("{name} id={} node={} asleep: no model; DMs and @{name} get \"{}\"", miot_keys::short(&cat.account), cat.node, asleep_reply(&name))));
     let mut cursor = loop {
@@ -1151,7 +1170,7 @@ pub async fn run_asleep(name: String, identity: Identity, node: String, roster: 
 
 pub async fn run(cfg: AgentConfig) {
     let account = cfg.identity.account();
-    let cat = new_cat(&cfg.name, cfg.identity, cfg.node, cfg.roster);
+    let cat = new_cat(&cfg.name, cfg.identity, cfg.node, cfg.roster, cfg.reboot_tool);
     let name = cat.name.clone();
     let reasoning = cfg.llm.reasoning().map(|e| format!(" reasoning={e}")).unwrap_or_default();
     println!("{}", ui::note(&format!("{name} id={} node={} llm={}{reasoning}", miot_keys::short(&account), cat.node, cfg.llm.label())));

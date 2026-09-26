@@ -201,6 +201,11 @@ struct RunArgs {
     /// polls must list it in their --patrons.
     #[arg(long, env = "MIOT_PATRON")]
     patron: bool,
+    /// Give this cat the `Reboot` tool (compact, then reboot the host).
+    /// Off by default — `docs/TOOLING.md` has why, and which cat (if any)
+    /// this is actually set for.
+    #[arg(long, env = "MIOT_REBOOT_TOOL")]
+    reboot_tool: bool,
 }
 
 #[derive(Args)]
@@ -393,6 +398,7 @@ async fn run(cli: &Cli, a: &RunArgs) {
                 llm,
                 persona,
                 roster: Roster::parse(&cli.roster).unwrap_or_else(|e| die(e)),
+                reboot_tool: a.reboot_tool,
             };
             tokio::spawn(agent::run(cfg));
         }

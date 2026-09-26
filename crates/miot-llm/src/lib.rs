@@ -511,6 +511,10 @@ pub fn local_tools() -> Vec<Tool> {
                 "required": ["path", "content"]
             })),
         edit_tool::edit_tool(),
+        fs_tools::grep_tool(),
+        fs_tools::glob_tool(),
+        fs_tools::multi_edit_tool(),
+        fs_tools::ls_tool(),
     ]
 }
 
@@ -691,6 +695,7 @@ pub fn task_tools() -> Vec<Tool> {
 }
 
 mod edit_tool;
+mod fs_tools;
 
 #[cfg(test)]
 mod tests;
