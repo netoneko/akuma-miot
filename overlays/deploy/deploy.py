@@ -109,6 +109,13 @@ class Agent:
     # (kernel builds) with, per its real transcript, zero `Compact` calls
     # across 87 of its own reboots.
     reboot_tool: bool = False
+    # The process's own working directory, so ReadFile/WriteFile/Edit/
+    # MultiEdit/LS/Glob/Grep's cwd-default (a bare relative path, or no
+    # path at all — `docs/TOOLING.md`, the qwen3:4b LS finding, 2026-09-26)
+    # lands on the actual source checkout rather than /root/kot. `None`:
+    # whatever herd/systemd starts the process with (unspecified, usually
+    # /root or /root/kot).
+    cwd: str | None = None
 
 
 # The GLM cats' model, since 2026-09-25 (Kirill): flash, reasoning `low`.
@@ -121,7 +128,7 @@ GLM_CONTEXT_WINDOW = 1_000_000
 
 
 AGENTS: list[Agent] = [
-    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW, reboot_tool=True),
+    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW, reboot_tool=True, cwd="/src/github.com/netoneko/akuma"),
     Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW),
     Agent("mac-linux-aarch64", "lima", "fc", "aarch64", "kuro", "http://192.168.5.2:11434", "gemma4-yolo-4b"),
     Agent("ryzen-akuma-amd64", "fcguest", "ryzen", "x86_64", "sora", "http://192.168.1.49:8082", "qwen3-4b"),
@@ -607,7 +614,8 @@ def cmd_up(name: str) -> None:
         # shape (docs/TOPOLOGY.md, node5) — the env file is exported with
         # `export` prefixes so a quoted ssh-key line survives.
         exported = "\n".join(f"export {line}" for line in env_content.splitlines())
-        start_sh = template("start.sh.tmpl", agent=a.name, env_lines=exported)
+        cwd_line = f"cd '{a.cwd}' || {{ echo 'cwd missing: {a.cwd}' >&2; exit 1; }}" if a.cwd else ""
+        start_sh = template("start.sh.tmpl", agent=a.name, env_lines=exported, cwd_line=cwd_line)
         put(a, _write_tmp(start_sh), "/root/kot/start.sh")
         on(a, "chmod 755 /root/kot/start.sh")
 

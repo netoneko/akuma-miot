@@ -208,6 +208,41 @@ Tests: `reboot_is_not_offered_unless_enabled`,
 compacted summary lands in the persisted history file and that the host's
 `reboot()` was invoked, never a real `reboot -f`.
 
+## Verified live against a real model, not just the fake-server tests
+
+2026-09-26, `kot chat --llm http://localhost:11434 --model qwen3:4b` (Ollama,
+already on this box) against small throwaway sandboxes — real tool calls
+from a real model, not the scripted fake server the unit tests use:
+
+- `Glob{"pattern": "*.rs"}` (no `path`) → correct file list, 15ms.
+- `Grep{"pattern": "TODO"}` → correct files_with_matches list.
+- `Edit{file_path, old_string, new_string, replace_all}` — the model
+  produced this exact shape unprompted, from the schema description alone.
+- `MultiEdit` with two edits in one call, both applied correctly, in order.
+- **Found a real bug this way**: `LS` with no `path` argument at all (the
+  model expected the same cwd-default `Glob`/`Grep` have) hit `read_dir("")`
+  → "No such file or directory". Fixed (`local_tool`'s `LS` arm now
+  defaults the same way the other two do) and covered by
+  `ls_with_no_path_at_all_defaults_to_the_working_directory`.
+
+GLM-4.7-Flash itself never finished pulling in this session (Ollama's
+download stalled twice at exactly the same byte count, 19,019,269,280 —
+restarted, not yet confirmed fixed) — qwen3:4b stood in as one of the three
+real target families while that's unresolved.
+
+## Working directory matters now, for meow
+
+`ReadFile`/`WriteFile`/`Edit`/`MultiEdit`/`LS`/`Glob`/`Grep`'s cwd-default
+(a bare relative path, or — the `LS` finding below — no path at all) only
+lands somewhere useful if the process's own working directory is the
+actual source checkout, not wherever herd/systemd happens to start it
+(`/root` or `/root/kot`). `overlays/deploy/deploy.py`'s `Agent.cwd` (added
+2026-09-26, meow only: `/src/github.com/netoneko/akuma`) threads a `cd` into
+`start.sh.tmpl` before `exec`. **Only wired for the `akuma`/`fcguest`
+shapes** — a `linux`-shape agent (tama) would need the same threaded into
+`kot.service.tmpl`'s `WorkingDirectory=` if it's ever needed there; not
+built, since nothing needs it yet.
+
 ## Not done yet
 
 - **A real local GLM smoke test.** No current GLM checkpoint fits in 48 GB

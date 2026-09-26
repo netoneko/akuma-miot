@@ -100,7 +100,11 @@ pub fn multi_edit_tool() -> Tool {
 
 pub fn ls_tool() -> Tool {
     Tool::new("LS")
-        .with_description("List one directory's immediate contents — names only, directories marked with a trailing /. Not recursive; Glob for that.")
+        .with_description(
+            "List one directory's immediate contents — names only, directories marked with a \
+             trailing /. Not recursive; Glob for that. Default path: this cat's working \
+             directory.",
+        )
         .with_schema(serde_json::json!({
             "type": "object",
             "properties": {

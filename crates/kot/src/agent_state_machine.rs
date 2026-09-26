@@ -1614,7 +1614,13 @@ fn local_tool(c: &Call, live: Arc<Live>) -> Option<Query> {
             }))
         }
         "LS" => {
-            let path = c.str("path").unwrap_or_default();
+            // `path` is schema-required, but a small model doesn't always
+            // honor that (found live against qwen3:4b, 2026-09-26: it
+            // omitted `path` outright, expecting the same cwd-default
+            // Glob/Grep already have, and got "No such file or directory"
+            // from an empty one). Same fallback as those two, for the same
+            // reason.
+            let path = c.str("path").filter(|s| !s.is_empty()).unwrap_or_else(|| ".".to_string());
             let ignore: Vec<String> = c.args.get("ignore").and_then(|v| v.as_array()).map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect()).unwrap_or_default();
             Some(Box::pin(async move {
                 let mut dir = match tokio::fs::read_dir(&path).await {

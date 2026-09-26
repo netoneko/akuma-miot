@@ -1475,6 +1475,20 @@ async fn ls_lists_a_directory_marking_dirs_and_honouring_ignore() {
     assert!(fed.contains("a.rs") && fed.contains("sub/") && !fed.contains("b.lock"), "{fed}");
 }
 
+/// `path` is schema-required, but found live against qwen3:4b (2026-09-26):
+/// it omitted `path` anyway, expecting the same cwd-default `Glob`/`Grep`
+/// already have. An empty path used to reach `read_dir("")`, which fails —
+/// this is the regression test for the fallback that fixed it.
+#[tokio::test]
+async fn ls_with_no_path_at_all_defaults_to_the_working_directory() {
+    let r = rig(vec![calls(vec![("LS", json!({}))]), text("ok")]).await;
+    r.wake("what's here");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("Cargo.toml"), "should list this crate's own directory, not fail: {fed}");
+}
+
 #[tokio::test]
 async fn glob_finds_by_name_pattern_recursively() {
     let dir = tempfile::tempdir().unwrap();
