@@ -25,16 +25,26 @@ struct Reply {
     delay_ms: u64,
     /// Sent apart, as `reasoning_content` — GLM's way.
     reasoning: Option<&'static str>,
+    /// A mocked provider's own cache-hit count
+    /// (`usage.prompt_tokens_details.cached_tokens`). `None`: the fake
+    /// server's response carries no `prompt_tokens_details` at all, same as
+    /// a provider that never reports one.
+    cached: Option<u32>,
 }
 
 fn calls(c: Vec<(&'static str, Value)>) -> Reply {
-    Reply { calls: c, text: None, delay_ms: 0, reasoning: None }
+    Reply { calls: c, text: None, delay_ms: 0, reasoning: None, cached: None }
 }
 fn text(t: &'static str) -> Reply {
-    Reply { calls: vec![], text: Some(t), delay_ms: 0, reasoning: None }
+    Reply { calls: vec![], text: Some(t), delay_ms: 0, reasoning: None, cached: None }
 }
 fn thinking(r: Reply, reasoning: &'static str) -> Reply {
     Reply { reasoning: Some(reasoning), ..r }
+}
+/// A scripted cache hit of `n` tokens on this reply — the mock standing in
+/// for a real provider's prompt cache.
+fn cache_hit(r: Reply, n: u32) -> Reply {
+    Reply { cached: Some(n), ..r }
 }
 fn say(body: &'static str) -> Reply {
     calls(vec![("SendMessage", json!({"body": body}))])
@@ -95,10 +105,14 @@ async fn serve(fake: Arc<Fake>) -> String {
                     if !tool_calls.is_empty() {
                         message["tool_calls"] = json!(tool_calls);
                     }
+                    let mut usage = json!({"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110});
+                    if let Some(c) = next.cached {
+                        usage["prompt_tokens_details"] = json!({"cached_tokens": c});
+                    }
                     axum::Json(json!({
                         "id": "x", "object": "chat.completion", "created": 0, "model": "fake",
                         "choices": [{"index": 0, "message": message, "finish_reason": if tool_calls.is_empty() { "stop" } else { "tool_calls" }}],
-                        "usage": {"prompt_tokens": 100, "completion_tokens": 10, "total_tokens": 110}
+                        "usage": usage
                     }))
                 }
             }),
@@ -125,6 +139,7 @@ struct Seen {
     /// Every live record handed to `Host::activity`, in order.
     activity: Vec<Activity>,
     transcript: Option<std::path::PathBuf>,
+    langfuse: Option<std::path::PathBuf>,
     reminder: Option<String>,
     /// `Host::stall_after` — the default (minutes) unless a test is about it.
     stall: Option<Duration>,
@@ -200,6 +215,9 @@ impl Host for TestHost {
     }
     fn activity(&self, a: &Activity) {
         self.0.lock().unwrap().activity.push(a.clone());
+    }
+    fn langfuse_log(&self) -> Option<std::path::PathBuf> {
+        self.0.lock().unwrap().langfuse.clone()
     }
     fn transcript(&self) -> Option<std::path::PathBuf> {
         self.0.lock().unwrap().transcript.clone()
@@ -900,6 +918,59 @@ async fn transcript_records_the_whole_session() {
     assert_eq!(n, 5 + 3, "start, turn, record appended");
 }
 
+/// A provider's own cache-hit count (`usage.prompt_tokens_details.
+/// cached_tokens`) reaches the transcript untouched — the actual number
+/// we'd check, against a real endpoint, to know whether the prefix cache
+/// hit on a given turn. `an_old_result_shrinks_to_a_stub` and
+/// `a_restart_alone_keeps_the_prefix_a_cache_could_still_hit` establish
+/// *when the bytes we send would let a cache hit*; this establishes that
+/// kot actually surfaces a real provider's answer when it does.
+#[tokio::test]
+async fn a_reported_cache_hit_reaches_the_transcript() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t/tama.transcript.jsonl");
+    let r = rig_seen(vec![say("a"), cache_hit(say("b"), 87)], Seen { transcript: Some(path.clone()), ..Seen::default() }).await;
+    r.wake("one");
+    r.until("first", |f, _| f.requests().len() == 1).await;
+    r.wake("two");
+    r.until("second", |f, _| f.requests().len() == 2).await;
+    r.finish().await;
+
+    let lines: Vec<Value> = std::fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let turns: Vec<&Value> = lines.iter().filter(|l| l["t"] == "turn").collect();
+    assert_eq!(turns[0]["cached_tokens"], 0, "no cache reported: {:?}", turns[0]);
+    assert_eq!(turns[1]["cached_tokens"], 87, "the mock's cache hit reached the transcript: {:?}", turns[1]);
+}
+
+/// The Langfuse-ingestion-shaped log (`kot::langfuse_log`) gets one
+/// `trace-create` per session, one `generation-create` per model turn with
+/// real usage numbers, and a `span-create` per tool call and per write —
+/// disk-only, nothing sent anywhere, but shaped so it wouldn't need
+/// reshaping to actually ingest later.
+#[tokio::test]
+async fn langfuse_log_records_a_trace_generation_and_spans() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t/tama.langfuse.jsonl");
+    let r = rig_seen(
+        vec![calls(vec![("Bash", json!({"command": "echo hi"}))]), say("done")],
+        Seen { langfuse: Some(path.clone()), ..Seen::default() },
+    )
+    .await;
+    r.wake("do a thing");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    r.finish().await;
+
+    let lines: Vec<Value> = std::fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let kinds: Vec<&str> = lines.iter().map(|l| l["type"].as_str().unwrap()).collect();
+    assert_eq!(kinds, vec!["trace-create", "generation-create", "span-create", "generation-create", "span-create"], "{kinds:?}");
+    let trace_id = lines[0]["body"]["id"].as_str().unwrap().to_string();
+    assert!(lines.iter().all(|l| l["type"] == "trace-create" || l["body"]["traceId"] == trace_id), "every event shares one trace: {lines:?}");
+    assert_eq!(lines[1]["body"]["usageDetails"]["total"], 110, "the mock's usage reached the log: {}", lines[1]);
+    assert_eq!(lines[2]["body"]["name"], "Bash");
+    assert_eq!(lines[2]["body"]["level"], "DEFAULT");
+    assert_eq!(lines[4]["body"]["name"], "SendMessage");
+}
+
 /// The host's reminder (a cat's open local tasks) rides every turn with a
 /// wake in it — and not a result-only turn, which is still mid-thought.
 #[tokio::test]
@@ -1169,7 +1240,10 @@ async fn a_restart_alone_keeps_the_prefix_a_cache_could_still_hit() {
     assert!(fake2.all(last - 1).contains(&payload), "still fresh the turn before aging: {}", fake2.all(last - 1));
     let aged = fake2.all(last);
     assert!(!aged.contains(&payload), "aged out right on schedule, restart or not: {aged}");
-    assert!(aged.contains("[#0 Bash]") && aged.contains("Inspect {\"id\": 0}"), "a stub in its place: {aged}");
+    // Its tool_log isn't persisted across a restart, so this stub reads
+    // differently from `an_old_result_shrinks_to_a_stub`'s same-life one —
+    // "no longer kept", not "Inspect {id}": it genuinely can't be read back.
+    assert!(aged.contains("[#0 Bash]") && aged.contains("no longer kept"), "a stub in its place: {aged}");
 }
 
 /// Result ids carry on across a restart, so a restored `[#0 …]` never
@@ -1226,16 +1300,77 @@ async fn bash_and_file_calls_run_one_at_a_time_in_order() {
     let f = dir.path().join("f");
     let slow_write = format!("sleep 0.4; echo written > {}", f.display());
     let r = rig(vec![
-        calls(vec![("Bash", json!({"command": slow_write})), ("ReadFile", json!({"path": f.display().to_string()}))]),
+        calls(vec![
+            ("Bash", json!({"command": slow_write})),
+            ("ReadFile", json!({"path": f.display().to_string()})),
+            ("Edit", json!({"path": f.display().to_string(), "old_string": "written", "new_string": "edited"})),
+        ]),
         text("ok"),
     ])
     .await;
-    r.wake("write then read");
-    r.until("both results", |f, _| f.requests().len() == 2).await;
+    r.wake("write, read, then edit");
+    r.until("all three results", |f, _| f.requests().len() == 2).await;
     let (fake, _) = r.finish().await;
     let fed = fake.fed(1);
-    assert!(fed.contains("[#0 Bash]") && fed.contains("[#1 ReadFile]"), "{fed}");
-    assert!(fed.contains("written"), "the read ran after the write finished: {fed}");
+    assert!(fed.contains("[#0 Bash]") && fed.contains("[#1 ReadFile]") && fed.contains("[#2 Edit]"), "{fed}");
+    assert!(fed.contains("written"), "the read ran after the write finished, before the edit: {fed}");
+    assert_eq!(std::fs::read_to_string(&f).unwrap().trim(), "edited", "Edit shares the lane too, and ran last, in order");
+}
+
+// ── Edit: exact-match find/replace (miot-llm/src/edit_tool.rs) ──────────
+
+#[tokio::test]
+async fn edit_replaces_one_exact_match() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f.rs");
+    std::fs::write(&f, "fn old_name() {}\n").unwrap();
+    let r = rig(vec![calls(vec![("Edit", json!({"path": f.display().to_string(), "old_string": "old_name", "new_string": "new_name"}))]), text("ok")]).await;
+    r.wake("rename it");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    r.finish().await;
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "fn new_name() {}\n");
+}
+
+#[tokio::test]
+async fn edit_refuses_when_old_string_is_not_found() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f.rs");
+    std::fs::write(&f, "unchanged\n").unwrap();
+    let r = rig(vec![calls(vec![("Edit", json!({"path": f.display().to_string(), "old_string": "missing", "new_string": "x"}))]), text("ok")]).await;
+    r.wake("rename it");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "unchanged\n", "nothing written");
+    assert!(fake.fed(1).contains("not found"), "{}", fake.fed(1));
+}
+
+/// The Anthropic-shaped rule this tool keeps: `old_string` must match
+/// exactly once unless `replace_all` says otherwise — a model that gets
+/// this refusal is expected to narrow the match and retry, the same as it
+/// would against `str_replace_based_edit_tool`.
+#[tokio::test]
+async fn edit_refuses_an_ambiguous_match_unless_replace_all() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("f.rs");
+    std::fs::write(&f, "x x x\n").unwrap();
+    // Each attempt's automatic follow-up replies in plain text rather than
+    // another call, so the chain stops there instead of racing past the
+    // request count each `until` below polls for.
+    let r = rig(vec![
+        calls(vec![("Edit", json!({"path": f.display().to_string(), "old_string": "x", "new_string": "y"}))]),
+        text("noted — retrying with replace_all"),
+        calls(vec![("Edit", json!({"path": f.display().to_string(), "old_string": "x", "new_string": "y", "replace_all": true}))]),
+        text("ok"),
+    ])
+    .await;
+    r.wake("first attempt, no replace_all");
+    r.until("first result", |f, _| f.requests().len() == 2).await;
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "x x x\n", "refused: ambiguous");
+    r.wake("now with replace_all");
+    r.until("second result", |f, _| f.requests().len() == 4).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(std::fs::read_to_string(&f).unwrap(), "y y y\n");
+    assert!(fake.fed(1).contains("matches 3 times"), "{}", fake.fed(1));
 }
 
 /// A call from a later response waits for one still running from an

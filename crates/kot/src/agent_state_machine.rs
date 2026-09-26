@@ -77,6 +77,7 @@
 //!   ([`Host::transcript`]).
 
 use crate::activity::{self, Activity, Finished, Flight};
+use crate::langfuse_log::LangfuseLog;
 use crate::ui::{self, ToolOut, TurnCost};
 use miot_llm::{Call, Llm, Speaker, Tool};
 use std::future::Future;
@@ -238,6 +239,13 @@ pub trait Host: Send + Sync + 'static {
     /// reasoning, text and calls, every result and record in full. `None`:
     /// no transcript.
     fn transcript(&self) -> Option<PathBuf> {
+        None
+    }
+    /// Where to append the Langfuse-ingestion-shaped log
+    /// ([`crate::langfuse_log`]) — a `trace-create`/`generation-create`/
+    /// `span-create` per line, disk-only, nothing sent anywhere. `None`:
+    /// no such log.
+    fn langfuse_log(&self) -> Option<PathBuf> {
         None
     }
     /// A line added to every turn that has a wake in it — a cat's open
@@ -481,6 +489,11 @@ struct AgentStateMachine<H: Host> {
     /// The next flight id.
     flights: u64,
     transcript: Option<Transcript>,
+    langfuse: Option<LangfuseLog>,
+    /// Stable per session — every `trace-create`/`generation-create`/
+    /// `span-create` for this session's [`Self::langfuse`] shares it.
+    /// Regenerated on every [`Inbound::Reset`], same as `session` itself.
+    trace_id: String,
     /// Since when we've been continuously idle (no query, no record in
     /// flight) — `None` while working. Drives the local-task nudge.
     idle_since: Option<Instant>,
@@ -506,6 +519,16 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
             host.show(ui::note(&format!("transcript: {}", t.path.display())));
         }
         t.write(serde_json::json!({"t": "start", "name": host.name(), "model": llm.label(), "window": window, "system": system}));
+    }
+    let mut langfuse = host.langfuse_log().map(LangfuseLog::open);
+    let trace_id = format!("trace-{}-{}", host.name(), activity::unix_ms());
+    if let Some(lf) = &mut langfuse {
+        if lf.is_open() {
+            host.show(ui::note(&format!("langfuse log: {}", trace_id)));
+            lf.trace_create(&trace_id, &format!("{} session", host.name()), llm.label(), window);
+        } else {
+            host.show(ui::note("langfuse log: can't open — not writing one"));
+        }
     }
     let act = Activity {
         name: host.name().to_string(),
@@ -541,6 +564,8 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         act,
         flights: 0,
         transcript,
+        langfuse,
+        trace_id,
         live: std::collections::HashMap::new(),
         lane: Arc::new(tokio::sync::Mutex::new(())),
         notices: Vec::new(),
@@ -730,6 +755,10 @@ impl<H: Host> AgentStateMachine<H> {
                 self.host.show(ui::note(&format!("new session — {why}")));
                 self.log(serde_json::json!({"t": "reset", "why": why}));
                 self.session += 1;
+                self.trace_id = format!("trace-{}-{}", self.host.name(), activity::unix_ms());
+                if let Some(lf) = &mut self.langfuse {
+                    lf.trace_create(&self.trace_id, &format!("{} session", self.host.name()), self.llm.label(), self.window);
+                }
                 self.history.clear();
                 self.fresh.clear();
                 self.restart_note = None;
@@ -755,13 +784,21 @@ impl<H: Host> AgentStateMachine<H> {
             Back::RecordDone(flight, out) => {
                 self.records = self.records.saturating_sub(1);
                 let (ok, meta) = out.as_ref().map(|o| (o.ok, o.meta.join(" · "))).unwrap_or((true, String::new()));
-                let (tool, arg) = self.land(Some(flight), "", "", ok, meta.clone());
-                self.log(serde_json::json!({"t": "record", "tool": tool, "arg": out.as_ref().map(|o| o.arg.clone()).unwrap_or(arg), "ok": ok, "meta": meta}));
+                let (tool, arg, ms) = self.land(Some(flight), "", "", ok, meta.clone());
+                let arg = out.as_ref().map(|o| o.arg.clone()).unwrap_or(arg);
+                self.log(serde_json::json!({"t": "record", "tool": tool, "arg": arg, "ok": ok, "meta": meta}));
+                if let Some(lf) = &mut self.langfuse {
+                    lf.span_create(&format!("span-{}-{flight}", self.session), &self.trace_id, &tool, ms, &arg, &meta, ok);
+                }
             }
             Back::Result(name, out, session, flight) => {
                 self.queries = self.queries.saturating_sub(1);
                 self.host.show(ui::tool(self.host.name(), &name, &out));
-                self.land(flight, &name, &out.arg, out.ok, out.meta.join(" · "));
+                let (_, _, ms) = self.land(flight, &name, &out.arg, out.ok, out.meta.join(" · "));
+                if let Some(lf) = &mut self.langfuse {
+                    let span_flight = flight.map(|f| f.to_string()).unwrap_or_else(|| "instant".into());
+                    lf.span_create(&format!("span-{}-{span_flight}", self.session), &self.trace_id, &name, ms, &out.arg, &out.text(), out.ok);
+                }
                 if session != self.session {
                     self.host.show(ui::note(&format!("{name}'s result is from before the session reset — not fed back")));
                     self.log(serde_json::json!({"t": "result", "id": null, "tool": name, "ok": out.ok, "stale": true, "text": out.text()}));
@@ -886,8 +923,8 @@ impl<H: Host> AgentStateMachine<H> {
 
     /// A call came back: off the running list (if it was ever on it), into
     /// the tally and the recent list. The waiting phase ends with the last
-    /// one. Returns the call's tool and argument as they were dispatched.
-    fn land(&mut self, flight: Option<u64>, tool: &str, arg: &str, ok: bool, meta: String) -> (String, String) {
+    /// one. Returns the call's tool, argument and how long it ran.
+    fn land(&mut self, flight: Option<u64>, tool: &str, arg: &str, ok: bool, meta: String) -> (String, String, u64) {
         let now = activity::unix_ms();
         if let Some(id) = flight {
             self.live.remove(&id);
@@ -910,7 +947,7 @@ impl<H: Host> AgentStateMachine<H> {
             self.phase("idle");
         }
         self.publish();
-        (tool, arg)
+        (tool, arg, ms)
     }
 
     /// Enter `phase` — its clock restarts only if it's actually new.
@@ -1051,6 +1088,10 @@ impl<H: Host> AgentStateMachine<H> {
             "cached_tokens": turn.cached_tokens,
             "ms": turn.ms,
         }));
+        if let Some(lf) = &mut self.langfuse {
+            let gen_id = format!("gen-{}-{}", self.session, self.turns_fed);
+            lf.generation_create(&gen_id, &self.trace_id, self.llm.label(), turn.ms, &prompt, &turn.text, turn.prompt_tokens, turn.cached_tokens, turn.tokens, turn.total_tokens);
+        }
         let messages = turn.calls.iter().filter(|c| c.name == "SendMessage").count();
         let cost = TurnCost {
             prompt: turn.prompt_tokens,

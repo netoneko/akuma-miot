@@ -16,6 +16,7 @@ pub mod client;
 pub mod common;
 pub mod local_tasks;
 pub mod agent_state_machine;
+pub mod langfuse_log;
 pub mod node;
 pub mod tls;
 pub mod ui;
