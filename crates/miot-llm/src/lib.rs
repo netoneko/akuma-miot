@@ -21,7 +21,7 @@
 
 use genai::adapter::AdapterKind;
 pub use genai::chat::Tool;
-use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ReasoningEffort};
+use genai::chat::{ChatMessage, ChatOptions, ChatRequest, ContentPart, MessageContent, ReasoningEffort, ToolCall, ToolResponse};
 use genai::resolver::{AuthData, Endpoint, ServiceTargetResolver};
 use genai::{Client, ModelIden, ServiceTarget};
 use std::time::Instant;
@@ -288,11 +288,7 @@ impl Llm {
     /// carry the question between turns the way the agent loop does.
     pub async fn converse(&self, system: &str, history: &[(Speaker, String)], tools: Vec<Tool>) -> Result<Turn, String> {
         let started = Instant::now();
-        let mut messages = vec![ChatMessage::system(system)];
-        messages.extend(history.iter().map(|(who, text)| match who {
-            Speaker::User => ChatMessage::user(text.clone()),
-            Speaker::Assistant => ChatMessage::assistant(text.clone()),
-        }));
+        let messages = to_messages(system, history);
         let req = ChatRequest::new(messages).with_tools(tools);
         let mut opts = ChatOptions::default().with_normalize_reasoning_content(true);
         if let Some(n) = self.max_tokens {
@@ -327,6 +323,76 @@ impl Llm {
 pub enum Speaker {
     User,
     Assistant,
+    /// The model's own tool calls, as [`called`] encodes them. Sent as a
+    /// real assistant `tool_calls` message — merged with the assistant text
+    /// right before it, if any — each answered by a `tool` message carrying
+    /// its ack. Their results still come back later as a user message, the
+    /// way they always have. Added 2026-09-27: with its calls left out of
+    /// history, a model only ever sees itself write "Reading X, nya:" and
+    /// then the results arrive, and learns that saying it is enough —
+    /// meow's 55 promise-only turns in 13½ hours, reproduced on a local
+    /// glm-4.7-flash (`docs/AGENT_STATE_MACHINE.md`, "Its own calls, in its
+    /// history").
+    Called,
+}
+
+/// One call as [`Speaker::Called`] keeps it.
+#[derive(Debug, Clone)]
+pub struct CalledRow {
+    pub name: String,
+    pub args: serde_json::Value,
+    /// What the `tool` message answering it says.
+    pub ack: String,
+}
+
+/// A [`Speaker::Called`] entry for these calls.
+pub fn called(rows: &[CalledRow]) -> String {
+    serde_json::Value::Array(rows.iter().map(|r| serde_json::json!({"name": r.name, "args": r.args, "ack": r.ack})).collect()).to_string()
+}
+
+/// [`called`] read back; `None` if it isn't one.
+pub fn called_rows(text: &str) -> Option<Vec<CalledRow>> {
+    let v: Vec<serde_json::Value> = serde_json::from_str(text).ok()?;
+    v.into_iter()
+        .map(|r| Some(CalledRow { name: r.get("name")?.as_str()?.to_string(), args: r.get("args").cloned().unwrap_or_default(), ack: r.get("ack").and_then(|a| a.as_str()).unwrap_or_default().to_string() }))
+        .collect()
+}
+
+/// `history` as the messages a provider is sent.
+fn to_messages(system: &str, history: &[(Speaker, String)]) -> Vec<ChatMessage> {
+    let mut messages = vec![ChatMessage::system(system)];
+    for (i, (who, text)) in history.iter().enumerate() {
+        match who {
+            Speaker::User => messages.push(ChatMessage::user(text.clone())),
+            Speaker::Assistant => messages.push(ChatMessage::assistant(text.clone())),
+            Speaker::Called => {
+                let Some(rows) = called_rows(text) else { continue };
+                if rows.is_empty() {
+                    continue;
+                }
+                // Ids only have to pair a call with its ack inside this
+                // request; the history index keeps them unique.
+                let calls: Vec<ToolCall> = rows
+                    .iter()
+                    .enumerate()
+                    .map(|(j, r)| ToolCall { call_id: format!("call_{i}_{j}"), fn_name: r.name.clone(), fn_arguments: r.args.clone(), thought_signatures: None })
+                    .collect();
+                let said = match (i.checked_sub(1).map(|p| &history[p]), messages.last()) {
+                    (Some((Speaker::Assistant, _)), Some(m)) if m.role == genai::chat::ChatRole::Assistant => {
+                        messages.pop().and_then(|m| m.content.first_text().map(str::to_string))
+                    }
+                    _ => None,
+                };
+                let mut parts: Vec<ContentPart> = said.into_iter().map(ContentPart::Text).collect();
+                parts.extend(calls.iter().cloned().map(ContentPart::ToolCall));
+                messages.push(ChatMessage::assistant(MessageContent::from_parts(parts)));
+                for (c, r) in calls.iter().zip(&rows) {
+                    messages.push(ChatMessage::from(ToolResponse::new(c.call_id.clone(), r.ack.clone())));
+                }
+            }
+        }
+    }
+    messages
 }
 
 /// The tool a cat uses to talk.

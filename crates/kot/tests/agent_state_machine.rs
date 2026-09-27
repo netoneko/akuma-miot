@@ -6,7 +6,7 @@
 //! must be folded into the next one, and nothing may loop forever.
 
 use kot::activity::Activity;
-use kot::agent_state_machine::{self, Dispatch, Host, Inbound, CHECK_IN, MAX_FOLLOWUPS};
+use kot::agent_state_machine::{self, Dispatch, Host, Inbound, CHECK_IN, MAX_CHECK_INS, MAX_FOLLOWUPS};
 use kot::ui::ToolOut;
 use miot_llm::{Call, Llm, Tool};
 use serde_json::{json, Value};
@@ -714,17 +714,21 @@ async fn an_ignored_check_in_with_open_local_tasks_gets_nudged() {
 #[tokio::test]
 async fn a_nudge_that_gets_only_a_promise_is_quoted_back_next_time() {
     let r = rig_seen(
-        vec![calls(vec![("Bash", json!({"command": "echo x"}))]), say("done"), text(""), text("Firing it now, nya:"), say("actually did it")],
+        // The promise gets a check-in of its own first
+        // (`a_nudge_answered_with_words_gets_a_check_in`), answered here with
+        // nothing, so the second nudge is what follows.
+        vec![calls(vec![("Bash", json!({"command": "echo x"}))]), say("done"), text(""), text("Firing it now, nya:"), text(""), say("actually did it")],
         Seen { check: true, local_nag: Some(Duration::from_millis(80)), reminder: Some("(open tasks: L2)".into()), ..Seen::default() },
     )
     .await;
     r.wake("build the kernel");
     r.until("check-in answered with nothing", |_, s| s.shown.iter().any(|l| l.contains("check-in: nothing more to do"))).await;
-    r.until("second nudge landed", |f, _| f.requests().len() == 5).await;
+    r.until("second nudge landed", |f, _| f.requests().len() == 6).await;
     let (fake, seen) = r.finish().await;
     let first_nudge = fake.fed(3);
     assert!(!first_nudge.contains("Last time you said"), "nothing to quote yet, first time: {first_nudge}");
-    let second_nudge = fake.fed(4);
+    assert!(fake.fed(4).contains(CHECK_IN), "the promise is followed by a check-in: {}", fake.fed(4));
+    let second_nudge = fake.fed(5);
     assert!(
         second_nudge.contains("Last time you said this, then called no tool") && second_nudge.contains("Firing it now, nya:"),
         "quotes the unfulfilled promise back: {second_nudge}"
@@ -754,7 +758,79 @@ async fn a_plain_text_promise_after_results_gets_a_check_in() {
     let (fake, _) = r.finish().await;
     assert_eq!(fake.requests().len(), 5);
     assert!(fake.fed(2).contains(CHECK_IN), "the plain-text promise is followed by a check-in: {}", fake.fed(2));
+    assert!(fake.all(2).contains("Reading it, nya:"), "with its own words right above: {}", fake.all(2));
     assert!(fake.fed(3).contains("$ echo reading"), "the promised read ran and came back: {}", fake.fed(3));
+    assert!(fake.fed(4).contains(CHECK_IN), "a message-only turn gets the plain check-in: {}", fake.fed(4));
+}
+
+/// meow, 2026-09-27 08:46: a check-in answered with only more words ("Reading
+/// the write fn NOW, nya:") was taken as "done" and dropped, and it sat
+/// until the 150 s nudge. Words and no call now get another check-in, up to
+/// `MAX_CHECK_INS` in a row, and the words stay in the conversation.
+#[tokio::test]
+async fn a_check_in_answered_with_words_gets_another() {
+    let r = rig_with(
+        vec![
+            calls(vec![("Bash", json!({"command": "echo recon"}))]),
+            text("Reading the write fn, nya:"),
+            text("Reading the write fn NOW, nya:"),
+            calls(vec![("Bash", json!({"command": "echo write-fn"}))]),
+            say("read it"),
+            text(""),
+        ],
+        true,
+    )
+    .await;
+    r.wake("find why write returns 0");
+    r.until("final check-in answered", |_, s| s.shown.iter().any(|l| l.contains("check-in: nothing more to do"))).await;
+    let (fake, seen) = r.finish().await;
+    assert_eq!(fake.requests().len(), 6);
+    assert!(fake.fed(3).contains(CHECK_IN), "the second promise got a check-in too: {}", fake.fed(3));
+    assert!(fake.all(3).contains("Reading the write fn NOW, nya:"), "its words were kept: {}", fake.all(3));
+    assert!(fake.fed(4).contains("$ echo write-fn"), "and the third turn did the work: {}", fake.fed(4));
+    let seen = seen.lock().unwrap();
+    assert!(seen.spoke.iter().all(|s| !s.contains("NOW")), "words in answer to a check-in are never sent: {:?}", seen.spoke);
+}
+
+/// A model that only ever promises still stops being asked: `MAX_CHECK_INS`
+/// check-ins in a row, then quiet.
+#[tokio::test]
+async fn check_ins_answered_with_words_are_bounded() {
+    let r = rig_with(vec![calls(vec![("Bash", json!({"command": "echo recon"}))])], true).await;
+    *r.fake.forever.lock().unwrap() = Some(text("Firing it NOW, nya:"));
+    r.wake("go");
+    r.until("all check-ins spent", |f, _| f.requests().len() >= 2 + MAX_CHECK_INS as usize).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(fake.requests().len(), 2 + MAX_CHECK_INS as usize, "wake, results, then exactly MAX_CHECK_INS check-ins");
+}
+
+/// meow, 2026-09-27 02:02–02:08: three nudges answered with "Firing it NOW,
+/// nya:" and no call spent the nudge budget, and it sat idle 6h35m. A nudge
+/// answered with bare words now gets a check-in right away instead of
+/// waiting out another interval — and a call there resets the budget.
+#[tokio::test]
+async fn a_nudge_answered_with_words_gets_a_check_in() {
+    let r = rig_seen(
+        vec![
+            calls(vec![("Bash", json!({"command": "echo x"}))]),
+            say("done"),
+            text(""),
+            text("Firing it NOW, nya:"),
+            calls(vec![("Bash", json!({"command": "echo fired"}))]),
+            say("fired"),
+            text(""),
+        ],
+        Seen { check: true, local_nag: Some(Duration::from_millis(80)), reminder: Some("(open tasks: L35)".into()), ..Seen::default() },
+    )
+    .await;
+    r.wake("play the wav");
+    r.until("the nudge's promise got done", |_, s| s.sent.len() == 2).await;
+    let (fake, seen) = r.finish().await;
+    assert!(fake.fed(3).contains("open local tasks"), "a nudge: {}", fake.fed(3));
+    assert!(fake.fed(4).contains(CHECK_IN), "answered with words, so a check-in follows at once: {}", fake.fed(4));
+    assert!(fake.fed(5).contains("$ echo fired"), "{}", fake.fed(5));
+    assert_eq!(seen.lock().unwrap().sent, vec!["done", "fired"]);
 }
 
 /// A model call that fails is tried again, not dropped with its wake.
@@ -1655,4 +1731,67 @@ async fn a_later_turns_call_waits_for_the_one_still_running() {
     let all: String = (0..fake.requests().len()).map(|i| fake.fed(i)).collect::<Vec<_>>().join("\n====\n");
     assert!(all.contains("queued behind the calls before it"), "Running shows it waiting: {all}");
     assert!(all.contains("first\nsecond"), "it ran after the slow one, not beside it: {all}");
+}
+
+/// The model's own calls are in its history as real `tool_calls`, with the
+/// text it wrote beside them in the same assistant message and a `tool`
+/// ack for each. Before 2026-09-27 only the text was kept, so all a model
+/// ever saw of itself was "Reading X, nya:" followed by results — and a
+/// local glm-4.7-flash, shown meow's real history that way, answered with
+/// just the words and no call every time (`docs/AGENT_STATE_MACHINE.md`,
+/// "Its own calls, in its history").
+#[tokio::test]
+async fn own_calls_are_in_history_as_tool_calls() {
+    let r = rig(vec![Reply { text: Some("Reading it, nya:"), ..calls(vec![("Bash", json!({"command": "echo seen"}))]) }, say("read it")]).await;
+    r.wake("read it");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, _) = r.finish().await;
+    let msgs = fake.requests()[1]["messages"].as_array().unwrap().clone();
+    let at = msgs.iter().position(|m| m["role"] == "assistant").expect("an assistant message");
+    let a = &msgs[at];
+    assert_eq!(a["content"], "Reading it, nya:", "the text is in the same message as the call: {a}");
+    let call = &a["tool_calls"][0];
+    assert_eq!(call["function"]["name"], "Bash", "{a}");
+    assert!(call["function"]["arguments"].as_str().unwrap().contains("echo seen"), "{a}");
+    let ack = &msgs[at + 1];
+    assert_eq!(ack["role"], "tool", "{ack}");
+    assert_eq!(ack["tool_call_id"], call["id"], "{ack}");
+    assert_eq!(ack["content"], agent_state_machine::CALLED_ACK);
+    assert!(msgs[at + 2]["content"].as_str().unwrap().contains("[#0 Bash]"), "results still come back as a user message after it");
+    assert_eq!(msgs.iter().filter(|m| m["role"] == "assistant").count(), 1, "text and call are one message, not two");
+}
+
+/// A call's long string argument is cut in history — the whole body of a
+/// `WriteFile` mustn't ride along in every turn after it.
+#[tokio::test]
+async fn a_long_call_argument_is_cut_in_history() {
+    let long: &'static str = Box::leak("y".repeat(5000).into_boxed_str());
+    let r = rig(vec![say(long), say("again")]).await;
+    r.wake("one");
+    r.until("first", |_, s| s.sent.len() == 1).await;
+    r.wake("two");
+    r.until("second", |_, s| s.sent.len() == 2).await;
+    let (fake, seen) = r.finish().await;
+    assert_eq!(seen.lock().unwrap().sent[0].len(), 5000, "the call itself got the whole argument");
+    let args = fake.requests()[1]["messages"].as_array().unwrap().iter().find_map(|m| m["tool_calls"][0]["function"]["arguments"].as_str().map(str::to_string)).unwrap();
+    assert!(args.len() < 1000 && args.contains("5000 chars in all"), "{args}");
+}
+
+/// Its calls survive a restart with the rest of the conversation.
+#[tokio::test]
+async fn own_calls_survive_a_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("tama.history.7.json");
+    let r = rig_seen(vec![calls(vec![("Bash", json!({"command": "echo first-life"}))]), text("ok")], with_history(&path)).await;
+    r.wake("go");
+    r.until("result", |f, _| f.requests().len() == 2).await;
+    r.finish().await;
+    assert!(std::fs::read_to_string(&path).unwrap().contains("\"called\""), "saved as its own kind of row");
+
+    let r = rig_seen(vec![text("ok")], with_history(&path)).await;
+    r.wake("again");
+    r.until("turn", |f, _| f.requests().len() == 1).await;
+    let (fake, _) = r.finish().await;
+    let msgs = fake.requests()[0]["messages"].as_array().unwrap().clone();
+    assert!(msgs.iter().any(|m| m["tool_calls"][0]["function"]["arguments"].as_str().is_some_and(|a| a.contains("first-life"))), "{msgs:?}");
 }

@@ -62,22 +62,25 @@ scripted fake model server, 30 tests.
        │                      │                 │  no call at all → Host::spoke
        │                      └────────┬────────┘
        │                               │
-       │     fed results, wrote something (calls, or plain text),
-       │     started no query? (and the host wants it: a cat yes,
-       │     kot chat no)
+       │     started no query, and was answering: results (wrote
+       │     anything), a nudge (wrote only text), or a check-in (wrote
+       │     only text)? fewer than 3 check-ins since the last query or
+       │     wake? (and the host wants it: a cat yes, kot chat no)
        │                 no ┌──────────┴──────────┐ yes → armed
        │                    │                     ▼
        │                    │       once no query is in flight and nothing
        │                    │       is queued, and followups < 8:
        │                    │                ┌──────────────┐
        │                    │                │   CHECK-IN   │  followups += 1
-       │                    │                │ "nothing is  │  fed CHECK_IN alone
+       │                    │                │ "nothing is  │  fed CHECK_IN
        │                    │                │  running..." │
        │                    │                └──────┬───────┘
-       │                    │     calls nothing     │     calls a tool
-       │                    │   (erased from        │   → ACTING, as any turn
-       │                    │    history) ──┐       │     (a check-in never
-       │                    │               │       │      arms another)
+       │                    │                       │
+       │                    │   calls nothing,      │  only text → kept in
+       │                    │   writes nothing      │  history, shown, never
+       │                    │   (erased from        │  sent; arms the next
+       │                    │    history) ──┐       │  (up to 3), else as any
+       │                    │               │       │  turn → ACTING
        └────────────────────┴───────────────┘       ▼
 
   Reset (checkpoint moved, /clear), at any point:
@@ -301,6 +304,84 @@ What it doesn't cover:
   `nudges_into_a_dead_provider_dont_spend_the_budget`. **Still not
   covered:** a wake that isn't a nudge (an operator's message) is still gone
   once all five attempts fail — it isn't queued again.
+
+- ~~One check-in per promise, and a nudge answered with words waits out
+  another interval.~~ **Covered (2026-09-27),** from meow's Langfuse log
+  (19:12 09-26 → 08:46 09-27, 148 turns). Every one of its 55 no-call turns
+  was a one-line promise ("Reading the write fn, nya:", 19 output tokens
+  median against 162 for a turn with a call); nothing any phrase list
+  could have caught better, since all 148 turns end in `nya:`. The misses
+  were the loop's: a check-in answered with more words was taken as "done"
+  and dropped (08:46); nudges answered with words got nothing until the
+  next 150 s interval, 18 of 48 of them; and three of those in a row
+  (02:02–02:08) spent the nudge budget and it sat idle **6h35m**. Now a
+  check-in answered with only words is kept in history and gets another,
+  up to `MAX_CHECK_INS` (3) since the last query or wake; a nudge answered
+  with only words gets one at once. A model that only ever promises costs at most 3 nudges × 4 turns before
+  it's left alone. The quote-back at the next nudge made no measurable
+  difference (a tool call after 10 of 16 quoted nudges, 20 of 32 plain);
+  it stays, harmless. `RULES` also now say not to announce a call and stop,
+  and not to redirect output to a file just to read it back (after such a
+  result meow acted 9 of 21 times, against 62% overall). Tests:
+  `a_check_in_answered_with_words_gets_another`,
+  `check_ins_answered_with_words_are_bounded`,
+  `a_nudge_answered_with_words_gets_a_check_in`. These are the backstop,
+  not the fix: measured on a local model, a check-in rescues a stalled
+  turn about one time in eight, whatever it says. The fix is the next
+  section.
+
+## Its own calls, in its history (2026-09-27)
+
+Until now the model's history kept only the *text* of its turns — its
+calls were left out on purpose, after qwen3-4b copied `[called: Bash{…}]`
+text into its replies (2026-09-24). So all meow ever saw of its own past
+was:
+
+```
+assistant: Reading the dispatch, nya:
+user:      Results of tools you called: [#12 Bash] …
+assistant: Reading the wiring, nya:
+user:      Results of tools you called: [#13 ReadFile] …
+```
+
+— it says "Reading X", and results arrive. Nothing in that shows a call
+being made, and a model continuing the pattern writes the line and stops.
+
+Measured on a local `glm-4.7-flash` (Ollama, `think: false`), rebuilding
+meow's real context — its system prompt and its last 12 turns from the
+transcript — at 8 real points where it stalled after results:
+
+| history shown | follow-up | turns with a call |
+|---|---|---|
+| text only (as kot sent it) | — | **0 / 12** |
+| text + its calls as structured `tool_calls` | — | **15 / 16** |
+| text only, after the stall | `CHECK_IN` | 2 / 16 |
+| text only, after the stall | a "you wrote that and stopped — make the call" wording | 2 / 16 |
+
+Rewording the check-in did nothing; the history did it. Now every turn
+with calls is followed in history by a `Speaker::Called` entry
+(`miot_llm::called`): sent as a real assistant `tool_calls` message —
+merged with that turn's text, if any — and one `tool` message per call
+saying `CALLED_ACK` ("started — anything it returns comes back in a
+later message"). Results still come back as a user message, later, by id,
+exactly as before. These are structured calls, not text, so there's
+nothing for a model to type back the way qwen3-4b did. A string argument
+longer than 400 characters is cut in history (a `WriteFile` body mustn't
+ride along forever); the compaction summary is asked for without them,
+since it's asked with no tools. Saved as `"called"` rows, so they survive
+a restart. Verified end to end with `kot chat` against the same local
+model: two chained `Bash` calls and an answer, the second and third
+requests carrying the first's `tool_calls`/`tool` messages.
+
+Cost: each call adds its (cut) arguments to every later turn until the
+next compaction — for meow, roughly 100 tokens a call. Unlike results,
+calls don't age into stubs yet.
+
+Not verified: `glm-5.3-flash` on z.ai itself (meow's real model; this ran
+on its small local sibling), and whether qwen3-4b behaves with structured
+calls in history (only its text-copying was ever seen). Tests:
+`own_calls_are_in_history_as_tool_calls`,
+`a_long_call_argument_is_cut_in_history`, `own_calls_survive_a_restart`.
 
 ## Also seen in the same log, not fixed here
 

@@ -49,7 +49,10 @@
 //!   Calling nothing there is the normal answer, and it leaves no trace in
 //!   history. Found live 2026-09-24: meow, asked to build the kernel,
 //!   messaged root "next I'm checking whether a plain `cargo build`
-//!   works", called no tool, and was never woken again.
+//!   works", called no tool, and was never woken again. A check-in answered
+//!   with only more words gets another,
+//!   up to [`MAX_CHECK_INS`], and so does a nudge answered with only words
+//!   (2026-09-27, meow's Langfuse log).
 //! - **Local-task nudge.** An ignored check-in still leaves the loop with no
 //!   further wake queued — found live again 2026-09-25, same meow, a later
 //!   kernel-build task this time. If [`Host::reminder`] says there's an open
@@ -169,6 +172,23 @@ pub const CHECK_IN: &str = "(Check-in: none of your tools are running and nothin
 coming back to you. If you said you'd do something next, call its tool now — a message \
 saying you will doesn't do it. If you're finished, or waiting on someone, call nothing and \
 write nothing.)";
+/// What the `tool` message answering each of the model's own calls says in
+/// its history ([`Speaker::Called`]): the call went out, and its result —
+/// if it has one — arrives the way results always do, later, by id.
+pub const CALLED_ACK: &str = "(started — anything it returns comes back in a later message)";
+/// A string argument longer than this is cut, in history only, to its start
+/// and a note of its length — a `WriteFile`'s whole body must not ride along
+/// in every turn after it.
+const CALLED_ARG_CHARS: usize = 400;
+/// Check-ins in a row answered with only more words before the loop stops
+/// asking and leaves it to the local-task nudge. Found in meow's Langfuse
+/// log, 2026-09-27: every one of its 55 no-call turns in 13½ hours was a
+/// one-line promise ("Firing it NOW, nya:", 19 output tokens median against
+/// 162 for a turn that called something), and one check-in was all it got —
+/// the second promise sat until the 150 s nudge. Three promise-only replies
+/// to three nudges then spent the nudge budget and it sat idle 6h35m. Reset
+/// by any query started and by any real wake, so each nudge gets its own.
+pub const MAX_CHECK_INS: u32 = 3;
 
 pub type Query = Pin<Box<dyn Future<Output = ToolOut> + Send>>;
 /// `None`: the host already showed it its own way.
@@ -307,7 +327,11 @@ they arrive; you don't have to reply in the same response you call a tool.\n\
 - Writes (SendMessage, TaskUpdate, Artifact, ...) are final: they just happen, and \
 nothing comes back from them.\n\
 - Your work stops when you stop calling tools. If you say you'll do something next, call \
-its tool in that same response — a message alone doesn't start anything.\n\
+its tool in that same response — a message alone doesn't start anything. Don't write a line \
+announcing a call (\"Reading the file:\") and end there: the call is the announcement, and a \
+response with no call in it does nothing.\n\
+- Don't send a command's output to a file just to read it back next turn — a long result \
+already comes back as its start and end, and Inspect reads the rest.\n\
 - Bash, ReadFile, WriteFile, Edit, MultiEdit, LS, Glob and Grep run one at a time, in the \
 order you call them — across responses too: one waits for the one before it to finish, so a \
 later edit never races an earlier script. Running shows a waiting one as queued. Put a long \
@@ -536,6 +560,9 @@ struct AgentStateMachine<H: Host> {
     /// The last turn worked on results and started nothing: give the model
     /// a [`CHECK_IN`] before going idle.
     check_armed: bool,
+    /// Check-ins sent since a query last started or a real wake arrived —
+    /// bounded by [`MAX_CHECK_INS`].
+    check_ins: u32,
     /// Bumped by every [`Inbound::Reset`]. Anything started in an older
     /// session — a turn still thinking, a query still running, a wake
     /// queued ahead of the reset — is dropped rather than carried into
@@ -642,6 +669,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         followups: 0,
         held: Vec::new(),
         check_armed: false,
+        check_ins: 0,
         session: 0,
         pending: std::collections::VecDeque::new(),
         act,
@@ -854,6 +882,7 @@ impl<H: Host> AgentStateMachine<H> {
                 self.held.clear();
                 self.notices.clear();
                 self.check_armed = false;
+                self.check_ins = 0;
                 self.local_nudges = 0;
                 self.awaiting_nudge_reply = false;
                 self.last_unfulfilled_promise = None;
@@ -1116,6 +1145,12 @@ impl<H: Host> AgentStateMachine<H> {
         // own comment. A follow-up turn (`wakes` empty) is never itself the
         // nudge's reply, so this only fires on an actual wake.
         let awaiting_nudge_reply = !wakes.is_empty() && std::mem::take(&mut self.awaiting_nudge_reply);
+        if !wakes.is_empty() {
+            self.check_ins = 0;
+        }
+        if check {
+            self.check_ins += 1;
+        }
 
         self.turns_fed += 1;
         let mut msg: Vec<String> = wakes.iter().map(|w| w.0.clone()).collect();
@@ -1260,11 +1295,14 @@ impl<H: Host> AgentStateMachine<H> {
         // qwen3-4b started typing `[called: SendMessage{...}]` as its reply
         // instead of calling the tool. What it asked for is recoverable
         // anyway: every result comes back labelled with its tool and
-        // argument (`[#3 Bash] $ uname -sm`). A tool-only turn leaves no
-        // assistant message, and the results follow as the next user one.
+        // argument (`[#3 Bash] $ uname -sm`). Since 2026-09-27 they *are*
+        // kept — as real structured `tool_calls` (`Speaker::Called`, pushed
+        // after dispatch below), never as text a model could copy.
         // A check-in answered with nothing: the normal "I'm done". Leave no
-        // trace, so a long session isn't a stack of check-ins.
-        if check && turn.calls.is_empty() {
+        // trace, so a long session isn't a stack of check-ins. Answered with
+        // words and no call is something else — another promise — and is
+        // kept, below, so the next check-in can ask it to finish that.
+        if check && turn.calls.is_empty() && turn.text.trim().is_empty() {
             self.history.pop();
             self.host.show(ui::note("check-in: nothing more to do"));
             self.host.after_turn(&cost);
@@ -1331,9 +1369,14 @@ impl<H: Host> AgentStateMachine<H> {
                 _ => self.dispatch(c),
             }
         }
+        // Its calls, as calls — see `Speaker::Called` for why they're here
+        // at all. A compaction just replaced the history they'd go in.
+        if !turn.calls.is_empty() && !compacted {
+            let rows: Vec<miot_llm::CalledRow> = turn.calls.iter().map(|c| miot_llm::CalledRow { name: c.name.clone(), args: short_args(&c.args), ack: CALLED_ACK.to_string() }).collect();
+            self.history.push((Speaker::Called, miot_llm::called(&rows)));
+        }
         // Worked on results, then only wrote things (a message, a task
-        // update): the shape of "I'll do X next" with no X started. A
-        // check-in never arms another.
+        // update): the shape of "I'll do X next" with no X started.
         let started_nothing = self.queries == queries_before;
         if !started_nothing {
             // The holder acted — same rule a chain task's nudge budget
@@ -1341,6 +1384,10 @@ impl<H: Host> AgentStateMachine<H> {
             // acts"). Otherwise three real turns of work would still leave
             // a nag due the moment it next goes idle.
             self.local_nudges = 0;
+            self.check_ins = 0;
+            // Kept, a promise a check-in then got done would be quoted back
+            // at the next nudge as if it never happened.
+            self.last_unfulfilled_promise = None;
         }
         // Plain text counts as writing too: "Reading term.rs, nya:" with no
         // call is the same promise as a `SendMessage` saying it. Found live
@@ -1348,7 +1395,16 @@ impl<H: Host> AgentStateMachine<H> {
         // 50-minute session, and with no check-in armed each one sat idle
         // until the 150 s local-task nudge — 25 minutes, half the session.
         let wrote = !turn.calls.is_empty() || !turn.text.trim().is_empty();
-        self.check_armed = !check && !results.is_empty() && wrote && started_nothing && self.host.check_before_idle();
+        let only_text = turn.calls.is_empty() && !turn.text.trim().is_empty();
+        // What it was answering decides whether it gets a check-in: results
+        // (it was mid-work, so words or a message alone); a nudge answered
+        // with bare words (it was told to do the next step — meow answered
+        // 18 of 48 that way); or a check-in answered with more words, up to
+        // `MAX_CHECK_INS` in a row. A nudge or check-in answered with a
+        // message and no query ("waiting on root") is an answer, not a
+        // promise, and arms nothing.
+        let working = if check { only_text } else { !results.is_empty() || (awaiting_nudge_reply && only_text) };
+        self.check_armed = working && wrote && started_nothing && self.check_ins < MAX_CHECK_INS && self.host.check_before_idle();
         if turn.calls.is_empty() {
             let text = turn.text.trim();
             if awaiting_nudge_reply && !text.is_empty() {
@@ -1356,7 +1412,11 @@ impl<H: Host> AgentStateMachine<H> {
                 // back next time so it can't just repeat itself.
                 self.last_unfulfilled_promise = Some(text.to_string());
             }
-            if text.is_empty() {
+            if check {
+                // Words in answer to a check-in are a stalled lead-in, not a
+                // reply to anyone: shown, never sent.
+                self.host.show(ui::note(&format!("check-in answered with words, no call: {}", text.lines().next().unwrap_or(""))));
+            } else if text.is_empty() {
                 self.host.show(ui::note("no tool call, no text — turn wasted"));
             } else {
                 self.host.spoke(text, &self.ctx);
@@ -1978,6 +2038,7 @@ pub fn load_history(path: &std::path::Path) -> Saved {
             .filter_map(|(who, said)| match who.as_str() {
                 "user" => Some((Speaker::User, said)),
                 "assistant" => Some((Speaker::Assistant, said)),
+                "called" => Some((Speaker::Called, said)),
                 _ => None,
             })
             .collect()
@@ -2034,7 +2095,18 @@ fn row_id(line: &str) -> Option<usize> {
 /// mid-write leaves the previous conversation rather than half of one.
 pub fn save_history(path: &std::path::Path, saved: &Saved) {
     let file = SavedFile {
-        history: saved.history.iter().map(|(who, said)| ((if *who == Speaker::User { "user" } else { "assistant" }).to_string(), said.clone())).collect(),
+        history: saved
+            .history
+            .iter()
+            .map(|(who, said)| {
+                let who = match who {
+                    Speaker::User => "user",
+                    Speaker::Assistant => "assistant",
+                    Speaker::Called => "called",
+                };
+                (who.to_string(), said.clone())
+            })
+            .collect(),
         fresh: saved.fresh.clone(),
         turns: saved.turns,
         next_id: saved.next_id,
@@ -2049,11 +2121,26 @@ pub fn save_history(path: &std::path::Path, saved: &Saved) {
     }
 }
 
+/// `args` with every string longer than [`CALLED_ARG_CHARS`] cut to its
+/// start and its length.
+fn short_args(args: &serde_json::Value) -> serde_json::Value {
+    match args {
+        serde_json::Value::String(s) if s.chars().count() > CALLED_ARG_CHARS => {
+            let head: String = s.chars().take(CALLED_ARG_CHARS).collect();
+            serde_json::Value::String(format!("{head}… ({} chars in all)", s.chars().count()))
+        }
+        serde_json::Value::Object(m) => serde_json::Value::Object(m.iter().map(|(k, v)| (k.clone(), short_args(v))).collect()),
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(short_args).collect()),
+        v => v.clone(),
+    }
+}
+
 async fn summarize(llm: &Llm, system: &str, history: &[(Speaker, String)]) -> String {
     let ask = "Summarize this conversation so far for your own future reference — what was asked, \
                what you found or did, what's still open. Plain text, no tools, as concise as it can \
                be while staying useful.";
-    let mut h = history.to_vec();
+    // Asked with no tools, so no tool calls in what it's shown either.
+    let mut h: Vec<(Speaker, String)> = history.iter().filter(|(who, _)| *who != Speaker::Called).cloned().collect();
     h.push((Speaker::User, ask.to_string()));
     match llm.converse(system, &h, Vec::new()).await {
         Ok(turn) if !turn.text.trim().is_empty() => turn.text.trim().to_string(),
