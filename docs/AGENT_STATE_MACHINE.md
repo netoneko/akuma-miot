@@ -51,7 +51,9 @@ scripted fake model server, 30 tests.
        │                               ▼
        │                      ┌─────────────────┐
        │                      │    THINKING     │  llm.converse(system, history, tools)
-       │                      └────────┬────────┘
+       │                      └────────┬────────┘  call failed? retry after 5/15/45/135 s;
+       │                               │    all 5 failed → turn never happened, IDLE
+       │                               │    (a nudge that failed isn't counted)
        │                               │  a Reset arrived meanwhile? → drop every call, IDLE
        │                               ▼
        │                      ┌─────────────────┐
@@ -60,8 +62,9 @@ scripted fake model server, 30 tests.
        │                      │                 │  no call at all → Host::spoke
        │                      └────────┬────────┘
        │                               │
-       │     fed results, made calls, all of them records?
-       │     (and the host wants it: a cat yes, kot chat no)
+       │     fed results, wrote something (calls, or plain text),
+       │     started no query? (and the host wants it: a cat yes,
+       │     kot chat no)
        │                 no ┌──────────┴──────────┐ yes → armed
        │                    │                     ▼
        │                    │       once no query is in flight and nothing
@@ -280,6 +283,24 @@ What it doesn't cover:
   itself is unchanged, on purpose: a model that only ever promises needs
   the same backstop as one that never answers at all, or nagging it burns
   turns forever exactly the way the bound was meant to prevent.
+- ~~A plain-text promise after results arms no check-in.~~ **Covered
+  (2026-09-26):** only a promise sent with a call (`SendMessage`) armed one;
+  meow's usual shape is plain text, "Reading term.rs, nya:", with no call at
+  all. Its first session with the Langfuse log (19:12–20:02 UTC) had 10 of
+  them, each sitting idle until the 150 s nudge: 25 of its 49½ minutes.
+  Plain text now counts as writing, so it gets the check-in straight away.
+  Test: `a_plain_text_promise_after_results_gets_a_check_in`.
+- ~~A failed model call loses its turn, and a failed nudge still spends the
+  budget.~~ **Covered (2026-09-26):** meow came back from a 20:09 UTC reboot
+  before its network did. All three nudges failed on `error sending
+  request` to z.ai, the model never saw any of them, the budget ran out, and
+  it sat idle until root wrote at 23:28 — 3h11m. A failed call is now
+  retried ([`LLM_RETRIES`], 5/15/45/135 s), and a nudge whose every attempt
+  failed is refunded, so nudges keep coming once per interval until the
+  provider answers. Tests: `a_failed_model_call_is_retried`,
+  `nudges_into_a_dead_provider_dont_spend_the_budget`. **Still not
+  covered:** a wake that isn't a nudge (an operator's message) is still gone
+  once all five attempts fail — it isn't queued again.
 
 ## Also seen in the same log, not fixed here
 

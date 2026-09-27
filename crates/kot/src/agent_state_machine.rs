@@ -41,7 +41,8 @@
 //!   allowed one tells the model so (report now); past it, results are
 //!   *held* — queued, not dropped — and ride along with the next wake.
 //! - **Check-in before idling.** A turn that worked on results but started
-//!   nothing new (only records — a message, a task update) is about to leave
+//!   nothing new (only records — a message, a task update — or just plain
+//!   text, "Reading it, nya:", found live 2026-09-26) is about to leave
 //!   the loop with nothing to do. If the host wants it
 //!   ([`Host::check_before_idle`]), the model gets one [`CHECK_IN`] turn
 //!   first: "nothing is running — if you said you'd do something, do it".
@@ -62,7 +63,11 @@
 //!   next nudge now quotes the unfulfilled one back
 //!   ([`AgentStateMachine::last_unfulfilled_promise`]), so it can't just
 //!   repeat itself — still bounded the same way, since a model that only
-//!   ever promises needs the same backstop as one that never answers.
+//!   ever promises needs the same backstop as one that never answers. A
+//!   nudge whose model call failed outright isn't counted at all: the model
+//!   never saw it ([`LLM_RETRIES`]).
+//! - **A failed model call is retried**, [`LLM_RETRIES`] more times with a
+//!   growing wait, before its turn is given up.
 //! - **Long results.** A result is fed as its head and tail (build errors
 //!   are at the end, a README's point at its start); `Inspect` with an
 //!   `offset` pages through the middle. `Bash` takes a `timeout` up to
@@ -144,6 +149,16 @@ pub const LOCAL_TASK_NAG_AFTER: Duration = Duration::from_secs(150);
 /// model starts a query again (mirrors `max_nudges`: "resets whenever the
 /// holder acts").
 pub const MAX_LOCAL_TASK_NUDGES: u32 = 3;
+/// A turn whose model call fails (the provider unreachable, not the model
+/// answering badly) is tried again this many more times, waiting
+/// [`Host::llm_retry_after`] and then three times longer each time: 5 s,
+/// 15 s, 45 s, 135 s — about 3½ minutes in all. Found live 2026-09-26: meow
+/// came back from a reboot before its network did, all three local-task
+/// nudges failed on `error sending request` to z.ai, and it sat idle for
+/// 3h11m — one attempt per turn, the same shape `Cat::submit` had until it
+/// got its own retries.
+pub const LLM_RETRIES: u32 = 4;
+pub const LLM_RETRY_AFTER: Duration = Duration::from_secs(5);
 /// How much of a running call's output `Running <id>` shows — its tail.
 const RUNNING_TAIL: usize = 2400;
 /// `Bash` without a `timeout`, and the most one may ask for, in seconds.
@@ -216,6 +231,11 @@ pub trait Host: Send + Sync + 'static {
     /// shortens it.
     fn local_nag_after(&self) -> Duration {
         LOCAL_TASK_NAG_AFTER
+    }
+    /// The first wait before retrying a failed model call ([`LLM_RETRIES`]).
+    /// A test shortens it.
+    fn llm_retry_after(&self) -> Duration {
+        LLM_RETRY_AFTER
     }
     /// The live record changed — a cat sends it to its node. Called often
     /// (every step); coalescing is the host's business.
@@ -1036,6 +1056,16 @@ impl<H: Host> AgentStateMachine<H> {
         }
     }
 
+    /// Whether a reset is waiting in `inbox`. Whatever is read to find out
+    /// stays queued, in order, for the main loop, which applies the reset
+    /// itself.
+    fn reset_waiting(&mut self, inbox: &mut mpsc::UnboundedReceiver<Inbound>) -> bool {
+        while let Ok(i) = inbox.try_recv() {
+            self.pending.push_back(i);
+        }
+        self.pending.iter().any(|i| matches!(i, Inbound::Reset(_)))
+    }
+
     /// Where the model is after acting: tools still out, or nothing.
     fn settle(&mut self) {
         let p = if self.act.running.is_empty() { "idle" } else { "waiting" };
@@ -1144,16 +1174,37 @@ impl<H: Host> AgentStateMachine<H> {
             Some(w) => format!("{}\n\n{w}", self.system),
             None => self.system.clone(),
         };
-        let turn = match self.llm.converse(&system_now, &self.history, self.tools()).await {
-            Ok(t) => t,
-            Err(e) => {
-                self.host.show(ui::note(&format!("llm error: {e}")));
-                self.log(serde_json::json!({"t": "turn", "why": why, "check": check, "prompt": prompt, "error": e}));
-                // A failed turn never happened, as far as history goes.
-                self.history.pop();
-                self.settle();
-                return;
+        let mut attempt = 0;
+        let turn = loop {
+            let e = match self.llm.converse(&system_now, &self.history, self.tools()).await {
+                Ok(t) => break t,
+                Err(e) => e,
+            };
+            // A reset that landed meanwhile ends this session's turn now —
+            // no point retrying for a conversation that's already gone.
+            if attempt < LLM_RETRIES && !self.reset_waiting(inbox) {
+                let wait = self.host.llm_retry_after() * 3u32.pow(attempt);
+                attempt += 1;
+                self.host.show(ui::note(&format!("llm error: {e} — retrying in {} (attempt {} of {})", ui::human(wait.as_secs()), attempt + 1, LLM_RETRIES + 1)));
+                self.log(serde_json::json!({"t": "llm_retry", "why": why, "attempt": attempt, "wait_ms": wait.as_millis() as u64, "error": e}));
+                tokio::time::sleep(wait).await;
+                continue;
             }
+            self.host.show(ui::note(&format!("llm error: {e}")));
+            self.log(serde_json::json!({"t": "turn", "why": why, "check": check, "prompt": prompt, "error": e, "attempts": attempt + 1}));
+            // A failed turn never happened, as far as history goes.
+            self.history.pop();
+            // Nor, then, did the nudge it was answering: the model never saw
+            // it, so it can't count as one more the model ignored. Without
+            // this, three nudges into a dead network spent the budget for
+            // good (see `LLM_RETRIES`). The next one comes a full
+            // `local_nag_after` later, so a long outage costs one failed
+            // round of calls per interval, and no tokens.
+            if awaiting_nudge_reply {
+                self.local_nudges = self.local_nudges.saturating_sub(1);
+            }
+            self.settle();
+            return;
         };
         if let Some(r) = &turn.reasoning {
             self.host.show(ui::musing(&name, "reasoning", r));
@@ -1193,12 +1244,8 @@ impl<H: Host> AgentStateMachine<H> {
 
         // Thinking takes minutes; a reset may have landed meanwhile. If so,
         // this turn answered a session that no longer exists — act on none
-        // of it. (Whatever was read here stays queued, in order, for the
-        // main loop, which applies the reset itself.)
-        while let Ok(i) = inbox.try_recv() {
-            self.pending.push_back(i);
-        }
-        if self.pending.iter().any(|i| matches!(i, Inbound::Reset(_))) {
+        // of it.
+        if self.reset_waiting(inbox) {
             let n = turn.calls.len();
             self.host.show(ui::note(&format!("session reset while thinking — this turn's {n} call(s) dropped, nothing sent")));
             self.log(serde_json::json!({"t": "dropped", "calls": n}));
@@ -1295,7 +1342,12 @@ impl<H: Host> AgentStateMachine<H> {
             // a nag due the moment it next goes idle.
             self.local_nudges = 0;
         }
-        let wrote = !turn.calls.is_empty();
+        // Plain text counts as writing too: "Reading term.rs, nya:" with no
+        // call is the same promise as a `SendMessage` saying it. Found live
+        // 2026-09-26: meow answered results like that 10 times in one
+        // 50-minute session, and with no check-in armed each one sat idle
+        // until the 150 s local-task nudge — 25 minutes, half the session.
+        let wrote = !turn.calls.is_empty() || !turn.text.trim().is_empty();
         self.check_armed = !check && !results.is_empty() && wrote && started_nothing && self.host.check_before_idle();
         if turn.calls.is_empty() {
             let text = turn.text.trim();

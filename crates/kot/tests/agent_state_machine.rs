@@ -30,13 +30,19 @@ struct Reply {
     /// server's response carries no `prompt_tokens_details` at all, same as
     /// a provider that never reports one.
     cached: Option<u32>,
+    /// Answer 503 instead — the provider unreachable, not the model.
+    fail: bool,
 }
 
 fn calls(c: Vec<(&'static str, Value)>) -> Reply {
-    Reply { calls: c, text: None, delay_ms: 0, reasoning: None, cached: None }
+    Reply { calls: c, text: None, delay_ms: 0, reasoning: None, cached: None, fail: false }
 }
 fn text(t: &'static str) -> Reply {
-    Reply { calls: vec![], text: Some(t), delay_ms: 0, reasoning: None, cached: None }
+    Reply { calls: vec![], text: Some(t), delay_ms: 0, reasoning: None, cached: None, fail: false }
+}
+/// The model call fails — `n` of them in a row.
+fn fails(n: usize) -> Vec<Reply> {
+    vec![Reply { fail: true, ..text("") }; n]
 }
 fn thinking(r: Reply, reasoning: &'static str) -> Reply {
     Reply { reasoning: Some(reasoning), ..r }
@@ -78,6 +84,7 @@ impl Fake {
 }
 
 async fn serve(fake: Arc<Fake>) -> String {
+    use axum::response::IntoResponse;
     use axum::routing::{get, post};
     let f = fake.clone();
     let app = axum::Router::new()
@@ -91,6 +98,9 @@ async fn serve(fake: Arc<Fake>) -> String {
                     let next = f.script.lock().unwrap().pop_front().or_else(|| f.forever.lock().unwrap().clone()).unwrap_or_else(|| text("(script ran out)"));
                     if next.delay_ms > 0 {
                         tokio::time::sleep(Duration::from_millis(next.delay_ms)).await;
+                    }
+                    if next.fail {
+                        return (axum::http::StatusCode::SERVICE_UNAVAILABLE, "down").into_response();
                     }
                     let tool_calls: Vec<Value> = next
                         .calls
@@ -114,6 +124,7 @@ async fn serve(fake: Arc<Fake>) -> String {
                         "choices": [{"index": 0, "message": message, "finish_reason": if tool_calls.is_empty() { "stop" } else { "tool_calls" }}],
                         "usage": usage
                     }))
+                    .into_response()
                 }
             }),
         );
@@ -145,6 +156,10 @@ struct Seen {
     stall: Option<Duration>,
     /// `Host::local_nag_after` — the default (minutes) unless a test is about it.
     local_nag: Option<Duration>,
+    /// `Host::llm_retry_after` — shortened for every test by default
+    /// ([`Seen::default`]), so one that trips on a failed call doesn't wait
+    /// the real 5 s.
+    llm_retry: Option<Duration>,
     /// `Host::history_path` — none unless a test is about restarts.
     history: Option<std::path::PathBuf>,
     /// `Host::restart_note`.
@@ -250,6 +265,9 @@ impl Host for TestHost {
     }
     fn local_nag_after(&self) -> Duration {
         self.0.lock().unwrap().local_nag.unwrap_or(agent_state_machine::LOCAL_TASK_NAG_AFTER)
+    }
+    fn llm_retry_after(&self) -> Duration {
+        self.0.lock().unwrap().llm_retry.unwrap_or(Duration::from_millis(1))
     }
 }
 
@@ -712,6 +730,71 @@ async fn a_nudge_that_gets_only_a_promise_is_quoted_back_next_time() {
         "quotes the unfulfilled promise back: {second_nudge}"
     );
     assert_eq!(seen.lock().unwrap().sent, vec!["done", "actually did it"]);
+}
+
+/// meow, 2026-09-26: answering results with a plain-text promise ("Reading
+/// term.rs, nya:") and no call armed no check-in — only a `SendMessage`
+/// promise did — so each one sat idle until the local-task nudge, 150 s
+/// later. Plain text now gets the same check-in, right away.
+#[tokio::test]
+async fn a_plain_text_promise_after_results_gets_a_check_in() {
+    let r = rig_with(
+        vec![
+            calls(vec![("Bash", json!({"command": "echo recon"}))]),
+            text("Reading it, nya:"),
+            calls(vec![("Bash", json!({"command": "echo reading"}))]),
+            say("read it"),
+            text(""),
+        ],
+        true,
+    )
+    .await;
+    r.wake("find the ioctl dispatch");
+    r.until("second check-in answered", |_, s| s.shown.iter().any(|l| l.contains("check-in: nothing more to do"))).await;
+    let (fake, _) = r.finish().await;
+    assert_eq!(fake.requests().len(), 5);
+    assert!(fake.fed(2).contains(CHECK_IN), "the plain-text promise is followed by a check-in: {}", fake.fed(2));
+    assert!(fake.fed(3).contains("$ echo reading"), "the promised read ran and came back: {}", fake.fed(3));
+}
+
+/// A model call that fails is tried again, not dropped with its wake.
+#[tokio::test]
+async fn a_failed_model_call_is_retried() {
+    let mut script = fails(2);
+    script.push(say("made it"));
+    let r = rig(script).await;
+    r.wake("hello?");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    let (fake, seen) = r.finish().await;
+    assert_eq!(fake.requests().len(), 3, "two failures, then the retry that worked");
+    assert_eq!(seen.lock().unwrap().sent, vec!["made it"]);
+    assert!(seen.lock().unwrap().shown.iter().any(|l| l.contains("retrying in")), "the retry is shown");
+}
+
+/// meow, 2026-09-26: back from a reboot before its network was, all three
+/// local-task nudges failed on the call to z.ai itself, the budget was
+/// spent on nudges the model never saw, and it sat idle 3h11m until root
+/// happened to write. A nudge whose call fails outright (every retry)
+/// doesn't count — so once the provider is back, the next nudge gets through.
+#[tokio::test]
+async fn nudges_into_a_dead_provider_dont_spend_the_budget() {
+    let per_turn = agent_state_machine::LLM_RETRIES as usize + 1;
+    let mut script = vec![calls(vec![("Bash", json!({"command": "echo x"}))]), say("done"), text("")];
+    // More failed nudges than the whole budget.
+    script.extend(fails(per_turn * (agent_state_machine::MAX_LOCAL_TASK_NUDGES as usize + 1)));
+    script.push(say("back online"));
+    let r = rig_seen(
+        script,
+        Seen { check: true, local_nag: Some(Duration::from_millis(80)), reminder: Some("(open tasks: L35)".into()), ..Seen::default() },
+    )
+    .await;
+    r.wake("play the wav");
+    r.until("nudged once the provider is back", |_, s| s.sent.len() == 2).await;
+    let (fake, seen) = r.finish().await;
+    assert_eq!(seen.lock().unwrap().sent, vec!["done", "back online"]);
+    let last = fake.requests().len() - 1;
+    assert!(fake.fed(last).contains("open local tasks"), "it was a nudge that got through: {}", fake.fed(last));
+    assert!(!fake.fed(last).contains("This is the last reminder"), "failed nudges spent none of the budget: {}", fake.fed(last));
 }
 
 /// A cat with nothing open on its local list is left alone — the nudge only
