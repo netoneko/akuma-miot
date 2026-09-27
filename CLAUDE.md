@@ -216,7 +216,11 @@ read that first, it is kept current and this file does not repeat it.
   0/1/2 answered "console" instead of `EBADF`, so every `pack-objects
   --stdout` died at exit, at any size. HANDOFF, "Why git push died on the
   trashcan". An Akuma ssh session has no `$HOME`: set `HOME=/root` before
-  testing git there, or credentials look missing.
+  testing git there, or credentials look missing. **Fixed for git
+  2026-09-27:** the box's `/etc/gitconfig` (read with no `$HOME`) now has
+  `credential.helper = store --file=/root/.git-credentials`, so `git push
+  litter` works from a bare ssh session. Without `HOME` it commits as
+  `/etc/gitconfig`'s identity (Kirill), with `HOME=/root` as meow.
 - **sora's guest and the metal box need keys that live outside
   `../akuma/target`** (a `cargo clean` deleted the only way in, 2026-09-25):
   `~/.akuma/kot/fcguest.ssh-key` for sora's guest (in its image's
