@@ -124,6 +124,12 @@ enum Cmd {
         #[arg(long)]
         tree: bool,
     },
+    /// Patrons: accounts outside the roster that may read, talk and approve
+    /// others, admitted on chain. `docs/HTTPAPI.md`.
+    Patron {
+        #[command(subcommand)]
+        cmd: PatronCmd,
+    },
     /// Create an identity at --seed-file if there isn't one, and print it.
     Id {
         /// Comment for the `.pub` line.
@@ -141,6 +147,36 @@ enum TaskCmd {
         #[arg(long)]
         cat: Option<String>,
     },
+}
+
+#[derive(Subcommand)]
+enum PatronCmd {
+    /// Ask to be a patron, signed with this key (--seed-file), through a
+    /// node's httpapi — no node has to know the key yet.
+    Request {
+        /// The httpapi base, e.g. https://treehouse.akuma.sh/api
+        #[arg(long, env = "MIOT_HTTPAPI", default_value = "https://treehouse.akuma.sh/api")]
+        api: String,
+        /// The name you'll be known by: 1-32 of [a-z0-9_-].
+        #[arg(long)]
+        name: String,
+        /// Who you are and why — whoever approves you reads this. Up to 500 bytes.
+        #[arg(long)]
+        note: String,
+    },
+    /// Whether this key's request is none, pending or approved.
+    Status {
+        #[arg(long, env = "MIOT_HTTPAPI", default_value = "https://treehouse.akuma.sh/api")]
+        api: String,
+    },
+    /// Approved patrons and pending requests, with their notes.
+    List,
+    /// Approve a pending request (by name or account). Root or a patron.
+    Approve { who: String },
+    /// Turn a pending request down. Root or a patron.
+    Reject { who: String },
+    /// Remove a patron. Root, or whoever approved it.
+    Revoke { who: String },
 }
 
 #[derive(Args)]
@@ -311,6 +347,49 @@ fn die(msg: impl std::fmt::Display) -> ! {
     std::process::exit(2)
 }
 
+/// `kot patron request`: sign the request with `id` against the chain's
+/// request domain (from `/genesis`) and hand it to `httpapi`.
+async fn patron_request(id: &Identity, api: &str, name: &str, note: &str) {
+    use codec::Encode;
+    let api = api.trim_end_matches('/');
+    let http = reqwest::Client::new();
+    let g: serde_json::Value = http
+        .get(format!("{api}/genesis"))
+        .send()
+        .await
+        .unwrap_or_else(|e| die(format!("{api}: {e}")))
+        .json()
+        .await
+        .unwrap_or_else(|e| die(format!("{api}/genesis: {e}")));
+    let domain: [u8; 32] = g["request_domain"]
+        .as_str()
+        .and_then(|h| hex::decode(h).ok())
+        .and_then(|b| b.try_into().ok())
+        .unwrap_or_else(|| die(format!("{api}/genesis: no request_domain")));
+    let context = g["request_context"].as_str().unwrap_or_else(|| die(format!("{api}/genesis: no request_context")));
+    let message = (context.as_bytes(), domain, name, note).encode();
+    let body = serde_json::json!({
+        "who": miot_keys::to_hex(&id.account()),
+        "name": name,
+        "note": note,
+        "sig": hex::encode(id.sign(&message).0),
+    });
+    let r = http
+        .post(format!("{api}/patron-request"))
+        .header(kot::httpapi::CSRF_HEADER, "1")
+        .json(&body)
+        .send()
+        .await
+        .unwrap_or_else(|e| die(format!("{api}: {e}")));
+    let ok = r.status().is_success();
+    let v: serde_json::Value = r.json().await.unwrap_or_default();
+    if !ok || v["ok"] != true {
+        die(format!("request refused: {}", v["error"].as_str().unwrap_or(&v.to_string())));
+    }
+    println!("asked as {name} ({}); status: {}", miot_keys::to_hex(&id.account()), v["status"].as_str().unwrap_or("sent"));
+    println!("check with: kot --seed-file <same file> patron status --api {api}");
+}
+
 /// Who a command signs as: --seed, then --seed-file, then --as <roster
 /// member>, then the operator's own persisted identity.
 fn signer(cli: &Cli) -> Identity {
@@ -459,6 +538,38 @@ async fn main() {
         Some(Cmd::Task { cmd: TaskCmd::List { cat: Some(cat) } }) => {
             let mut c = connect(&cli).await;
             println!("{}", c.local_tasks_text(cat).await);
+        }
+        Some(Cmd::Patron { cmd: PatronCmd::Request { api, name, note } }) => patron_request(&signer(&cli), api, name, note).await,
+        Some(Cmd::Patron { cmd: PatronCmd::Status { api } }) => {
+            let who = miot_keys::to_hex(&signer(&cli).account());
+            let api = api.trim_end_matches('/');
+            let v: serde_json::Value = reqwest::Client::new()
+                .get(format!("{api}/patron/{who}"))
+                .send()
+                .await
+                .unwrap_or_else(|e| die(format!("{api}: {e}")))
+                .json()
+                .await
+                .unwrap_or_default();
+            println!("{who}: {}", v["status"].as_str().unwrap_or("unknown"));
+        }
+        Some(Cmd::Patron { cmd: PatronCmd::List }) => {
+            if !connect(&cli).await.print_patrons().await {
+                std::process::exit(1);
+            }
+        }
+        Some(Cmd::Patron { cmd: PatronCmd::Approve { who } | PatronCmd::Reject { who } | PatronCmd::Revoke { who } }) => {
+            let mut c = connect(&cli).await;
+            let acct = c.patron_account(who).await.unwrap_or_else(|| die(format!("no patron or request called {who}")));
+            let call = match &cli.cmd {
+                Some(Cmd::Patron { cmd: PatronCmd::Approve { .. } }) => pallet_litter::Call::approve_patron { who: acct },
+                Some(Cmd::Patron { cmd: PatronCmd::Reject { .. } }) => pallet_litter::Call::reject_patron_request { who: acct },
+                _ => pallet_litter::Call::revoke_patron { who: acct },
+            };
+            let since = c.head_seq().await;
+            if c.submit(RuntimeCall::Litter(call)).await {
+                c.log(since, None, true, Some(4)).await;
+            }
         }
         Some(Cmd::Artifact { id }) => {
             if !connect(&cli).await.print_artifact(id).await {

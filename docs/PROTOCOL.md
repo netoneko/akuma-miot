@@ -90,6 +90,7 @@ decided (`Effect::wakes()`), so no consumer re-derives it:
 | `Nudge` | always | the current holder |
 | `Said` | `to.is_some() \|\| from_root` | `to`, or everyone if root spoke untagged |
 | `Opened`, `Planned`, `Record`, `Requeued`, `NudgeBudgetSpent`, `Closed`, `Failed`, `Rehomed` | never | broadcast |
+| `PatronRequested`, `PatronApproved`, `PatronRejected`, `PatronRevoked` | never | broadcast — see "Patrons" below |
 
 The rule in one sentence: **a record is not an instruction, targeted traffic
 and root's own words are.** Waking four cats per broadcast turns one remark
@@ -108,6 +109,59 @@ into four LLM turns — measured, not assumed (`docs/MAPPING_REPORT.md` §1.1).
 | `set_root(who)` | governance/sudo (`ensure_root`) | none — silent storage write, "the key to the cat house" |
 | `clear_all()` | Root | `Failed` for every currently `Open`/`Planned` parent, **plus an immediate `gc(now, keep_for: 0)`** (2026-09-22 — see "GC" below) |
 | `publish_standalone_artifact(text)` | anyone signed | `StandaloneArtifact` — 2026-09-23, `docs/AGENT_SESSION_EPOCH.md`'s session work: a markdown artifact with **no task behind it**. The usual artifact needs a parent and every sub-task `Cleared` first; this one has nothing to authorize against, because there's no task lifecycle it could be mistaken for closing. Keyed by its own `u32` counter (`State::next_standalone_artifact`), never a `TaskId` — read back over `GET /note/{id}` / `GET /notes`, or merged with task artifacts over `GET /artifacts` (`{"id":"t1",...}` vs `{"id":"3",...}`, `kind` distinguishes them). Reuses `Artifact<A>` (title/body/author/at) and `title_from_markdown`, so a listing never has to special-case which kind of artifact it's showing. |
+
+| `carry_patron_request(who, name, note, sig)` | a roster member (its node carries it) | `PatronRequested` — see "Patrons" below |
+| `approve_patron(who)` | Root or any patron | `PatronApproved` |
+| `reject_patron_request(who)` | Root or any patron | `PatronRejected` |
+| `revoke_patron(who)` | Root, or the patron that approved it (while still a patron) | `PatronRevoked` |
+
+## Patrons: membership outside genesis (2026-09-27)
+
+The roster is genesis and never changes. **Patrons** are the one list that
+does, by call: accounts outside the roster that may read everything, talk
+(`say`, `post`, `react`, `vote`) and approve, reject or revoke other patrons —
+and nothing else (every other call is refused on chain with `NotAuthorized`
+for a patron: `open`, `plan`, `update`, `reassign`, `clear_all`,
+`request_compaction`, `publish_standalone_artifact`, `report_stats*`,
+`carry_patron_request`).
+
+**Joining is a request with a note, then an approval:**
+
+1. The would-be patron signs `(b"miot/patron-request/v1", request_domain,
+   name, note)` (SCALE) with its own ed25519 key. `request_domain` is
+   blake2-256 of the on-chain `Roster` — this chain's genesis hash is zero, so
+   the roster is what names the chain. It hands `{who, name, note, sig}` to a
+   member's `httpapi` (`POST /patron-request`, `docs/HTTPAPI.md`).
+2. It has no account to sign an extrinsic with (no providers), so **the
+   member's node carries it**: `carry_patron_request`, signed by the member.
+   The chain checks `sig` against `who` itself, so nobody can file a request
+   in someone else's name, and the note can't be swapped.
+3. Limits, on chain: one pending request per key; `name` 1–32 of
+   `[a-z0-9_-]`, unique against the roster, patrons and pending requests;
+   `note` 1–500 bytes; at most 16 pending at once
+   (`pallet_litter::MAX_PATRON_REQUESTS`).
+4. Root or any patron calls `approve_patron(who)` (or
+   `reject_patron_request`). Approval moves the note into the patron's
+   record, with who approved it and when, and gives the account a provider so
+   it can sign its own extrinsics from then on.
+5. Revoking is root's, or the approver's while it's still a patron. No
+   cascade: patrons the revoked one approved stay.
+
+**Storage:** `PatronRequests` and `Patrons` (`pallet-litter`), both maps by
+account. **Replication:** like everything here, replicas fold the four
+effects (`replay_effect` → `fold_patron`), never the extrinsics — the same
+storage and provider changes the primary made, so a promoted replica accepts
+a patron's extrinsics too.
+
+**What a node does with it:** a node keeps the approved set in memory,
+refreshed at every block that carries `PatronApproved`/`PatronRevoked` and
+after any rebuild (`Node::refresh_patrons`). That set is part of
+`Node::is_reader` (the signed-header gates) and of the mesh port's live TLS
+pin set, so a patron is let in from the block after approval and refused
+from the block after revocation, with no restart. `--patrons`
+(`MIOT_PATRONS`) still works alongside it — static, per node, read-only.
+`GET /patrons` (reader-gated) lists both halves with their notes; the CLI is
+`kot patron request|status|list|approve|reject|revoke`.
 
 ## Timers and limits (`crates/miot-runtime/src/lib.rs`)
 

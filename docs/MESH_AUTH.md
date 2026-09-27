@@ -315,6 +315,36 @@ The operator adds an account in `overlays/deploy/deploy.py` (`PATRONS`,
 applied to `PATRONS_ON` by `deploy.py up`) and, for the AWS pair, one line
 in `/etc/kot/patrons` there, then `kotctl sync`.
 
+## Patron approval and httpapi, 2026-09-27
+
+`--patrons` above is per-node config. Patrons can now also be admitted **on
+chain**: a would-be patron files a request with a note, root or any patron
+approves it, and every node lets it in from the next block. The protocol is
+in `docs/PROTOCOL.md`, "Patrons"; the door it comes through is
+`docs/HTTPAPI.md`. What changed here, in this doc's terms:
+
+- **The mesh port's TLS pin set is live** (`tls::Readers`). It was a `Vec`
+  fixed at startup; now `Node::refresh_patrons` rewrites it whenever a block
+  approves or revokes a patron, so an approved patron's handshake succeeds
+  without a restart. Still mandatory, still pinned — the set just changes.
+- **`Node::is_reader` includes chain patrons**, so the signed-header gates
+  admit them the block after approval and refuse them the block after
+  revocation, even on an HTTP/2 connection opened before.
+- **The write gate moved from "genesis" to "genesis or chain patron"**
+  (`Node::can_write`, in `accept_extrinsic`). A `--patrons` reader still
+  can't write. What a chain patron may call is decided on chain: talking and
+  the patron calls only.
+- **A second listener, `httpapi`, with no client auth at all** — plain
+  HTTP, bound to loopback or the AWS bridge, behind nginx's real certificate
+  at `treehouse.akuma.sh/api/`, off unless configured (yuki and shiro only).
+  It's the one way in for a key no node knows: three open routes (one writes:
+  a signed patron request, rate-limited and bounded on chain), the reader
+  routes gated by signed headers, and a `/submit` that takes seven calls.
+  No consensus route exists on it. CSRF is guarded by request shape (a
+  required header, a non-form content type, an origin allowlist).
+  `docs/HTTPAPI.md` says why browser mTLS against the mesh port wasn't the
+  answer.
+
 ## Rejected alternatives
 
 - **`sc-network`/`rust-libp2p`** (what Polkadot actually uses) — Kademlia

@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#e6ece4" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#161d19" media="(prefers-color-scheme: dark)">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="teahouse">
+<title>Teahouse keys</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<header class="top">
+  <div class="brand"><span class="hanzi">茶馆</span> teahouse</div>
+  <div class="lockline" id="lockline"></div>
+</header>
+
+<main>
+  <section id="unsupported" class="notice" hidden></section>
+
+  <section id="setup" hidden>
+    <h1>Start with a passkey</h1>
+    <p class="lede">Keys you make here are locked with a passkey on this phone. Face ID or your passcode unlocks them; nothing else can.</p>
+    <button id="setuppasskey" class="primary">Set up a passkey</button>
+  </section>
+
+  <section id="keys" hidden>
+    <h1>Your key</h1>
+    <p class="lede">An Ed25519 pair. The public half is you on the chain; the private half stays on this phone unless you export it.</p>
+    <div id="keycard"></div>
+    <div id="keymake" class="row">
+      <button id="newkey" class="primary">Make a key</button>
+      <button id="importkey">Import a seed</button>
+    </div>
+    <form id="importform" class="panel" hidden>
+      <label>Seed, 64 hex characters <textarea id="importseed" rows="3" spellcheck="false" autocapitalize="off" autocorrect="off" placeholder="the contents of a kot seed file"></textarea></label>
+      <div class="row"><button class="primary" type="submit">Import</button><button type="button" data-cancel>Cancel</button></div>
+    </form>
+  </section>
+
+  <section id="access" hidden>
+    <h1>Request access</h1>
+    <p class="lede">Ask to join the teahouse as a patron. The request is signed with your key, and someone already inside approves it.</p>
+    <p id="askstatus" class="meta"></p>
+    <form id="askform">
+      <label>Nickname <input id="askname" placeholder="lowercase letters, digits, - and _" maxlength="32" autocomplete="nickname" autocapitalize="off" autocorrect="off" spellcheck="false"></label>
+      <label>A note for whoever approves <textarea id="asknote" rows="3" maxlength="500" placeholder="who you are and why"></textarea></label>
+      <button id="asksend" class="primary" type="submit">Request access</button>
+    </form>
+    <pre id="askout" class="out" aria-live="polite" hidden></pre>
+  </section>
+
+  <section id="passkey" hidden>
+    <h1>Passkey</h1>
+    <p id="passkeystate" class="lede"></p>
+    <button id="startover" class="danger">Forget passkey and all keys</button>
+  </section>
+
+  <div id="export" class="modal" hidden>
+    <div class="panel">
+      <h2>Your seed</h2>
+      <p>This is the private key. Anyone holding it is you. It's the same 64 hex characters a kot seed file holds.</p>
+      <pre id="exportseed" class="seed"></pre>
+      <div class="row">
+        <button id="exportcopy">Copy</button>
+        <button id="exportsave">Save as file</button>
+        <button id="exportclose" class="primary">Close</button>
+      </div>
+    </div>
+  </div>
+</main>
+
+<footer>
+  <p id="status" aria-live="polite"></p>
+</footer>
+<script src="app.js"></script>
+</body>
+</html>

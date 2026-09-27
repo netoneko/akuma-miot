@@ -547,6 +547,58 @@ impl Client {
     }
 
     /// Every standalone note: id, title, author.
+    /// Approved patrons and pending requests, with their notes (`/patrons`).
+    pub async fn print_patrons(&mut self) -> bool {
+        match self.get_json("/patrons").await {
+            Ok(v) => {
+                let name = |h: &serde_json::Value| h.as_str().and_then(|h| miot_keys::from_hex(h).ok()).map(|a| self.patron_or_member_name(&v, &a)).unwrap_or_else(|| "?".into());
+                let pending = v["pending"].as_array().cloned().unwrap_or_default();
+                let approved = v["approved"].as_array().cloned().unwrap_or_default();
+                println!("pending ({})", pending.len());
+                for r in &pending {
+                    println!("  {}  {}  carried by {}\n      {}", r["name"].as_str().unwrap_or("?"), &r["account"].as_str().unwrap_or("")[..16.min(r["account"].as_str().unwrap_or("").len())], name(&r["carrier"]), r["note"].as_str().unwrap_or(""));
+                }
+                println!("approved ({})", approved.len());
+                for r in &approved {
+                    println!("  {}  {}  approved by {}\n      {}", r["name"].as_str().unwrap_or("?"), &r["account"].as_str().unwrap_or("")[..16.min(r["account"].as_str().unwrap_or("").len())], name(&r["approved_by"]), r["note"].as_str().unwrap_or(""));
+                }
+                true
+            }
+            Err(e) => {
+                eprintln!("{e}");
+                false
+            }
+        }
+    }
+
+    /// A roster name, else a patron's name from a `/patrons` answer, else
+    /// the short hex.
+    fn patron_or_member_name(&self, patrons: &serde_json::Value, who: &AccountId) -> String {
+        if self.roster.0.iter().any(|(_, a)| a == who) {
+            return self.roster.name_of(who);
+        }
+        let hex = miot_keys::to_hex(who);
+        ["approved", "pending"]
+            .iter()
+            .flat_map(|k| patrons[*k].as_array().cloned().unwrap_or_default())
+            .find(|r| r["account"].as_str() == Some(hex.as_str()))
+            .and_then(|r| r["name"].as_str().map(str::to_string))
+            .unwrap_or_else(|| miot_keys::short(who))
+    }
+
+    /// A patron or requester by name (from `/patrons`) or by 64-hex account.
+    pub async fn patron_account(&mut self, who: &str) -> Option<AccountId> {
+        if let Ok(a) = miot_keys::from_hex(who) {
+            return Some(a);
+        }
+        let v = self.get_json("/patrons").await.ok()?;
+        ["approved", "pending"]
+            .iter()
+            .flat_map(|k| v[*k].as_array().cloned().unwrap_or_default())
+            .find(|r| r["name"].as_str() == Some(who))
+            .and_then(|r| r["account"].as_str().and_then(|h| miot_keys::from_hex(h).ok()))
+    }
+
     pub async fn print_notes(&mut self) -> bool {
         match self.get_json("/notes").await {
             Ok(serde_json::Value::Array(rows)) => {

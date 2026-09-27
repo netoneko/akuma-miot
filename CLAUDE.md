@@ -130,6 +130,9 @@ read that first, it is kept current and this file does not repeat it.
   cats push their own branches to, Kirill pulls from): the options, the
   recommendation, what's still Kirill's call, and `MIOT_CONTEXT`, the shared
   system-prompt files that tell every cat where the source is. 2026-09-25.
+- `docs/HTTPAPI.md` — `httpapi`, the plain-HTTP API for browsers and
+  would-be patrons: every route, the call allowlist on `/submit`, CSRF,
+  and why browser mTLS against the mesh port wasn't the answer. 2026-09-27.
 - `docs/KEY_MANAGEMENT.md` — what one account's key now backs (chain writes,
   every read, the TLS connection itself), the dev-seed footgun in `kot`'s own
   CLI defaults, and the genesis-generation procedure (`deploy.py`/`deploy.sh
@@ -151,7 +154,12 @@ read that first, it is kept current and this file does not repeat it.
   account in a member's `MIOT_PATRONS` may read and pull but never vote
   or write, and its own node runs `--patron` (a learner that pulls from
   any member it can reach). Per node, so it rolls out without a new chain.
-  `docs/MESH_AUTH.md`, "Patrons".
+  `docs/MESH_AUTH.md`, "Patrons". **And on chain (2026-09-27):** a
+  would-be patron files a request with a note through `httpapi`
+  (`https://treehouse.akuma.sh/api/`, yuki and shiro only, plain HTTP
+  behind nginx), root or any patron approves it, and from the next block it
+  can read, talk and approve others — no restart, no config.
+  `docs/PROTOCOL.md` "Patrons", `docs/HTTPAPI.md`.
 - **An operator's client doesn't pin the node (2026-09-23).** `kot`'s
   client reads the roster from whichever node it connects to (`/roster`)
   and trusts that node's cert as presented (`tls::client_config_any_node`);
