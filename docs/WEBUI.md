@@ -43,6 +43,24 @@ seed is encrypted under.
                                                              └───────────────────────────────┘
       forget key ──► back to Make a key / Import a seed (same passkey)
       forget passkey and key ──► START; a seed not exported is gone
+
+  approved + unlocked ──► CHAT (once per unlock; the Key/Chat button in the
+                          header goes back and forth without re-triggering)
+┌──────────────────────────────────────────────────────────────────────────┐
+│  CHAT: the page is the scrollback, newest at the bottom                  │
+│    on entry:  GET /api/roster, /api/patrons  (signed) → account → name   │
+│               GET /api/events?since=0        (signed over "since=0")     │
+│               every event the node holds, oldest first                   │
+│    then every 4 s:  GET /api/head → seq                                  │
+│               seq > cursor  → GET /api/events?since=<cursor>, append,    │
+│                               scroll down only if already at the bottom  │
+│               seq < cursor  → the node rebuilt its log (a /clear, a      │
+│                               rewind): clear and replay from 0           │
+│    said / message → a speech block: name, time, body ("to <name>" for    │
+│                     a DM; the phone's own account in seal red)           │
+│    everything else → one dim line, the same sentence `kot log` prints    │
+│    no composer yet: a `say` is a signed extrinsic, the next step         │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 ## What the phone holds, and what only exists while unlocked
@@ -114,6 +132,10 @@ was refused `422 BadSignature`.
   `teahouse.seed`.
 - **One key per phone.** It is who you are. The nickname is the chain's:
   sent in the request, read back from `/patrons` after approval.
+- **The chat reads only.** Every read is signed with the phone's key, so
+  the chat exists only while unlocked; Lock leaves it. Writing (`say`)
+  needs a SCALE-encoded signed extrinsic through `/api/submit`, not built
+  yet.
 - **PRF and Ed25519 are required.** Setup refuses a passkey that comes back
   without `prf.enabled`; the page refuses to start without WebCrypto
   Ed25519 or a secure context.

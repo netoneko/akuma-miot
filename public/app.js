@@ -87,7 +87,9 @@ async function newSeed() {
 // `vault` is read once so an unlock reaches the authenticator without an
 // IndexedDB round trip first; Safari is strict about the tap that starts a
 // passkey prompt. `wrapKey` lives only here, and only while unlocked.
-const state = { vault: null, wrapKey: null, priv: null, name: null };
+// `autoChat`: one automatic jump into the chat per unlock; the Key button
+// then stays put until the next unlock.
+const state = { vault: null, wrapKey: null, priv: null, name: null, view: 'key', autoChat: false };
 
 async function registerPasskey() {
   const salt = rand(32);
@@ -115,7 +117,7 @@ async function setup(seed) {
   const { vault, secret } = await registerPasskey();
   await putVault(vault);
   state.vault = vault;
-  if (secret) state.wrapKey = await deriveWrapKey(secret, vault.salt);
+  if (secret) { state.wrapKey = await deriveWrapKey(secret, vault.salt); state.autoChat = true; }
   return setKey(seed);
 }
 
@@ -134,10 +136,12 @@ async function unlock() {
   const out = a.getClientExtensionResults().prf?.results?.first;
   if (!out) throw new Error('the passkey answered without its PRF secret; nothing can be unlocked with that');
   state.wrapKey = await deriveWrapKey(out, v.salt);
+  state.autoChat = true;
 }
 
 function lock() {
   state.wrapKey = null; state.priv = null; state.name = null;
+  leaveChat();
 }
 
 async function ensureUnlocked() {
@@ -220,9 +224,9 @@ async function patronStatus(account) {
 }
 
 // A signed read: the headers the node checks, over the query string (none here).
-async function signedGet(path) {
+async function signedGet(path, query = '') {
   const { account } = await getKey();
-  return api(path, { headers: { 'x-miot-signer': account, 'x-miot-sig': await sign(new Uint8Array(0)) } });
+  return api(path, { headers: { 'x-miot-signer': account, 'x-miot-sig': await sign(enc.encode(query)) } });
 }
 
 // The nickname is the chain's, not ours: once approved, read it back.
@@ -234,6 +238,124 @@ async function myName() {
   const me = (body.approved || []).find((p) => p.account === account);
   state.name = me ? me.name : null;
   return state.name;
+}
+
+// ---------------------------------------------------------------- chat
+
+// account hex → name: the roster, then approved patrons, then root (a Said
+// from root carries `root: true`, and that account is remembered, so root's
+// approvals read as root's too). Anything else shows as its first 8 hex.
+const names = new Map();
+async function loadNames() {
+  const r = await signedGet('/roster');
+  for (const m of r.body || []) names.set(m.account, m.name);
+  const p = await signedGet('/patrons');
+  for (const m of (p.body && p.body.approved) || []) names.set(m.account, m.name);
+}
+const nameOf = (a) => (a ? names.get(a) || a.slice(0, 8) : '?');
+
+// One event → what to show. Same sentences as `kot log` (client.rs
+// render_effect), so the phone and the terminal agree on what happened.
+function describe(eff) {
+  const t = eff.t || '';
+  if (eff.t === 'said' && eff.root && eff.from) names.set(eff.from, 'root');
+  const n = (f) => nameOf(eff[f]);
+  const task = () => eff.task || '?';
+  const otr = eff.off_record ? ' (off the record)' : '';
+  switch (t) {
+    case 'said': return { speech: true, from: eff.from, who: n('from'), to: eff.to ? nameOf(eff.to) : null, body: eff.body + otr };
+    case 'message': {
+      let extra = eff.parent != null ? ` ↩#${eff.parent}` : '';
+      for (const tag of eff.tags || []) extra += ` #${tag}`;
+      return { speech: true, from: eff.from, who: n('from'), to: null, body: eff.body + otr + extra };
+    }
+    case 'reacted': return { text: `${n('who')} reacted ${eff.emoji} on #${eff.target}` };
+    case 'voted': return { text: `${n('who')} voted ${eff.up ? 'up' : 'down'} on §${eff.artifact}` };
+    case 'patron_requested': return { text: `${eff.name} asked to be a patron (carried by ${n('carrier')}): ${eff.note}` };
+    case 'patron_approved': return { text: `${n('by')} approved ${eff.name} as a patron` };
+    case 'patron_rejected': return { text: `${n('by')} turned down ${n('who')}'s patron request` };
+    case 'patron_revoked': return { text: `${n('by')} revoked patron ${n('who')}` };
+    case 'opened': return { text: `${n('who')} opened ${task()}: ${eff.text}` };
+    case 'planned': return { text: `${n('who')} planned ${task()} into ${eff.count} subtask(s)` };
+    case 'assigned': return { text: `${task()} assigned to ${n('to')}: ${eff.what}` };
+    case 'directed': return { text: `${n('to')} directed on ${task()}: ${eff.directive}` };
+    case 'nudge': return { text: `${n('to')} nudged on ${task()} (${eff.remaining} left${eff.last ? ', last' : ''})` };
+    case 'record': return { text: `${n('who')} ${eff.act} on ${task()}${eff.text ? ': ' + eff.text : ''}` };
+    case 'requeued': return { text: `${task()} requeued from ${n('from')}: ${eff.why}` };
+    case 'budget_spent': return { text: `${n('holder')} spent its nudge budget on ${task()}` };
+    case 'closed': return { text: `${task()} closed by ${n('author')}: ${eff.title}` };
+    case 'failed': return { text: `${task()} failed` };
+    case 'rehomed': return { text: `${task()} rehomed from ${n('from')} to ${n('to')}` };
+    case 'standalone_artifact': return { text: `${n('author')} published artifact ${eff.id}: ${eff.title}` };
+    case 'stats_reported': return { text: `${n('who')} reported its stats` };
+    default: return { text: JSON.stringify(eff) };
+  }
+}
+
+const chat = { cursor: 0, timer: null, lastDay: null, me: null };
+const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+const dayOf = (ms) => new Date(ms).toDateString();
+
+function appendEvent(e) {
+  const log = $('#log');
+  if (e.at && dayOf(e.at) !== chat.lastDay) {
+    chat.lastDay = dayOf(e.at);
+    const d = document.createElement('div'); d.className = 'day';
+    d.textContent = new Date(e.at).toLocaleDateString([], { weekday: 'long', day: 'numeric', month: 'long' });
+    log.append(d);
+  }
+  const d = describe(e.effect || {});
+  const el = document.createElement('div');
+  if (d.speech) {
+    el.className = 'msg' + (d.from === chat.me ? ' me' : '');
+    const who = document.createElement('div'); who.className = 'who';
+    who.textContent = d.who;
+    if (d.to) { const to = document.createElement('span'); to.className = 'to'; to.textContent = ` to ${d.to}`; who.append(to); }
+    const stamp = document.createElement('span'); stamp.className = 'stamp'; stamp.textContent = e.at ? clock(e.at) : '';
+    who.append(stamp);
+    const body = document.createElement('div'); body.className = 'body'; body.textContent = d.body;
+    el.append(who, body);
+  } else {
+    el.className = 'line';
+    const stamp = document.createElement('span'); stamp.className = 'stamp'; stamp.textContent = e.at ? clock(e.at) : '';
+    el.append(stamp, document.createTextNode(d.text));
+  }
+  log.append(el);
+}
+
+// Replay from the start, then follow. `/events` is signed over its query
+// string; a head seq below our cursor means the node rebuilt its log
+// (a /clear or a rewind), so we start over: HANDOFF, "seq restarts".
+async function pullEvents() {
+  const q = `since=${chat.cursor}`;
+  const { status, body } = await signedGet(`/events?${q}`, q);
+  if (status !== 200) throw new Error(`events: ${status} ${body.error || ''}`);
+  const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 120;
+  for (const e of body) { appendEvent(e); chat.cursor = Math.max(chat.cursor, e.seq); }
+  if (body.length && nearBottom) window.scrollTo(0, document.body.scrollHeight);
+  return body.length;
+}
+async function followOnce() {
+  const { status, body } = await signedGet('/head');
+  if (status !== 200) throw new Error(`head: ${status}`);
+  if (body.seq < chat.cursor) { chat.cursor = 0; chat.lastDay = null; $('#log').replaceChildren(); status('the node rebuilt its log; replaying'); }
+  if (body.seq > chat.cursor) await pullEvents();
+  $('#chatfoot').textContent = `block ${body.block}, ${chat.cursor} events`;
+}
+async function enterChat() {
+  if (state.view === 'chat') return;
+  state.view = 'chat';
+  chat.me = (await getKey()).account;
+  chat.cursor = 0; chat.lastDay = null; $('#log').replaceChildren();
+  await loadNames();
+  await pullEvents();
+  window.scrollTo(0, document.body.scrollHeight);
+  await followOnce();
+  chat.timer = setInterval(() => followOnce().catch((e) => { $('#chatfoot').textContent = e.message; }), 4000);
+}
+function leaveChat() {
+  clearInterval(chat.timer); chat.timer = null;
+  state.view = 'key';
 }
 
 // ---------------------------------------------------------------- view
@@ -270,6 +392,7 @@ async function showAskStatus(k) {
       if (seq !== askStatusSeq) return;
       el.textContent = name ? `You are ${name}.` : 'Approved, but the teahouse lists no nickname for this key.';
       $('#keycard .name').textContent = name || '';
+      if (name && state.autoChat && state.view !== 'chat') { state.autoChat = false; await enterChat(); render(); }
     }
   } catch (e) {
     if (seq === askStatusSeq) el.textContent = `couldn't reach the API: ${e.message}`;
@@ -322,10 +445,12 @@ async function render() {
   const has = !!state.vault;
   const k = has ? await getKey() : null;
 
+  const inChat = state.view === 'chat' && !!state.wrapKey;
   $('#setup').hidden = has;
-  $('#keys').hidden = !has;
-  $('#access').hidden = !k;
-  $('#passkey').hidden = !has;
+  $('#keys').hidden = !has || inChat;
+  $('#access').hidden = !k || inChat;
+  $('#passkey').hidden = !has || inChat;
+  $('#chat').hidden = !inChat;
 
   if (has) {
     $('#keycard').replaceChildren(...(k ? [keyCard(k)] : []));
@@ -334,17 +459,24 @@ async function render() {
     $('#keys .lede').hidden = !!k;
     $('#passkeystate').textContent = `Set up ${new Date(state.vault.createdAt).toLocaleString()} on this phone. Every unlock asks it for the secret the seed is encrypted with.`;
   }
-  if (k) showAskStatus(k);
+  if (k && !inChat) showAskStatus(k);
 
   const ll = $('#lockline');
   ll.classList.toggle('open', !!state.wrapKey);
   ll.replaceChildren();
   if (k) {
     const dot = document.createElement('span'); dot.className = 'dot';
-    const txt = document.createElement('span'); txt.textContent = state.wrapKey ? 'unlocked' : 'locked';
+    const txt = document.createElement('span'); txt.className = 'state'; txt.textContent = state.wrapKey ? 'unlocked' : 'locked';
     const btn = document.createElement('button'); btn.textContent = state.wrapKey ? 'Lock' : 'Unlock';
     btn.onclick = failing(async () => { state.wrapKey ? lock() : await unlock(); });
-    ll.append(dot, txt, btn);
+    ll.append(dot, txt);
+    if (state.wrapKey && state.name) {
+      const view = document.createElement('button'); view.className = 'view';
+      view.textContent = inChat ? 'Key' : 'Chat';
+      view.onclick = failing(async () => { if (inChat) { leaveChat(); } else { await enterChat(); } });
+      ll.append(view);
+    }
+    ll.append(btn);
   }
 }
 

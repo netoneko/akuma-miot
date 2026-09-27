@@ -26,6 +26,11 @@ browsers without passkey PRF or WebCrypto Ed25519.
   key's standing: none shows the form, pending says so, approved reads the
   nickname back from a signed `/api/patrons` once the key is unlocked.
 
+- Once approved and unlocked the page becomes the chat: a signed
+  `/api/events?since=0` replays everything the node holds, `/api/head` is
+  polled every 4 s to follow, and each effect is rendered with the same
+  sentence `kot log` uses. Read-only for now; `say` is the next step.
+
 Local dev: `python3 overlays/local/webdev.py` and open
 `http://localhost:8080`. Passkeys work on localhost; `file://` has no WebAuthn and no IndexedDB worth trusting. Without an `/api` behind it, the
 access form reports the 404. `overlays/local/webdev.py` serves the page and

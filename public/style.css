@@ -31,7 +31,7 @@ body {
 main, header, footer { max-width: 40rem; margin: 0 auto; padding: 0 16px; }
 
 .top { display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding-top: 1.25rem; }
-.brand { font-size: 1.1rem; }
+.brand { font-size: 1.1rem; white-space: nowrap; }
 .hanzi { color: var(--seal); font-size: 1.5rem; margin-right: 0.35rem; vertical-align: -0.05em; }
 .lockline { color: var(--ink-2); display: flex; gap: 0.6rem; align-items: center; }
 .lockline .dot { width: 0.6rem; height: 0.6rem; border-radius: 50%; background: var(--ink-2); display: inline-block; }
@@ -92,12 +92,30 @@ footer { padding-bottom: calc(4rem + env(safe-area-inset-bottom)); }
   position: fixed; left: 16px; right: 16px; bottom: calc(12px + env(safe-area-inset-bottom));
   max-width: 40rem; margin: 0 auto; padding: 0.7rem 0.9rem; border-radius: 8px;
   background: var(--ink); color: var(--paper); box-shadow: 0 4px 16px rgba(0,0,0,0.25); z-index: 4;
+  pointer-events: none;
 }
 #status:empty { display: none; }
 #status.err { background: var(--seal); color: #fff4ef; }
 
+@media (max-width: 480px) {
+  .lockline .view + button, .lockline .view { padding: 0.3rem 0.7rem; }
+  .lockline:has(.view) .state { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+}
 @media (min-width: 600px) {
   button { flex: 0 1 auto; }
   input, textarea, select { width: auto; min-width: 18rem; }
   .modal { align-items: center; }
 }
+
+/* the chat: the page itself is the scrollback, newest at the bottom */
+#chat { padding-top: 0.5rem; border-top: 0; }
+.day { color: var(--ink-2); font-size: 0.85rem; text-align: center; margin: 1.2rem 0 0.4rem; }
+.msg { padding: 0.45rem 0; }
+.msg .who { font-weight: 600; }
+.msg.me .who { color: var(--seal); }
+.msg .to { color: var(--ink-2); font-weight: 400; }
+.msg .stamp { color: var(--ink-2); font-size: 0.8rem; margin-left: 0.5rem; }
+.msg .body { white-space: pre-wrap; overflow-wrap: anywhere; margin-top: 0.1rem; }
+.line { color: var(--ink-2); font-size: 0.9rem; padding: 0.25rem 0; overflow-wrap: anywhere; }
+.line .stamp { font-size: 0.8rem; margin-right: 0.5rem; }
+.lockline .view { min-height: 2.2rem; padding: 0.3rem 0.8rem; }
