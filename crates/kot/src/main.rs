@@ -191,6 +191,17 @@ struct RunArgs {
     /// set it on just the nodes a patron talks to.
     #[arg(long, env = "MIOT_PATRONS", default_value = "")]
     patrons: String,
+    /// Serve `httpapi` — plain HTTP, for browsers and would-be patrons — on
+    /// this `addr:port`. Bind it to loopback or a private bridge and put
+    /// nginx (with a real certificate) in front; never a public address.
+    /// Off unless set. `docs/HTTPAPI.md`.
+    #[arg(long, env = "MIOT_HTTPAPI_LISTEN")]
+    httpapi_listen: Option<String>,
+    /// Browser origins `httpapi` accepts, comma-separated
+    /// (`https://treehouse.akuma.sh`). A request naming any other `Origin`
+    /// is refused — its CSRF check.
+    #[arg(long, env = "MIOT_HTTPAPI_ORIGINS", default_value = "", value_delimiter = ',')]
+    httpapi_origins: Vec<String>,
     /// No agent loop: this cat's node runs, but no model is called, and every
     /// DM or @name tag is answered "*<name> is currently asleep*". Overrides
     /// --llm/--glm/--openrouter.
@@ -369,6 +380,8 @@ async fn run(cli: &Cli, a: &RunArgs) {
         timing: miot_mesh::Timing { election_min_ms: a.election_min_ms, election_max_ms: a.election_max_ms },
         patrons: patrons.0,
         learner: a.patron,
+        httpapi_listen: a.httpapi_listen.clone(),
+        httpapi_origins: a.httpapi_origins.iter().map(|o| o.trim().trim_end_matches('/').to_string()).filter(|o| !o.is_empty()).collect(),
     };
     let running = node::start(cfg).await.unwrap_or_else(|e| die(e));
 

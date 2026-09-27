@@ -598,3 +598,170 @@ fn messaging_variants_are_appended_in_order() {
     assert_eq!(reacted[0], 16);
     assert_eq!(voted[0], 17);
 }
+
+// ---- patrons -----------------------------------------------------------
+
+/// Someone outside the roster, and a second one.
+const FRIEND: u64 = 9;
+const OTHER: u64 = 10;
+
+fn request(carrier: u64, who: u64, name: &str, note: &str) -> frame_support::dispatch::DispatchResult {
+    let sig = fake_sign(who, &Litter::request_message(name, note));
+    Litter::carry_patron_request(RuntimeOrigin::signed(carrier), who, name.into(), note.into(), sig)
+}
+
+/// A request lands with its note; root approves it; the patron is now a
+/// patron, with the note carried over and a provider to sign with.
+#[test]
+fn a_patron_request_is_carried_then_approved_by_root() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(request(TAMA, FRIEND, "neobeav", "Kirill's friend, wants to watch"));
+        let reqs = Litter::patron_requests();
+        assert_eq!(reqs.len(), 1);
+        assert_eq!(reqs[0].1.note, "Kirill's friend, wants to watch");
+        assert_eq!(reqs[0].1.carrier, TAMA);
+        assert_eq!(System::providers(&FRIEND), 0);
+
+        assert_ok!(Litter::approve_patron(RuntimeOrigin::signed(ROOT), FRIEND));
+        assert!(Litter::patron_requests().is_empty());
+        let p = Litter::patrons();
+        assert_eq!(p[0].0, FRIEND);
+        assert_eq!((p[0].1.name.as_str(), p[0].1.note.as_str(), p[0].1.approved_by), ("neobeav", "Kirill's friend, wants to watch", ROOT));
+        assert_eq!(System::providers(&FRIEND), 1);
+    });
+}
+
+/// The requester's own signature is checked — over this exact name and note,
+/// by this exact key — so nobody can file in someone else's name, and a
+/// signed note can't be swapped for another.
+#[test]
+fn a_patron_request_needs_the_requesters_own_signature() {
+    new_test_ext().execute_with(|| {
+        let sig = fake_sign(OTHER, &Litter::request_message("neobeav", "hi"));
+        assert_noop!(Litter::carry_patron_request(RuntimeOrigin::signed(TAMA), FRIEND, "neobeav".into(), "hi".into(), sig), Error::<Test>::BadSignature);
+        let sig = fake_sign(FRIEND, &Litter::request_message("neobeav", "hi"));
+        assert_noop!(Litter::carry_patron_request(RuntimeOrigin::signed(TAMA), FRIEND, "neobeav".into(), "a different note".into(), sig), Error::<Test>::BadSignature);
+    });
+}
+
+/// Only a member's node may carry one, and the chain bounds what can pile up.
+#[test]
+fn patron_requests_are_carried_by_members_and_bounded() {
+    new_test_ext().execute_with(|| {
+        assert_noop!(request(OTHER, FRIEND, "neobeav", "hi"), Error::<Test>::NotAuthorized);
+        assert_noop!(request(TAMA, KURO, "kuro2", "already a member"), Error::<Test>::AlreadyKnown);
+        assert_noop!(request(TAMA, FRIEND, "tama", "taken by the roster"), Error::<Test>::BadName);
+        assert_noop!(request(TAMA, FRIEND, "Neo Beav", "bad shape"), Error::<Test>::BadName);
+        assert_noop!(request(TAMA, FRIEND, "neobeav", ""), Error::<Test>::TooLong);
+        assert_ok!(request(TAMA, FRIEND, "neobeav", "hi"));
+        assert_noop!(request(TAMA, FRIEND, "neobeav2", "again"), Error::<Test>::AlreadyKnown);
+        assert_noop!(request(TAMA, OTHER, "neobeav", "same name"), Error::<Test>::BadName);
+        for i in 1..crate::MAX_PATRON_REQUESTS as u64 {
+            assert_ok!(request(TAMA, 100 + i, &format!("p{i}"), "hi"));
+        }
+        assert_noop!(request(TAMA, 999, "late", "hi"), Error::<Test>::TooManyRequests);
+    });
+}
+
+/// A patron approves the next one; a stranger can't approve anything.
+#[test]
+fn a_patron_can_approve_another_and_a_stranger_cannot() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(request(TAMA, FRIEND, "neobeav", "hi"));
+        assert_ok!(request(TAMA, OTHER, "otter", "friend of neobeav"));
+        assert_noop!(Litter::approve_patron(RuntimeOrigin::signed(OTHER), FRIEND), Error::<Test>::NotAuthorized);
+        assert_noop!(Litter::approve_patron(RuntimeOrigin::signed(TAMA), FRIEND), Error::<Test>::NotAuthorized);
+        assert_ok!(Litter::approve_patron(RuntimeOrigin::signed(ROOT), FRIEND));
+        assert_ok!(Litter::approve_patron(RuntimeOrigin::signed(FRIEND), OTHER));
+        assert!(Litter::is_patron(&OTHER));
+        assert_noop!(Litter::approve_patron(RuntimeOrigin::signed(ROOT), 777), Error::<Test>::NoSuchPatron);
+    });
+}
+
+#[test]
+fn a_patron_request_can_be_rejected() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(request(TAMA, FRIEND, "neobeav", "hi"));
+        assert_noop!(Litter::reject_patron_request(RuntimeOrigin::signed(TAMA), FRIEND), Error::<Test>::NotAuthorized);
+        assert_ok!(Litter::reject_patron_request(RuntimeOrigin::signed(ROOT), FRIEND));
+        assert!(Litter::patron_requests().is_empty() && !Litter::is_patron(&FRIEND));
+        // Rejected isn't banned: it may ask again.
+        assert_ok!(request(TAMA, FRIEND, "neobeav", "second try"));
+    });
+}
+
+/// Root, or whoever approved it — not another patron. No cascade.
+#[test]
+fn revoking_is_root_or_the_approver_and_does_not_cascade() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(request(TAMA, FRIEND, "neobeav", "hi"));
+        assert_ok!(request(TAMA, OTHER, "otter", "hi"));
+        assert_ok!(Litter::approve_patron(RuntimeOrigin::signed(ROOT), FRIEND));
+        assert_ok!(Litter::approve_patron(RuntimeOrigin::signed(FRIEND), OTHER));
+        // OTHER didn't approve FRIEND.
+        assert_noop!(Litter::revoke_patron(RuntimeOrigin::signed(OTHER), FRIEND), Error::<Test>::NotAuthorized);
+        // Root revokes FRIEND; OTHER, whom FRIEND approved, stays.
+        assert_ok!(Litter::revoke_patron(RuntimeOrigin::signed(ROOT), FRIEND));
+        assert!(!Litter::is_patron(&FRIEND) && Litter::is_patron(&OTHER));
+        assert_eq!(System::providers(&FRIEND), 0);
+        // FRIEND could revoke OTHER while it was a patron — now it's no one.
+        assert_noop!(Litter::revoke_patron(RuntimeOrigin::signed(FRIEND), OTHER), Error::<Test>::NotAuthorized);
+    });
+}
+
+/// A patron talks and approves; the member verbs are refused on chain.
+#[test]
+fn a_patron_may_talk_but_not_act_as_a_member() {
+    new_test_ext().execute_with(|| {
+        assert_ok!(request(TAMA, FRIEND, "neobeav", "hi"));
+        assert_ok!(Litter::approve_patron(RuntimeOrigin::signed(ROOT), FRIEND));
+        let f = || RuntimeOrigin::signed(FRIEND);
+        assert_ok!(Litter::say(f(), Some(TAMA), "hello from outside".into(), false, false));
+        assert_ok!(Litter::post(f(), MessageId(7), None, "a post".into(), None, None, vec![], false, false));
+        assert_ok!(Litter::react(f(), MessageId(7), "👍".into()));
+        assert_noop!(Litter::open(f(), "a task".into()), Error::<Test>::NotAuthorized);
+        assert_noop!(Litter::publish_standalone_artifact(f(), "# note".into()), Error::<Test>::NotAuthorized);
+        assert_noop!(Litter::report_stats2(f(), 1, 1, 1, 1, 1), Error::<Test>::NotAuthorized);
+        assert_noop!(Litter::clear_all(f()), Error::<Test>::NotAuthorized);
+        assert_noop!(request(FRIEND, OTHER, "otter", "carried by a patron"), Error::<Test>::NotAuthorized);
+    });
+}
+
+/// A replica folds the effects the primary emitted, never the extrinsics:
+/// it must end up with the same requests, patrons and providers.
+#[test]
+fn a_replica_folding_patron_effects_matches_the_primary() {
+    let effects = new_test_ext().execute_with(|| {
+        assert_ok!(request(TAMA, FRIEND, "neobeav", "hi"));
+        assert_ok!(request(TAMA, OTHER, "otter", "hi"));
+        assert_ok!(Litter::approve_patron(RuntimeOrigin::signed(ROOT), FRIEND));
+        assert_ok!(Litter::approve_patron(RuntimeOrigin::signed(FRIEND), OTHER));
+        assert_ok!(Litter::revoke_patron(RuntimeOrigin::signed(ROOT), FRIEND));
+        let fx: Vec<Effect<u64>> = System::events()
+            .into_iter()
+            .filter_map(|r| match r.event {
+                RuntimeEvent::Litter(crate::Event::Happened(e)) => Some(e),
+                _ => None,
+            })
+            .collect();
+        (fx, Litter::patrons(), Litter::patron_requests(), System::providers(&FRIEND), System::providers(&OTHER))
+    });
+    new_test_ext().execute_with(|| {
+        for e in &effects.0 {
+            Litter::replay_effect(e, 1);
+        }
+        assert_eq!(Litter::patrons(), effects.1);
+        assert_eq!(Litter::patron_requests(), effects.2);
+        assert_eq!((System::providers(&FRIEND), System::providers(&OTHER)), (effects.3, effects.4));
+    });
+}
+
+/// The patron variants are appended after every older one.
+#[test]
+fn patron_variants_are_appended_in_order() {
+    use codec::Encode;
+    assert_eq!(Effect::<u64>::PatronRequested { who: 1, name: String::new(), note: String::new(), carrier: 2 }.encode()[0], 18);
+    assert_eq!(Effect::<u64>::PatronApproved { who: 1, name: String::new(), by: 2 }.encode()[0], 19);
+    assert_eq!(Effect::<u64>::PatronRejected { who: 1, by: 2 }.encode()[0], 20);
+    assert_eq!(Effect::<u64>::PatronRevoked { who: 1, by: 2 }.encode()[0], 21);
+}

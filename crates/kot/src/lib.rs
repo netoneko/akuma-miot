@@ -14,6 +14,7 @@ pub mod agent;
 pub mod chat;
 pub mod client;
 pub mod common;
+pub mod httpapi;
 pub mod local_tasks;
 pub mod agent_state_machine;
 pub mod langfuse_log;

@@ -127,6 +127,12 @@ pub struct NodeConfig {
     /// never vote or write. Per node, not genesis, so it can change with a
     /// restart of just the nodes a patron talks to. See the module doc.
     pub patrons: Vec<(String, AccountId)>,
+    /// `httpapi` (`crate::httpapi`): plain HTTP on this `addr:port`, for
+    /// browsers and would-be patrons. `None`: not served. Never on a
+    /// learner — a patron's node can't carry a request.
+    pub httpapi_listen: Option<String>,
+    /// Browser origins `httpapi` accepts (its CSRF check).
+    pub httpapi_origins: Vec<String>,
     /// This node is a patron itself: it never campaigns and never votes
     /// ([`Mesh::learner`]), so it never produces.
     pub learner: bool,
@@ -188,6 +194,16 @@ pub struct Node {
     /// When each patron last polled us, and the status it sent — kept
     /// here for `kot peers` only, never handed to [`Mesh`].
     patrons_seen: BTreeMap<String, (u64, Status)>,
+    /// Patrons approved on chain (`pallet_litter::Patrons`), by name — a
+    /// cache of state, refreshed by [`Node::refresh_patrons`] whenever a
+    /// block carries a patron effect and after any rebuild. Readers like
+    /// `--patrons`, and also writers: the pallet decides which calls.
+    chain_patrons: Vec<(String, AccountId)>,
+    /// [`reader_accounts`] from config — what [`Self::tls_readers`] is
+    /// rebuilt from, plus [`Self::chain_patrons`].
+    static_readers: Vec<AccountId>,
+    /// The TLS listener's live pin set, shared with it.
+    tls_readers: tls::Readers,
     /// This node's own keypair — signs outgoing mesh-internal traffic.
     identity: Identity,
     mesh: Mesh,
@@ -416,6 +432,12 @@ fn render(e: &Effect<AccountId>) -> serde_json::Value {
         Effect::Voted { who, artifact, up } => {
             json!({"t":"voted","who":to_hex(who),"artifact":artifact.to_string(),"up":up})
         }
+        Effect::PatronRequested { who, name, note, carrier } => {
+            json!({"t":"patron_requested","who":to_hex(who),"name":name,"note":note,"carrier":to_hex(carrier)})
+        }
+        Effect::PatronApproved { who, name, by } => json!({"t":"patron_approved","who":to_hex(who),"name":name,"by":to_hex(by)}),
+        Effect::PatronRejected { who, by } => json!({"t":"patron_rejected","who":to_hex(who),"by":to_hex(by)}),
+        Effect::PatronRevoked { who, by } => json!({"t":"patron_revoked","who":to_hex(who),"by":to_hex(by)}),
     }
 }
 
@@ -550,6 +572,9 @@ impl Node {
             members: members_of(&cfg.roster),
             patrons: cfg.patrons.clone(),
             patrons_seen: BTreeMap::new(),
+            chain_patrons: Vec::new(),
+            static_readers: reader_accounts(cfg),
+            tls_readers: tls::readers(reader_accounts(cfg)),
             identity: cfg.identity,
             mesh,
             producing: false,
@@ -666,7 +691,46 @@ impl Node {
     /// poll, the block log and the client-facing GETs. Voting, pushing
     /// blocks and posting activity stay [`is_trusted_signer`]-only.
     fn is_reader(&self, a: &AccountId) -> bool {
-        self.is_trusted_signer(a) || *a == self.identity.account() || self.patrons.iter().any(|(_, f)| f == a)
+        self.is_trusted_signer(a) || *a == self.identity.account() || self.patrons.iter().any(|(_, f)| f == a) || self.is_chain_patron(a)
+    }
+
+    /// Approved on chain — see [`Self::chain_patrons`].
+    fn is_chain_patron(&self, a: &AccountId) -> bool {
+        self.chain_patrons.iter().any(|(_, f)| f == a)
+    }
+
+    /// Who a write may come from: a genesis account, or a chain patron
+    /// (which the pallet then limits to talking and approving). A
+    /// `--patrons` reader still can't write.
+    fn can_write(&self, a: &AccountId) -> bool {
+        self.is_trusted_signer(a) || self.is_chain_patron(a)
+    }
+
+    /// A patron's name for display, whichever list it's on.
+    fn patron_name(&self, a: &AccountId) -> Option<String> {
+        self.patrons.iter().chain(self.chain_patrons.iter()).find(|(_, f)| f == a).map(|(n, _)| n.clone())
+    }
+
+    /// Re-read [`Self::chain_patrons`] from state and hand the listener its
+    /// new pin set: approved patrons in from the next block, revoked ones
+    /// out. An open connection from a revoked one still gets refused, by
+    /// the per-request header gates (`is_reader`).
+    fn refresh_patrons(&mut self) {
+        let patrons: Vec<(String, AccountId)> = self.ext.execute_with(|| pallet_litter::Pallet::<Runtime>::patrons().into_iter().map(|(a, p)| (p.name, a)).collect());
+        let mut readers = self.static_readers.clone();
+        readers.extend(patrons.iter().map(|(_, a)| a.clone()).filter(|a| !self.static_readers.contains(a)));
+        *self.tls_readers.write().expect("readers lock") = readers;
+        self.chain_patrons = patrons;
+    }
+
+    /// Run `f` against this node's chain state — for `httpapi`'s reads.
+    pub fn with_state<R>(&mut self, f: impl FnOnce() -> R) -> R {
+        self.ext.execute_with(f)
+    }
+
+    /// The listener's live pin set — see [`Self::tls_readers`].
+    pub fn tls_readers(&self) -> tls::Readers {
+        self.tls_readers.clone()
     }
 
     /// The whole litter table, SCALE-encoded — counters `/tasks` doesn't
@@ -677,6 +741,10 @@ impl Node {
     }
 
     fn absorb(&mut self, effects: Vec<Effect<AccountId>>) {
+        let patrons_moved = effects.iter().any(|e| matches!(e, Effect::PatronApproved { .. } | Effect::PatronRevoked { .. }));
+        if patrons_moved {
+            self.refresh_patrons();
+        }
         for e in effects {
             self.seq += 1;
             // `"*"` is the broadcast sentinel every agent's own filter
@@ -852,6 +920,8 @@ impl Node {
             let (effects, at) = open_body(&body).expect("corrupt block body in store");
             self.apply_block(h, effects, at);
         }
+        // A checkpoint carries patrons in its state, with no effect to say so.
+        self.refresh_patrons();
     }
 
     /// Throw away in-memory state and rebuild it from the store alone — on
@@ -1760,6 +1830,7 @@ pub fn router(shared: Shared) -> Router {
         .route("/notes", get(standalone_artifacts))
         .route("/artifacts", get(all_artifacts))
         .route("/stats", get(all_stats))
+        .route("/patrons", get(patrons))
         .route("/tasks", get(tasks))
         .route("/chain/head", get(chain_head))
         .route("/chain/blocks", get(chain_blocks))
@@ -1812,9 +1883,10 @@ pub async fn start(cfg: NodeConfig) -> Result<Running, String> {
         if cfg.peers.is_empty() { "none (a mesh of one)".to_string() } else { cfg.peers.join(",") },
         cfg.block_ms,
     );
+    let readers = node.tls_readers();
     let shared: Shared = Arc::new(Mutex::new(node));
     let tcp = tokio::net::TcpListener::bind((cfg.bind.as_str(), cfg.port)).await.map_err(|e| format!("bind {}:{}: {e}", cfg.bind, cfg.port))?;
-    let listener = tls::TlsListener::new(tcp, tls::server_config(&cfg.identity, reader_accounts(&cfg)));
+    let listener = tls::TlsListener::new(tcp, tls::server_config(&cfg.identity, readers));
     let addr = listener.local_addr().map_err(|e| e.to_string())?;
     let mut tasks = Vec::new();
 
@@ -1857,6 +1929,14 @@ pub async fn start(cfg: NodeConfig) -> Result<Running, String> {
         }
     }));
 
+    if let Some(listen) = cfg.httpapi_listen.as_deref() {
+        if cfg.learner {
+            eprintln!("[httpapi] not served: a patron's node can't carry requests (--httpapi-listen ignored)");
+        } else {
+            tasks.push(crate::httpapi::serve(shared.clone(), listen, cfg.httpapi_origins.clone()).await?);
+        }
+    }
+
     let app = router(shared.clone());
     tasks.push(tokio::spawn(async move {
         if let Err(e) = axum::serve(listener, app).await {
@@ -1890,7 +1970,7 @@ async fn mesh_status_post(AxState(n): AxState<Shared>, headers: HeaderMap, body:
     if !n.is_trusted_signer(&signer) {
         if let Ok(wire) = serde_json::from_slice::<StatusWire>(&body) {
             let now = n.now_ms();
-            let name = n.patrons.iter().find(|(_, a)| *a == signer).map(|(name, _)| name.clone());
+            let name = n.patron_name(&signer);
             n.patrons_seen.insert(name.unwrap_or_else(|| miot_keys::to_hex(&signer)), (now, wire.status));
         }
         return signed_json(&n.identity, StatusCode::OK, &n.status_wire());
@@ -1937,7 +2017,7 @@ async fn activity_post(AxState(n): AxState<Shared>, headers: HeaderMap, body: By
 
 /// `GET /activity`: every cat's live record this node has heard — its own
 /// first, then each peer's, with how old each is now.
-async fn activity_get(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+pub(crate) async fn activity_get(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
@@ -2058,12 +2138,12 @@ async fn chain_checkpoint(AxState(n): AxState<Shared>, headers: HeaderMap) -> Re
 }
 
 #[derive(Deserialize)]
-struct Since {
+pub(crate) struct Since {
     #[serde(default)]
     since: u64,
 }
 
-async fn head(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+pub(crate) async fn head(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
@@ -2076,7 +2156,7 @@ async fn head(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     Json(serde_json::json!({"block":block,"seq":seq,"leader":leader,"closed":closed,"last_checkpoint":last_checkpoint})).into_response()
 }
 
-async fn events(AxState(n): AxState<Shared>, uri: Uri, headers: HeaderMap, Query(q): Query<Since>) -> Response {
+pub(crate) async fn events(AxState(n): AxState<Shared>, uri: Uri, headers: HeaderMap, Query(q): Query<Since>) -> Response {
     let n = n.lock().await;
     // Signed over the raw query string, same rule as `/chain/blocks`.
     if let Err(r) = require_client_auth(&n, &headers, uri.query().unwrap_or("").as_bytes()) {
@@ -2085,7 +2165,7 @@ async fn events(AxState(n): AxState<Shared>, uri: Uri, headers: HeaderMap, Query
     Json(n.log.iter().filter(|e| e.seq > q.since).cloned().collect::<Vec<_>>()).into_response()
 }
 
-async fn tasks(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+pub(crate) async fn tasks(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
@@ -2119,7 +2199,7 @@ async fn tasks(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     Json(rows).into_response()
 }
 
-async fn meta(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+pub(crate) async fn meta(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
@@ -2136,7 +2216,7 @@ async fn meta(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
 
 /// The genesis roster, from chain state (`pallet_litter::Roster`): who is
 /// in this litter, by name. What a client names accounts with.
-async fn roster(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+pub(crate) async fn roster(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
@@ -2148,6 +2228,31 @@ async fn roster(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
             .collect::<Vec<_>>()
     });
     Json(rows).into_response()
+}
+
+/// Patrons approved on chain, and requests waiting — with their notes.
+/// Reader-gated like every other client GET.
+pub(crate) async fn patrons(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+    let mut n = n.lock().await;
+    if let Err(r) = require_client_auth(&n, &headers, b"") {
+        return r;
+    }
+    Json(patrons_json(&mut n)).into_response()
+}
+
+pub(crate) fn patrons_json(n: &mut Node) -> serde_json::Value {
+    use miot_keys::to_hex;
+    n.ext.execute_with(|| {
+        let approved: Vec<_> = pallet_litter::Pallet::<Runtime>::patrons()
+            .into_iter()
+            .map(|(a, p)| serde_json::json!({"account":to_hex(&a),"name":p.name,"note":p.note,"approved_by":to_hex(&p.approved_by),"at":p.at}))
+            .collect();
+        let pending: Vec<_> = pallet_litter::Pallet::<Runtime>::patron_requests()
+            .into_iter()
+            .map(|(a, r)| serde_json::json!({"account":to_hex(&a),"name":r.name,"note":r.note,"carrier":to_hex(&r.carrier),"at":r.at}))
+            .collect();
+        serde_json::json!({"approved": approved, "pending": pending})
+    })
 }
 
 /// Where a replica sends what only the primary can answer. `None` while
@@ -2202,7 +2307,7 @@ async fn forward(http: &reqwest::Client, req: reqwest::RequestBuilder) -> (Statu
 /// A replica's nonce lags the primary's by up to a sync interval — enough to
 /// get a signed extrinsic refused as stale — so the nonce comes from
 /// wherever the extrinsic will land.
-async fn account(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: HeaderMap) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) async fn account(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: HeaderMap) -> (StatusCode, Json<serde_json::Value>) {
     let Ok(who) = miot_keys::from_hex(&id) else {
         return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"error":"bad account hex"})));
     };
@@ -2237,7 +2342,7 @@ async fn account(AxState(n): AxState<Shared>, Path(id): Path<String>, headers: H
 /// `mempool_round` keeps trying it every mesh tick (`HANDOFF.md`, "One-way
 /// reachability": a push-only follower otherwise has no way to write at
 /// all while the primary is on the side it can't reach).
-async fn accept_extrinsic(n: &Shared, body: Bytes) -> (StatusCode, Json<serde_json::Value>) {
+pub(crate) async fn accept_extrinsic(n: &Shared, body: Bytes) -> (StatusCode, Json<serde_json::Value>) {
     let hash = tx_hash(&body);
     // Only a genesis account can ever land a write (`catnip`), so a
     // signer that isn't one is refused here, with the chain's own answer,
@@ -2245,7 +2350,7 @@ async fn accept_extrinsic(n: &Shared, body: Bytes) -> (StatusCode, Json<serde_js
     // until some primary says the same thing. Patrons reach this door
     // (TLS lets them in to read), and this is what keeps it read-only.
     if let Ok(UncheckedExtrinsic { preamble: sp_runtime::generic::Preamble::Signed(who, ..), .. }) = UncheckedExtrinsic::decode(&mut &body[..]) {
-        if !n.lock().await.is_trusted_signer(&who) {
+        if !n.lock().await.can_write(&who) {
             return (StatusCode::UNPROCESSABLE_ENTITY, Json(serde_json::json!({"ok":false,"error":"rejected: Invalid(Payment)"})));
         }
     }
@@ -2288,6 +2393,65 @@ async fn submit(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode, Json<s
     accept_extrinsic(&n, body).await
 }
 
+/// Carry a stranger's patron request onto the chain, signed by this node's
+/// own (member) key — the stranger has no providers to sign with. `sig` is
+/// checked here first, so a bad one costs no nonce; the chain checks it
+/// again (`pallet_litter::Call::carry_patron_request`) and that's the one
+/// that counts. The cat on this node signs with the same account, so its
+/// nonce can move under us: a stale one is retried, like `Cat::submit`.
+pub(crate) async fn carry_patron_request(n: &Shared, who: AccountId, name: String, note: String, sig: [u8; 64]) -> (StatusCode, Json<serde_json::Value>) {
+    use pallet_litter::VerifyPatronRequest;
+    let refuse = |code: StatusCode, e: &str| (code, Json(serde_json::json!({"ok":false,"error":e})));
+    let (identity, meta) = {
+        let mut g = n.lock().await;
+        let message = g.ext.execute_with(|| pallet_litter::Pallet::<Runtime>::request_message(&name, &note));
+        if !miot_runtime::Ed25519PatronSignature::verify(&who, &message, &sig) {
+            return refuse(StatusCode::UNPROCESSABLE_ENTITY, "rejected: BadSignature (sign the request_message for this name and note with the key you're asking for)");
+        }
+        if g.can_write(&who) {
+            return refuse(StatusCode::UNPROCESSABLE_ENTITY, "rejected: AlreadyKnown (already a member or a patron)");
+        }
+        let genesis_hash = g.ext.execute_with(|| System::block_hash(0u64));
+        (g.identity, miot_runtime::client::Meta { genesis_hash, spec_version: VERSION.spec_version, tx_version: VERSION.transaction_version })
+    };
+    let me = identity.account();
+    let call = miot_runtime::RuntimeCall::Litter(pallet_litter::Call::carry_patron_request { who, name, note, sig });
+    let mut last = refuse(StatusCode::SERVICE_UNAVAILABLE, "not tried");
+    for attempt in 0..3u64 {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_millis(500 * attempt)).await;
+        }
+        let nonce = match route(n).await {
+            Route::Primary(p, http, identity) => {
+                let signed = sign_headers(&identity, b"");
+                let got = http.get(format!("{p}/account/{}", miot_keys::to_hex(&me))).headers(signed).send().await;
+                match got {
+                    Ok(r) => match r.json::<serde_json::Value>().await.ok().and_then(|v| v["nonce"].as_u64()) {
+                        Some(nonce) => nonce as u32,
+                        None => {
+                            last = refuse(StatusCode::BAD_GATEWAY, "the primary didn't give a nonce");
+                            continue;
+                        }
+                    },
+                    Err(e) => {
+                        last = refuse(StatusCode::BAD_GATEWAY, &format!("primary unreachable: {e}"));
+                        continue;
+                    }
+                }
+            }
+            Route::Here | Route::Nobody(_) => n.lock().await.ext.execute_with(|| frame_system::Pallet::<Runtime>::account_nonce(&me)),
+        };
+        let uxt = miot_runtime::client::sign(&identity, call.clone(), nonce, &meta);
+        let out = accept_extrinsic(n, Bytes::from(uxt.encode())).await;
+        let err = out.1 .0["error"].as_str().unwrap_or("").to_string();
+        if !(err.contains("Stale") || err.contains("Future")) {
+            return out;
+        }
+        last = out;
+    }
+    last
+}
+
 /// A peer relaying an extrinsic it couldn't forward either — see
 /// `mempool_round`. Same acceptance path as `/submit`; the only difference
 /// is who called it.
@@ -2303,7 +2467,7 @@ async fn mempool_relay(AxState(n): AxState<Shared>, body: Bytes) -> (StatusCode,
 /// "never seen" and "seen, but the node that resolved it has since been
 /// evicted or lost leadership" — `tx_status` isn't persisted or replicated,
 /// so either looks the same from here.
-async fn tx_status(AxState(n): AxState<Shared>, Path(hash_hex): Path<String>, headers: HeaderMap) -> Response {
+pub(crate) async fn tx_status(AxState(n): AxState<Shared>, Path(hash_hex): Path<String>, headers: HeaderMap) -> Response {
     {
         let n = n.lock().await;
         if let Err(r) = require_client_auth(&n, &headers, b"") {
@@ -2455,7 +2619,7 @@ fn comments_json(n: &mut Node, a: miot_primitives::ArtifactId, epoch: Option<u32
     )
 }
 
-async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, Query(query): Query<std::collections::HashMap<String, String>>, headers: HeaderMap) -> Response {
+pub(crate) async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, Query(query): Query<std::collections::HashMap<String, String>>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
@@ -2481,7 +2645,7 @@ async fn artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, Query(que
 /// A standalone artifact — [`Effect::StandaloneArtifact`], no task behind it.
 /// `id` is its own counter, never a `TaskId`, so this is a separate route
 /// from `/artifact`.
-async fn standalone_artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, Query(query): Query<std::collections::HashMap<String, String>>, headers: HeaderMap) -> Response {
+pub(crate) async fn standalone_artifact(AxState(n): AxState<Shared>, Path(id): Path<String>, Query(query): Query<std::collections::HashMap<String, String>>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
@@ -2506,7 +2670,7 @@ async fn standalone_artifact(AxState(n): AxState<Shared>, Path(id): Path<String>
 
 /// Every standalone artifact, oldest first — title and author only; `GET
 /// /note/{id}` has the body.
-async fn standalone_artifacts(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+pub(crate) async fn standalone_artifacts(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
@@ -2528,7 +2692,7 @@ async fn standalone_artifacts(AxState(n): AxState<Shared>, headers: HeaderMap) -
 /// collide as long as callers keep the `t` prefix on the task ones —
 /// `ArtifactRead` in `agent.rs` relies on exactly that to route a read to
 /// `/artifact/{id}` or `/note/{id}`.
-async fn all_artifacts(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+pub(crate) async fn all_artifacts(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;
@@ -2550,7 +2714,7 @@ async fn all_artifacts(AxState(n): AxState<Shared>, headers: HeaderMap) -> Respo
 /// authority check beyond `ensure_signed` (a cat can only overwrite its
 /// own row), so this is a straight dump of whatever every account most
 /// recently reported about itself.
-async fn all_stats(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
+pub(crate) async fn all_stats(AxState(n): AxState<Shared>, headers: HeaderMap) -> Response {
     let mut n = n.lock().await;
     if let Err(r) = require_client_auth(&n, &headers, b"") {
         return r;

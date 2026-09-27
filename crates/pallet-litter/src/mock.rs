@@ -55,6 +55,25 @@ impl crate::Config for Test {
     type MaxSubtasks = MaxSubtasks;
     type MaxTasks = MaxTasks;
     type MaxMessage = MaxMessage;
+    type PatronSignature = FakeSignature;
+}
+
+/// The test runtime's accounts are `u64`s, not public keys, so a request
+/// "signature" here is the requester's account in the first 8 bytes and the
+/// message's hash in the next 32 — enough to prove the pallet checks both
+/// who signed and what was signed.
+pub struct FakeSignature;
+impl crate::VerifyPatronRequest<u64> for FakeSignature {
+    fn verify(who: &u64, message: &[u8], sig: &[u8; 64]) -> bool {
+        sig[..8] == who.to_le_bytes() && sig[8..40] == sp_io::hashing::blake2_256(message)
+    }
+}
+
+pub fn fake_sign(who: u64, message: &[u8]) -> [u8; 64] {
+    let mut sig = [0u8; 64];
+    sig[..8].copy_from_slice(&who.to_le_bytes());
+    sig[8..40].copy_from_slice(&sp_io::hashing::blake2_256(message));
+    sig
 }
 
 pub const ROOT: u64 = 1;

@@ -1266,6 +1266,21 @@ pub fn render(time: &str, block: u64, eff: &serde_json::Value, roster: &Roster, 
                 format!("§{}", eff["artifact"].as_str().unwrap_or("?"))
             ),
         ),
+        // Patrons — accounts outside the roster, so the name comes from the
+        // effect itself, not the roster.
+        "patron_requested" => obs(
+            time,
+            block,
+            format!(
+                "{} asked to be a patron (carried by {}): {}",
+                who(eff["name"].as_str().unwrap_or("?")),
+                name_of(eff, "carrier", roster),
+                plain(eff["note"].as_str().unwrap_or(""))
+            ),
+        ),
+        "patron_approved" => obs(time, block, format!("{} approved {} as a patron", who(&name_of(eff, "by", roster)), who(eff["name"].as_str().unwrap_or("?")))),
+        "patron_rejected" => obs(time, block, format!("{} turned down {}'s patron request", who(&name_of(eff, "by", roster)), name_of(eff, "who", roster))),
+        "patron_revoked" => obs(time, block, format!("{} revoked patron {}", who(&name_of(eff, "by", roster)), name_of(eff, "who", roster))),
         other => obs(time, block, format!("{} {}", dim(other), faint(&eff.to_string()))),
     }
 }

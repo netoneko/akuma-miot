@@ -166,7 +166,49 @@ pub mod pallet {
         type MaxTasks: Get<u32>;
         #[pallet::constant]
         type MaxMessage: Get<u32>;
+
+        /// Checks a patron request's own signature — `who`'s ed25519 over
+        /// [`Pallet::request_message`]. A hook rather than a hard-wired
+        /// ed25519 check because an `AccountId` is only a public key in the
+        /// real runtime (`AccountId32`); the test runtime's accounts are
+        /// `u64`s.
+        type PatronSignature: VerifyPatronRequest<Self::AccountId>;
     }
+
+    /// See [`Config::PatronSignature`].
+    pub trait VerifyPatronRequest<AccountId> {
+        fn verify(who: &AccountId, message: &[u8], sig: &[u8; 64]) -> bool;
+    }
+
+    /// A request waiting for root or a patron — [`Pallet::carry_patron_request`].
+    #[derive(Debug, Clone, PartialEq, Eq, codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo)]
+    pub struct PatronRequest<AccountId> {
+        pub name: String,
+        pub note: String,
+        pub at: BlockNumber,
+        /// The member whose node put it on chain.
+        pub carrier: AccountId,
+    }
+
+    /// An approved patron — [`Pallet::approve_patron`].
+    #[derive(Debug, Clone, PartialEq, Eq, codec::Encode, codec::Decode, codec::DecodeWithMemTracking, scale_info::TypeInfo)]
+    pub struct Patron<AccountId> {
+        pub name: String,
+        /// The note from its request.
+        pub note: String,
+        pub approved_by: AccountId,
+        pub at: BlockNumber,
+    }
+
+    /// Requests at once, before new ones are refused: the door that files
+    /// them needs no key, so this is what bounds what a stranger can make
+    /// the chain hold.
+    pub const MAX_PATRON_REQUESTS: u32 = 16;
+    pub const MAX_PATRON_NAME: usize = 32;
+    pub const MAX_PATRON_NOTE: usize = 500;
+    /// What a request signature is over, first — so it can't be replayed as
+    /// a signature over anything else.
+    pub const PATRON_REQUEST_CONTEXT: &[u8] = b"miot/patron-request/v1";
 
     /// The whole table, as one value.
     #[pallet::storage]
@@ -299,6 +341,17 @@ pub mod pallet {
     #[pallet::storage]
     pub type Roster<T: Config> = StorageValue<_, Vec<(String, T::AccountId)>, ValueQuery>;
 
+    /// Patron requests waiting for an answer, by requester.
+    #[pallet::storage]
+    pub type PatronRequests<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, PatronRequest<T::AccountId>, OptionQuery>;
+
+    /// Approved patrons: accounts outside the roster that may read, talk
+    /// (`say`/`post`/`react`/`vote`) and approve or reject other patrons.
+    /// Unlike [`Roster`], this changes by call — the one membership list on
+    /// this chain that isn't genesis.
+    #[pallet::storage]
+    pub type Patrons<T: Config> = StorageMap<_, Blake2_128Concat, T::AccountId, Patron<T::AccountId>, OptionQuery>;
+
     #[pallet::event]
     #[pallet::generate_deposit(pub(super) fn deposit_event)]
     pub enum Event<T: Config> {
@@ -324,6 +377,15 @@ pub mod pallet {
         AlreadySubmitted,
         AlreadyClaimed,
         TooManyTasks,
+        /// A patron request's own signature doesn't verify.
+        BadSignature,
+        /// Already a member, a patron, or waiting on a request.
+        AlreadyKnown,
+        /// No pending request (approve/reject) or no such patron (revoke).
+        NoSuchPatron,
+        /// Empty, too long, or not `[a-z0-9_-]`, or taken.
+        BadName,
+        TooManyRequests,
     }
 
     impl<T: Config> From<TaskError> for Error<T> {
@@ -395,6 +457,7 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn open(origin: OriginFor<T>, text: String) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            Self::ensure_not_patron(&who)?;
             Self::apply(|t, auth, now| t.open(&who, auth, &text, now).map(|(_, fx)| fx), &who)
         }
 
@@ -410,6 +473,7 @@ pub mod pallet {
             assignments: Vec<PlanItem<T::AccountId>>,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            Self::ensure_not_patron(&who)?;
             Self::apply(|t, auth, now| t.plan(&who, auth, parent, &assignments, now), &who)
         }
 
@@ -428,6 +492,7 @@ pub mod pallet {
             text: String,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            Self::ensure_not_patron(&who)?;
             Self::apply(|t, auth, now| t.update(&who, auth, task, act, &text, now), &who)
         }
 
@@ -477,6 +542,7 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn clear_all(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            Self::ensure_not_patron(&who)?;
             Self::apply(|t, auth, now| t.clear_all(auth, now), &who)?;
             // A session boundary is an epoch boundary (`docs/MESSAGING.md`):
             // this is the compaction trigger, so the counter moves with it
@@ -506,6 +572,7 @@ pub mod pallet {
             to: T::AccountId,
         ) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            Self::ensure_not_patron(&who)?;
             Self::apply(|t, auth, now| t.reassign(&who, auth, task, to.clone(), now), &who)
         }
 
@@ -528,6 +595,7 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn publish_standalone_artifact(origin: OriginFor<T>, text: String) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            Self::ensure_not_patron(&who)?;
             Self::apply(|t, _auth, now| t.publish_standalone_artifact(&who, &text, now).map(|(_, fx)| fx), &who)
         }
 
@@ -547,6 +615,7 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn request_compaction(origin: OriginFor<T>) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            Self::ensure_not_patron(&who)?;
             let state = Litter::<T>::get();
             ensure!(Self::authority_of(&who, &state) == miot_primitives::Authority::Root, Error::<T>::NotAuthorized);
             // Same epoch bump as `clear_all`: compaction is the boundary,
@@ -574,6 +643,7 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn report_stats(origin: OriginFor<T>, turns: u32, tool_calls: u32, tokens: u64, ms: u64) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            Self::ensure_not_patron(&who)?;
             Stats::<T>::insert(who.clone(), CatStats { turns, tool_calls, tokens, ms });
             Self::deposit_event(Event::Happened(Effect::StatsReported { who, turns, tool_calls, tokens, ms }));
             Ok(())
@@ -588,6 +658,7 @@ pub mod pallet {
         #[pallet::weight(Weight::from_parts(10_000, 0))]
         pub fn report_stats2(origin: OriginFor<T>, turns: u32, tool_calls: u32, messages: u32, tokens: u64, ms: u64) -> DispatchResult {
             let who = ensure_signed(origin)?;
+            Self::ensure_not_patron(&who)?;
             Stats::<T>::insert(who.clone(), CatStats { turns, tool_calls, tokens, ms });
             MessagesSent::<T>::insert(who.clone(), messages);
             Self::deposit_event(Event::Happened(Effect::StatsReported2 { who, turns, tool_calls, messages, tokens, ms }));
@@ -670,6 +741,76 @@ pub mod pallet {
             let who = ensure_signed(origin)?;
             Votes::<T>::mutate(artifact, |t| cast_vote(t, &who, up));
             Self::deposit_event(Event::Happened(Effect::Voted { who, artifact, up }));
+            Ok(())
+        }
+
+        /// Put a stranger's patron request on chain. The stranger (`who`)
+        /// has no account to sign an extrinsic with — no providers — so a
+        /// member's node carries it, signed by the member; `sig` is `who`'s
+        /// own ed25519 over [`Self::request_message`], so every node can
+        /// check `who` wrote this note and nobody can file one in someone
+        /// else's name. The door that takes these needs no key (`kot`'s
+        /// `httpapi`), which is why the chain itself bounds them: one per
+        /// requester, [`MAX_PATRON_REQUESTS`] at once.
+        #[pallet::call_index(15)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn carry_patron_request(origin: OriginFor<T>, who: T::AccountId, name: String, note: String, sig: [u8; 64]) -> DispatchResult {
+            let carrier = ensure_signed(origin)?;
+            Self::ensure_not_patron(&carrier)?;
+            ensure!(Self::is_member(&carrier), Error::<T>::NotAuthorized);
+            ensure!(!Self::is_member(&who) && !Patrons::<T>::contains_key(&who) && !PatronRequests::<T>::contains_key(&who), Error::<T>::AlreadyKnown);
+            ensure!(!note.is_empty() && note.len() <= MAX_PATRON_NOTE, Error::<T>::TooLong);
+            ensure!(Self::name_is_free(&name), Error::<T>::BadName);
+            ensure!((PatronRequests::<T>::iter_keys().count() as u32) < MAX_PATRON_REQUESTS, Error::<T>::TooManyRequests);
+            ensure!(T::PatronSignature::verify(&who, &Self::request_message(&name, &note), &sig), Error::<T>::BadSignature);
+            let effect = Effect::PatronRequested { who, name, note, carrier };
+            Self::fold_patron(&effect, Self::now());
+            Self::deposit_event(Event::Happened(effect));
+            Ok(())
+        }
+
+        /// Approve a pending request. Root or any patron. From the next
+        /// block the new patron may read, talk and approve others; it gets
+        /// a provider so it can sign its own extrinsics.
+        #[pallet::call_index(16)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn approve_patron(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
+            let by = ensure_signed(origin)?;
+            ensure!(Self::is_root(&by) || Patrons::<T>::contains_key(&by), Error::<T>::NotAuthorized);
+            let req = PatronRequests::<T>::get(&who).ok_or(Error::<T>::NoSuchPatron)?;
+            let effect = Effect::PatronApproved { who, name: req.name, by };
+            Self::fold_patron(&effect, Self::now());
+            Self::deposit_event(Event::Happened(effect));
+            Ok(())
+        }
+
+        /// Turn a pending request down. Root or any patron.
+        #[pallet::call_index(17)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn reject_patron_request(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
+            let by = ensure_signed(origin)?;
+            ensure!(Self::is_root(&by) || Patrons::<T>::contains_key(&by), Error::<T>::NotAuthorized);
+            ensure!(PatronRequests::<T>::contains_key(&who), Error::<T>::NoSuchPatron);
+            let effect = Effect::PatronRejected { who, by };
+            Self::fold_patron(&effect, Self::now());
+            Self::deposit_event(Event::Happened(effect));
+            Ok(())
+        }
+
+        /// Remove an approved patron. Root, or whoever approved it — not
+        /// any other patron, and not the ones it approved in turn (no
+        /// cascade: they stay).
+        #[pallet::call_index(18)]
+        #[pallet::weight(Weight::from_parts(10_000, 0))]
+        pub fn revoke_patron(origin: OriginFor<T>, who: T::AccountId) -> DispatchResult {
+            let by = ensure_signed(origin)?;
+            let p = Patrons::<T>::get(&who).ok_or(Error::<T>::NoSuchPatron)?;
+            // The approver only while it's still a patron itself: a revoked
+            // one keeps no say over the ones it let in.
+            ensure!(Self::is_root(&by) || (p.approved_by == by && Patrons::<T>::contains_key(&by)), Error::<T>::NotAuthorized);
+            let effect = Effect::PatronRevoked { who, by };
+            Self::fold_patron(&effect, Self::now());
+            Self::deposit_event(Event::Happened(effect));
             Ok(())
         }
     }
@@ -764,6 +905,10 @@ pub mod pallet {
                 Votes::<T>::mutate(artifact.clone(), |t| cast_vote(t, who, *up));
                 return;
             }
+            if matches!(effect, Effect::PatronRequested { .. } | Effect::PatronApproved { .. } | Effect::PatronRejected { .. } | Effect::PatronRevoked { .. }) {
+                Self::fold_patron(effect, now);
+                return;
+            }
             if let Effect::Message { from, artifact_id: Some(a), body, .. } = effect {
                 // The comment half of `post` — the same insert the primary
                 // executed, against the same (snapshot-carried) epoch.
@@ -784,6 +929,93 @@ pub mod pallet {
         /// See [`Roster`].
         pub fn roster() -> Vec<(String, T::AccountId)> {
             Roster::<T>::get()
+        }
+
+        /// See [`Patrons`].
+        pub fn patrons() -> Vec<(T::AccountId, Patron<T::AccountId>)> {
+            Patrons::<T>::iter().collect()
+        }
+
+        pub fn is_patron(who: &T::AccountId) -> bool {
+            Patrons::<T>::contains_key(who)
+        }
+
+        /// See [`PatronRequests`].
+        pub fn patron_requests() -> Vec<(T::AccountId, PatronRequest<T::AccountId>)> {
+            PatronRequests::<T>::iter().collect()
+        }
+
+        /// What a patron request signs against: this chain, named by its
+        /// roster (the genesis hash is zero here, so it names nothing).
+        pub fn request_domain() -> [u8; 32] {
+            use sp_runtime::traits::Hash;
+            sp_runtime::traits::BlakeTwo256::hash(&Roster::<T>::get().encode()).0
+        }
+
+        /// The exact bytes a requester signs: context, chain, name, note.
+        pub fn request_message(name: &str, note: &str) -> Vec<u8> {
+            (PATRON_REQUEST_CONTEXT, Self::request_domain(), name, note).encode()
+        }
+
+        fn now() -> BlockNumber {
+            frame_system::Pallet::<T>::block_number().unique_saturated_into()
+        }
+
+        fn is_root(who: &T::AccountId) -> bool {
+            Litter::<T>::get().root.as_ref() == Some(who)
+        }
+
+        fn is_member(who: &T::AccountId) -> bool {
+            Self::is_root(who) || Roster::<T>::get().iter().any(|(_, a)| a == who)
+        }
+
+        /// A patron may talk and approve; everything else here is for
+        /// members. Checked on chain, not just at a node's door, so a node
+        /// that let one through still gets a refusal.
+        fn ensure_not_patron(who: &T::AccountId) -> DispatchResult {
+            ensure!(!Patrons::<T>::contains_key(who), Error::<T>::NotAuthorized);
+            Ok(())
+        }
+
+        /// `[a-z0-9_-]`, 1–32 chars, and nobody's already: not a roster
+        /// name, not a patron's, not a pending request's.
+        fn name_is_free(name: &str) -> bool {
+            let shaped = !name.is_empty()
+                && name.len() <= MAX_PATRON_NAME
+                && name.bytes().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-');
+            shaped
+                && !Roster::<T>::get().iter().any(|(n, _)| n == name)
+                && !Patrons::<T>::iter_values().any(|p| p.name == name)
+                && !PatronRequests::<T>::iter_values().any(|r| r.name == name)
+        }
+
+        /// A patron effect into storage — the live call and the replay path
+        /// both come through here, so a replica (and a replica promoted to
+        /// primary) holds exactly what the primary did, providers included:
+        /// without its provider a patron's own extrinsics fail the nonce
+        /// check on whichever node produces next.
+        fn fold_patron(effect: &Effect<T::AccountId>, now: BlockNumber) {
+            match effect {
+                Effect::PatronRequested { who, name, note, carrier } => {
+                    PatronRequests::<T>::insert(who, PatronRequest { name: name.clone(), note: note.clone(), at: now, carrier: carrier.clone() });
+                }
+                Effect::PatronApproved { who, name, by } => {
+                    let note = PatronRequests::<T>::take(who).map(|r| r.note).unwrap_or_default();
+                    if !Patrons::<T>::contains_key(who) {
+                        frame_system::Pallet::<T>::inc_providers(who);
+                    }
+                    Patrons::<T>::insert(who, Patron { name: name.clone(), note, approved_by: by.clone(), at: now });
+                }
+                Effect::PatronRejected { who, .. } => {
+                    PatronRequests::<T>::remove(who);
+                }
+                Effect::PatronRevoked { who, .. } => {
+                    if Patrons::<T>::take(who).is_some() {
+                        let _ = frame_system::Pallet::<T>::dec_providers(who);
+                    }
+                }
+                _ => {}
+            }
         }
 
         /// An artifact's current tally — `GET /artifact/{id}`'s and

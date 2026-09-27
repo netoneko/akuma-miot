@@ -780,6 +780,10 @@ impl Client {
             }
             "reacted" => format!("{} reacted {} on #{}", self.name(eff, "who"), text("emoji"), eff["target"]),
             "voted" => format!("{} voted {} on §{}", self.name(eff, "who"), if eff["up"].as_bool().unwrap_or(false) { "up" } else { "down" }, eff["artifact"].as_str().unwrap_or("?")),
+            "patron_requested" => format!("{} asked to be a patron (carried by {}): {}", text("name"), self.name(eff, "carrier"), text("note")),
+            "patron_approved" => format!("{} approved {} as a patron", self.name(eff, "by"), text("name")),
+            "patron_rejected" => format!("{} turned down {}'s patron request", self.name(eff, "by"), self.name(eff, "who")),
+            "patron_revoked" => format!("{} revoked patron {}", self.name(eff, "by"), self.name(eff, "who")),
             "opened" => format!("{} opened {}: {}", self.name(eff, "who"), task(), text("text")),
             "planned" => format!("{} planned {} into {} subtask(s)", self.name(eff, "who"), task(), eff["count"]),
             "assigned" => format!("{} assigned to {}: {}", task(), self.name(eff, "to"), text("what")),

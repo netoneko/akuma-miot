@@ -416,6 +416,22 @@ pub enum Effect<A> {
     /// `pallet_litter`'s `Votes` storage; this effect is what replicas
     /// fold to keep it identical.
     Voted { who: A, artifact: ArtifactId, up: bool },
+    /// Broadcast, non-waking: someone outside the roster asked to become a
+    /// patron (`pallet_litter::Call::carry_patron_request`). `who` signed
+    /// the request itself; `carrier` is the member whose node put it on
+    /// chain, since `who` has no account to sign an extrinsic with yet. The
+    /// request row lives in `pallet_litter`'s `PatronRequests`; this is
+    /// what replicas fold to keep it. Appended last, same rule as
+    /// [`Effect::StatsReported2`].
+    PatronRequested { who: A, name: String, note: String, carrier: A },
+    /// Broadcast, non-waking: root or a patron approved `who`'s request.
+    /// From here `who` may read, talk, and approve others.
+    PatronApproved { who: A, name: String, by: A },
+    /// Broadcast, non-waking: a pending request was turned down.
+    PatronRejected { who: A, by: A },
+    /// Broadcast, non-waking: an approved patron was removed — by root, or
+    /// by whoever approved it.
+    PatronRevoked { who: A, by: A },
 }
 
 /// A message's identity: 64 bits chosen by the sender and carried inside

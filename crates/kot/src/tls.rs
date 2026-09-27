@@ -100,19 +100,28 @@ fn account_of(cert: &CertificateDer<'_>) -> Result<AccountId, rustls::Error> {
 /// set, applied to a TLS cert instead of a header signature. `None` trusts
 /// any account — the cert must still be an Ed25519 one this module's shape
 /// accepts, and the handshake signature is still checked against it.
-fn check_trusted(cert: &CertificateDer<'_>, trusted: Option<&[AccountId]>) -> Result<(), rustls::Error> {
+fn check_trusted(cert: &CertificateDer<'_>, trusted: Option<&Readers>) -> Result<(), rustls::Error> {
     let account = account_of(cert)?;
     match trusted {
-        Some(set) if !set.contains(&account) => Err(rustls::Error::General("certificate's account is not trusted".into())),
+        Some(set) if !set.read().expect("readers lock").contains(&account) => Err(rustls::Error::General("certificate's account is not trusted".into())),
         _ => Ok(()),
     }
+}
+
+/// The accounts a pinned end accepts, shared so a node can change it while
+/// its listener runs: a patron approved on chain is let in from the next
+/// block (`Node::refresh_patrons`), without a restart.
+pub type Readers = Arc<std::sync::RwLock<Vec<AccountId>>>;
+
+pub fn readers(accounts: Vec<AccountId>) -> Readers {
+    Arc::new(std::sync::RwLock::new(accounts))
 }
 
 #[derive(Debug)]
 struct Pinned {
     provider: Arc<CryptoProvider>,
     /// `None`: any Ed25519 key (an operator's client, see the module docs).
-    trusted: Option<Vec<AccountId>>,
+    trusted: Option<Readers>,
 }
 
 impl ServerCertVerifier for Pinned {
@@ -124,7 +133,7 @@ impl ServerCertVerifier for Pinned {
         _ocsp_response: &[u8],
         _now: UnixTime,
     ) -> Result<ServerCertVerified, rustls::Error> {
-        check_trusted(end_entity, self.trusted.as_deref())?;
+        check_trusted(end_entity, self.trusted.as_ref())?;
         Ok(ServerCertVerified::assertion())
     }
 
@@ -155,7 +164,7 @@ impl ClientCertVerifier for Pinned {
     }
 
     fn verify_client_cert(&self, end_entity: &CertificateDer<'_>, _intermediates: &[CertificateDer<'_>], _now: UnixTime) -> Result<ClientCertVerified, rustls::Error> {
-        check_trusted(end_entity, self.trusted.as_deref())?;
+        check_trusted(end_entity, self.trusted.as_ref())?;
         Ok(ClientCertVerified::assertion())
     }
 
@@ -182,7 +191,7 @@ fn provider() -> Arc<CryptoProvider> {
 
 /// The mTLS server config for `identity`, requiring and pinning client
 /// certs to `trusted` — used for the node's own TLS listener.
-pub fn server_config(identity: &Identity, trusted: Vec<AccountId>) -> rustls::ServerConfig {
+pub fn server_config(identity: &Identity, trusted: Readers) -> rustls::ServerConfig {
     let provider = provider();
     let verifier: Arc<dyn ClientCertVerifier> = Arc::new(Pinned { provider: provider.clone(), trusted: Some(trusted) });
     let (cert, key) = cert_for(identity);
@@ -211,7 +220,7 @@ pub fn client_config_any_node(identity: &Identity) -> rustls::ClientConfig {
 
 fn configured_client(identity: &Identity, trusted: Option<Vec<AccountId>>) -> rustls::ClientConfig {
     let provider = provider();
-    let verifier: Arc<dyn ServerCertVerifier> = Arc::new(Pinned { provider: provider.clone(), trusted });
+    let verifier: Arc<dyn ServerCertVerifier> = Arc::new(Pinned { provider: provider.clone(), trusted: trusted.map(readers) });
     let (cert, key) = cert_for(identity);
     let mut config = rustls::ClientConfig::builder_with_provider(provider)
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -327,7 +336,7 @@ mod tests {
     async fn handshake_with(server_id: &Identity, server_trusts: Vec<AccountId>, client: rustls::ClientConfig) -> Result<(), String> {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config(server_id, server_trusts)));
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config(server_id, readers(server_trusts))));
         let server = tokio::spawn(async move {
             let (tcp, _) = listener.accept().await.unwrap();
             acceptor.accept(tcp).await.map(|_| ()).map_err(|e| e.to_string())
@@ -388,7 +397,7 @@ mod tests {
         let peer = Identity::from_seed(&[2; 32]);
         let trusted = vec![node.account(), peer.account()];
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let mut listener = TlsListener::new(tcp, server_config(&node, trusted.clone()));
+        let mut listener = TlsListener::new(tcp, server_config(&node, readers(trusted.clone())));
         let addr = axum::serve::Listener::local_addr(&listener).unwrap();
 
         // 200 connections that never send a byte, held open.
@@ -415,7 +424,7 @@ mod tests {
         let node = Identity::from_seed(&[1; 32]);
         let tcp = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = tcp.local_addr().unwrap();
-        drop(TlsListener::new(tcp, server_config(&node, vec![node.account()])));
+        drop(TlsListener::new(tcp, server_config(&node, readers(vec![node.account()]))));
         let t0 = std::time::Instant::now();
         loop {
             if TcpListener::bind(addr).await.is_ok() {

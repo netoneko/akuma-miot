@@ -168,6 +168,17 @@ impl pallet_litter::Config for Runtime {
     type MaxSubtasks = ConstU32<8>;
     type MaxTasks = ConstU32<512>;
     type MaxMessage = ConstU32<2048>;
+    type PatronSignature = Ed25519PatronSignature;
+}
+
+/// An account here *is* an ed25519 public key (`miot-keys`), so a patron
+/// request's signature is checked against the requester's account bytes.
+pub struct Ed25519PatronSignature;
+impl pallet_litter::VerifyPatronRequest<AccountId> for Ed25519PatronSignature {
+    fn verify(who: &AccountId, message: &[u8], sig: &[u8; 64]) -> bool {
+        let key = sp_core::ed25519::Public::from_raw(*<AccountId as AsRef<[u8; 32]>>::as_ref(who));
+        sp_io::crypto::ed25519_verify(&sp_core::ed25519::Signature::from_raw(*sig), message, &key)
+    }
 }
 
 const _: Option<ConstU64<0>> = None;

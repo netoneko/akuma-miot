@@ -514,6 +514,9 @@ impl<A: Clone + Eq> TaskTable<A> {
             // ever reaches `TaskTable::apply`, so this arm never actually
             // runs; it exists only because the match must be exhaustive.
             Effect::StatsReported { .. } | Effect::StatsReported2 { .. } => {}
+            // Patron membership lives in `pallet-litter`'s own storage, folded
+            // by `replay_effect` before it gets here — exhaustiveness only.
+            Effect::PatronRequested { .. } | Effect::PatronApproved { .. } | Effect::PatronRejected { .. } | Effect::PatronRevoked { .. } => {}
         }
     }
 
