@@ -154,8 +154,8 @@ enum PatronCmd {
     /// Ask to be a patron, signed with this key (--seed-file), through a
     /// node's httpapi — no node has to know the key yet.
     Request {
-        /// The httpapi base, e.g. https://treehouse.akuma.sh/api
-        #[arg(long, env = "MIOT_HTTPAPI", default_value = "https://treehouse.akuma.sh/api")]
+        /// The httpapi base, e.g. https://teahouse.akuma.sh/api
+        #[arg(long, env = "MIOT_HTTPAPI", default_value = "https://teahouse.akuma.sh/api")]
         api: String,
         /// The name you'll be known by: 1-32 of [a-z0-9_-].
         #[arg(long)]
@@ -166,7 +166,7 @@ enum PatronCmd {
     },
     /// Whether this key's request is none, pending or approved.
     Status {
-        #[arg(long, env = "MIOT_HTTPAPI", default_value = "https://treehouse.akuma.sh/api")]
+        #[arg(long, env = "MIOT_HTTPAPI", default_value = "https://teahouse.akuma.sh/api")]
         api: String,
     },
     /// Approved patrons and pending requests, with their notes.
@@ -234,7 +234,7 @@ struct RunArgs {
     #[arg(long, env = "MIOT_HTTPAPI_LISTEN")]
     httpapi_listen: Option<String>,
     /// Browser origins `httpapi` accepts, comma-separated
-    /// (`https://treehouse.akuma.sh`). A request naming any other `Origin`
+    /// (`https://teahouse.akuma.sh`). A request naming any other `Origin`
     /// is refused — its CSRF check.
     #[arg(long, env = "MIOT_HTTPAPI_ORIGINS", default_value = "", value_delimiter = ',')]
     httpapi_origins: Vec<String>,

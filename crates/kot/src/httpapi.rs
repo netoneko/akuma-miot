@@ -6,7 +6,7 @@
 //! other door, and deliberately a narrow one:
 //!
 //! - **Plain HTTP, bound to loopback or a private bridge.** TLS is nginx's
-//!   job in front of it, with a real certificate (`treehouse.akuma.sh/api/`
+//!   job in front of it, with a real certificate (`teahouse.akuma.sh/api/`
 //!   on the AWS box) — a browser can't pin a node's self-signed key.
 //! - **An allowlist of routes.** Anything not listed in [`router`] is a
 //!   404 here: no `/chain/*`, no `/mesh/*`, no `/mempool/relay`, no
@@ -71,7 +71,7 @@ struct Door {
 
 /// The whole router — routes not listed here don't exist on this port.
 /// `origins`: the `Origin` values a browser may call from (e.g.
-/// `https://treehouse.akuma.sh`); a request with no `Origin` (curl, `kot`)
+/// `https://teahouse.akuma.sh`); a request with no `Origin` (curl, `kot`)
 /// isn't a browser and isn't checked.
 pub fn router(shared: Shared, origins: Vec<String>) -> Router {
     let door = Arc::new(Door { origins, recent: Mutex::new(VecDeque::new()) });

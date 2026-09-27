@@ -4,7 +4,11 @@
 genesis, five at home and two on AWS. Named 2026-09-24. When the litter was
 asked (teahouse or treehouse?), shiro and yuki both preferred *teahouse*
 ("a place to gather and share stories", "a place to linger rather than rush
-through").
+through"). `httpapi` (2026-09-27) briefly spelled it *treehouse* in code and
+docs, missing this decision — fixed the same day, before either domain had
+DNS: `docs/HTTPAPI.md`, `CLAUDE.md`, `docs/MESH_AUTH.md`,
+`crates/kot/src/{httpapi,main}.rs`, and the AWS terraform's DNS record and
+nginx site all say *teahouse* now.
 
 This page is **what is actually running**, as of 2026-09-24. It supersedes
 `docs/TOPOLOGY_TARGET.md`'s five-agent plan, which predates the AWS

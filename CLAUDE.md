@@ -162,7 +162,7 @@ read that first, it is kept current and this file does not repeat it.
   any member it can reach). Per node, so it rolls out without a new chain.
   `docs/MESH_AUTH.md`, "Patrons". **And on chain (2026-09-27):** a
   would-be patron files a request with a note through `httpapi`
-  (`https://treehouse.akuma.sh/api/`, yuki and shiro only, plain HTTP
+  (`https://teahouse.akuma.sh/api/`, yuki and shiro only, plain HTTP
   behind nginx), root or any patron approves it, and from the next block it
   can read, talk and approve others — no restart, no config.
   `docs/PROTOCOL.md` "Patrons", `docs/HTTPAPI.md`.

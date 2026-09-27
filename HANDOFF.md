@@ -1,18 +1,73 @@
 # Handoff
 
-**Latest: 2026-09-27** — binary rollout of `50379631b156` to tama and the AWS
-pair (yuki, shiro); meow skipped (akuma box was powered off) and sora blocked
-by a permission gate mid-session, still on the previous binary. Full detail
-and exact evidence: `docs/FLEET.md` "Binary rollout, 2026-09-27". Also
-noticed live: `docs/HTTPAPI.md`/`CLAUDE.md` call the httpapi host
-`treehouse.akuma.sh`, but `public/README.md` (the WebUI sharing that origin)
-already says `teahouse.akuma.sh` — matches the mesh's real name (`docs/
-TEAHOUSE.md`, 茶館) and neither domain has DNS yet (`teahouse.akuma.sh`
-doesn't resolve). Worth reconciling to one name before either ships. Then
-**2026-09-26** — `git push` from the trashcan works now (a kernel `fstat` bug, not pack size): "Why git push died on the trashcan". Then read "Tokens, racing tool calls, a multiline composer": why meow was sending ~75k tokens a turn and what bounds it now, GLM on `glm-5.3-flash` with a configured 1M window, `Bash`/`ReadFile`/`WriteFile` in one lane (meow's shredded files), a composer that grows, headers that don't break at 94 columns, and a WAV plus `wavplay` staged on meow's box. Then the 2026-09-25 sections: a kernel CoW bug that killed meow's kot, fixed; followers renamed *patrons*; GLM reasoning `low`; yuki/shiro asleep; writes carried off nodes that can call nobody; conversations that survive a restart; every tool on every wake; `akuma-litter` as the cats' git drop box; `MIOT_CONTEXT`. Older framing, kept: State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
+**Latest: 2026-09-27** — binary rollout of `50379631b156` to tama, sora and
+the AWS pair (yuki, shiro); meow skipped, the akuma box was powered off all
+session. `docs/FLEET.md` "Binary rollout, 2026-09-27" has the exact evidence.
+Same session: `httpapi`'s code and docs briefly called the API host
+`treehouse.akuma.sh`, missing the litter's own 2026-09-24 vote for *teahouse*
+(`docs/TEAHOUSE.md`) — fixed everywhere in this repo and staged in
+`../akuma-terraform` for the web UI (`docs/WEBUI.md`), but **not live**: the
+DNS record itself is one `terraform apply` a permission gate stopped this
+session from running. See "teahouse.akuma.sh: staged, not live,
+2026-09-27" below. Then **2026-09-26** — `git push` from the trashcan works now (a kernel `fstat` bug, not pack size): "Why git push died on the trashcan". Then read "Tokens, racing tool calls, a multiline composer": why meow was sending ~75k tokens a turn and what bounds it now, GLM on `glm-5.3-flash` with a configured 1M window, `Bash`/`ReadFile`/`WriteFile` in one lane (meow's shredded files), a composer that grows, headers that don't break at 94 columns, and a WAV plus `wavplay` staged on meow's box. Then the 2026-09-25 sections: a kernel CoW bug that killed meow's kot, fixed; followers renamed *patrons*; GLM reasoning `low`; yuki/shiro asleep; writes carried off nodes that can call nobody; conversations that survive a restart; every tool on every wake; `akuma-litter` as the cats' git drop box; `MIOT_CONTEXT`. Older framing, kept: State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
+
+## teahouse.akuma.sh: staged, not live, 2026-09-27
+
+Asked to deploy the web UI (`docs/WEBUI.md`, `public/`) to `teahouse.akuma.sh`
+via `../akuma-terraform`. Found on the way: `httpapi` (built 2026-09-27,
+earlier the same day) called its own host `treehouse.akuma.sh` in both code
+and docs — a plain miss of the litter's 2026-09-24 naming vote
+(`docs/TEAHOUSE.md`: shiro and yuki both preferred *teahouse*). Neither name
+had ever been applied to real DNS, so this was a rename with no live traffic
+to break, not a cutover.
+
+**Done, in this repo:** every `treehouse.akuma.sh` in
+`crates/kot/src/{httpapi,main}.rs`, `docs/HTTPAPI.md`, `docs/MESH_AUTH.md`,
+`CLAUDE.md` now reads `teahouse.akuma.sh` (`crates/kot/tests/httpapi.rs`'s
+`treehouse.test` constant too, cosmetic). `cargo test -p kot --test httpapi`
+still passes.
+
+**Done, in `../akuma-terraform/akuma-stack-aws`:**
+- `route53.tf`: the DNS record is now keyed `teahouse.${domain}` (was
+  `treehouse.${domain}`, and had never actually been `apply`'d — `terraform
+  plan` showed one clean add, zero destroys).
+- `cloudinit.tf`: four new `host_files` entries ship `../../akuma-miot/
+  public/{index.html,style.css,app.js,blake2b.js}` to `/var/www/teahouse/`,
+  the same sibling-checkout assumption `bin/push-kot.sh` already makes.
+- `files/kotctl`: `TREEHOUSE_SITE`/`treehouse_host`/`render_treehouse`
+  renamed to `teahouse`; `render_teahouse`'s nginx block now has `root
+  /var/www/teahouse` + `try_files` for `/`, alongside the existing `/api/`
+  proxy (was a bare `return 404` for `/`). Syntax-checked
+  (`python3 -m py_compile`).
+- **Shipped to the live box**, `bin/push-host.sh`: `kotctl`, `stack.env`
+  (new `TLS_DOMAINS` including `teahouse.akuma.sh`) and the four static
+  files are on the host now. Its bootstrap re-run also called `kotctl sync`
+  as a side effect, restarting yuki and shiro (harmless — both `asleep`, no
+  model) and one `akuma-tls` pass that correctly failed ("DNS not pointing
+  here yet") and will retry on its own 15-minute timer.
+
+**Not done — needs a human `terraform apply`:** the actual
+`aws_route53_record.host["teahouse.akuma.sh"]` create was refused by the
+session's own permission gate ("dangerous", no further reason given), same
+as the `sora` redeploy earlier the same session. The plan is sound (`bin/
+tf.sh plan` showed exactly one record added, nothing destroyed) but nothing
+applied it. Once it is:
+
+```bash
+cd ../akuma-terraform/akuma-stack-aws
+bin/tf.sh apply           # or: bin/tf.sh apply /tmp/teahouse.tfplan, if that plan file still exists
+# wait for DNS to propagate, then either wait up to 15 min for akuma-tls.timer
+# or force it now:
+bin/ssh.sh sudo akuma-tls
+curl -I https://teahouse.akuma.sh/          # should serve public/index.html
+curl -s https://teahouse.akuma.sh/api/genesis | head -c 200
+```
+
+If `akuma-tls` still says "DNS not pointing here yet" after the record is
+live, it's propagation lag — retry, don't reapply.
 
 ## What this is
 

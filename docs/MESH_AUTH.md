@@ -336,7 +336,7 @@ in `docs/PROTOCOL.md`, "Patrons"; the door it comes through is
   the patron calls only.
 - **A second listener, `httpapi`, with no client auth at all** — plain
   HTTP, bound to loopback or the AWS bridge, behind nginx's real certificate
-  at `treehouse.akuma.sh/api/`, off unless configured (yuki and shiro only).
+  at `teahouse.akuma.sh/api/`, off unless configured (yuki and shiro only).
   It's the one way in for a key no node knows: three open routes (one writes:
   a signed patron request, rate-limited and bounded on chain), the reader
   routes gated by signed headers, and a `/submit` that takes seven calls.

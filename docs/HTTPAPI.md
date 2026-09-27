@@ -6,7 +6,7 @@ node knows yet. The mesh port stays what it was, pinned mTLS for members, the
 operator's CLI and patrons (`docs/MESH_AUTH.md`). Added 2026-09-27; the
 patron protocol it carries is in `docs/PROTOCOL.md`, "Patrons".
 
-**Public address:** `https://treehouse.akuma.sh/api/`, served by **yuki
+**Public address:** `https://teahouse.akuma.sh/api/`, served by **yuki
 and shiro** (the AWS pair) behind nginx. nginx terminates TLS with the
 Let's Encrypt certificate and strips `/api`, so `/api/genesis` reaches the
 node as `/genesis`.
@@ -17,7 +17,7 @@ node as `/genesis`.
 private bridge, never a public address: it's plain HTTP. On AWS, `kotctl`
 sets it to each kot's bridge address; `deploy.py` sets it for no home cat.
 `--httpapi-origins` / `MIOT_HTTPAPI_ORIGINS` is the comma-separated list of
-browser origins it accepts (`https://treehouse.akuma.sh`).
+browser origins it accepts (`https://teahouse.akuma.sh`).
 
 ## Rules that apply to every request
 
@@ -98,8 +98,8 @@ there too.
 ```bash
 kot id --seed-file ~/.akuma/kot/friend.seed          # a key to ask with
 kot --seed-file ~/.akuma/kot/friend.seed patron request \
-    --api https://treehouse.akuma.sh/api --name neobeav --note "Kirill's friend"
-kot --seed-file ~/.akuma/kot/friend.seed patron status --api https://treehouse.akuma.sh/api
+    --api https://teahouse.akuma.sh/api --name neobeav --note "Kirill's friend"
+kot --seed-file ~/.akuma/kot/friend.seed patron status --api https://teahouse.akuma.sh/api
 
 # root or a patron, over the mesh port:
 kot patron list

@@ -10,18 +10,17 @@ all` static musl for both arches) shipped to:
   term 260).
 - **yuki, shiro** (AWS) — `push-kot.sh` + `kotctl sync`, verified
   `kot 0.1.0+50379631b156` and both restarted (`kotctl list`, both `active`).
+- **sora** (`ryzen-akuma-amd64`) — `deploy.py up ryzen-akuma-amd64`, on the
+  first attempt this session was refused by the permission classifier; a
+  second, explicitly-requested attempt succeeded. Verified
+  `kot 0.1.0+50379631b156` (`ssh -p 2222 -i ~/.akuma/kot/fcguest.ssh-key
+  root@192.168.1.50 kot --version`).
 
 **Not shipped this round:**
 
 - **meow** (`dumpster-akuma-amd64`) — the akuma metal box was powered off for
   the session (confirmed: ssh to it returned "Host is down"; not a LAN
   issue, ryzen answered fine). Still on whatever it was running before.
-- **sora** (`ryzen-akuma-amd64`) — blocked by the auto-mode permission
-  classifier ("Modify Shared Resources") on the actual `deploy.py up
-  ryzen-akuma-amd64` call, after its `--dry-run` was reviewed and looked
-  correct. Confirmed still on `kot 0.1.0+10316e0bc997` (`ssh -p 2222 -i
-  ~/.akuma/kot/fcguest.ssh-key root@192.168.1.50 kot --version`). Needs a
-  human-run `python3 overlays/deploy/deploy.py up ryzen-akuma-amd64`.
 - **kuro, mimi** (both on this mac, Lima `fc`) — deliberately skipped per the
   rollout scope; also currently unreachable anyway (`limactl list` shows `fc`
   **Stopped**), pre-existing state, not caused by this rollout.

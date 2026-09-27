@@ -18,7 +18,7 @@ use std::time::Duration;
 const ROOT: u8 = 1;
 const STRANGER: u8 = 20;
 const SECOND: u8 = 21;
-const ORIGIN: &str = "https://treehouse.test";
+const ORIGIN: &str = "https://teahouse.test";
 
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
