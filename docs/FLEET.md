@@ -1,5 +1,35 @@
 # Fleet — hosts and model split
 
+## Binary rollout, 2026-09-27
+
+Commit `50379631b156` (`cargo test --workspace` green, `overlays/local/build.sh
+all` static musl for both arches) shipped to:
+
+- **tama** (`ryzen-linux-amd64`) — `deploy.py up ryzen-linux-amd64`, verified
+  `v0.1.0+50379631b156` in the restart log and live in the mesh (follower,
+  term 260).
+- **yuki, shiro** (AWS) — `push-kot.sh` + `kotctl sync`, verified
+  `kot 0.1.0+50379631b156` and both restarted (`kotctl list`, both `active`).
+
+**Not shipped this round:**
+
+- **meow** (`dumpster-akuma-amd64`) — the akuma metal box was powered off for
+  the session (confirmed: ssh to it returned "Host is down"; not a LAN
+  issue, ryzen answered fine). Still on whatever it was running before.
+- **sora** (`ryzen-akuma-amd64`) — blocked by the auto-mode permission
+  classifier ("Modify Shared Resources") on the actual `deploy.py up
+  ryzen-akuma-amd64` call, after its `--dry-run` was reviewed and looked
+  correct. Confirmed still on `kot 0.1.0+10316e0bc997` (`ssh -p 2222 -i
+  ~/.akuma/kot/fcguest.ssh-key root@192.168.1.50 kot --version`). Needs a
+  human-run `python3 overlays/deploy/deploy.py up ryzen-akuma-amd64`.
+- **kuro, mimi** (both on this mac, Lima `fc`) — deliberately skipped per the
+  rollout scope; also currently unreachable anyway (`limactl list` shows `fc`
+  **Stopped**), pre-existing state, not caused by this rollout.
+
+Mesh at the end of this: 4 of 7 members reachable (tama, sora, yuki, shiro),
+exactly quorum. Settled on term 260, sora primary, watched 2 minutes with no
+flapping, all heads converging.
+
 ## As running, 2026-09-25
 
 `overlays/deploy/deploy.py`'s `AGENTS` table is the source. tama and kuro

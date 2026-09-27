@@ -1,6 +1,15 @@
 # Handoff
 
-**Latest: 2026-09-26** — `git push` from the trashcan works now (a kernel `fstat` bug, not pack size): "Why git push died on the trashcan". Then read "Tokens, racing tool calls, a multiline composer": why meow was sending ~75k tokens a turn and what bounds it now, GLM on `glm-5.3-flash` with a configured 1M window, `Bash`/`ReadFile`/`WriteFile` in one lane (meow's shredded files), a composer that grows, headers that don't break at 94 columns, and a WAV plus `wavplay` staged on meow's box. Then the 2026-09-25 sections: a kernel CoW bug that killed meow's kot, fixed; followers renamed *patrons*; GLM reasoning `low`; yuki/shiro asleep; writes carried off nodes that can call nobody; conversations that survive a restart; every tool on every wake; `akuma-litter` as the cats' git drop box; `MIOT_CONTEXT`. Older framing, kept: State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
+**Latest: 2026-09-27** — binary rollout of `50379631b156` to tama and the AWS
+pair (yuki, shiro); meow skipped (akuma box was powered off) and sora blocked
+by a permission gate mid-session, still on the previous binary. Full detail
+and exact evidence: `docs/FLEET.md` "Binary rollout, 2026-09-27". Also
+noticed live: `docs/HTTPAPI.md`/`CLAUDE.md` call the httpapi host
+`treehouse.akuma.sh`, but `public/README.md` (the WebUI sharing that origin)
+already says `teahouse.akuma.sh` — matches the mesh's real name (`docs/
+TEAHOUSE.md`, 茶館) and neither domain has DNS yet (`teahouse.akuma.sh`
+doesn't resolve). Worth reconciling to one name before either ships. Then
+**2026-09-26** — `git push` from the trashcan works now (a kernel `fstat` bug, not pack size): "Why git push died on the trashcan". Then read "Tokens, racing tool calls, a multiline composer": why meow was sending ~75k tokens a turn and what bounds it now, GLM on `glm-5.3-flash` with a configured 1M window, `Bash`/`ReadFile`/`WriteFile` in one lane (meow's shredded files), a composer that grows, headers that don't break at 94 columns, and a WAV plus `wavplay` staged on meow's box. Then the 2026-09-25 sections: a kernel CoW bug that killed meow's kot, fixed; followers renamed *patrons*; GLM reasoning `low`; yuki/shiro asleep; writes carried off nodes that can call nobody; conversations that survive a restart; every tool on every wake; `akuma-litter` as the cats' git drop box; `MIOT_CONTEXT`. Older framing, kept: State of Akuma Miot as of 2026-09-23 (late: `kot` merge, election, new mesh — `docs/CLEANUP.md`; mesh-internal HTTP now authenticated, then every client-facing read too, then transport itself moved to mTLS pinned to the same keys — `docs/MESH_AUTH.md`; later still: `kot chat`, `RequestCompaction`, a `SendMessage` routing bug found and fixed by actually running two local cats against each other — `docs/LOCAL_SIM.md`). What runs, what doesn't, what to do next,
 and the things that will waste your time if you don't know them.
 
 ---
@@ -1304,12 +1313,20 @@ Cheapest tests to separate the two:
 
 ## Next, in order
 
-**Open after 2026-09-26**, most pressing first:
+**Open after 2026-09-27**, most pressing first:
 
-- **Ship the tool lane to meow and tama.** Both run the binary from before
-  it (meow's is the 09-25 night build with aging and the context window).
-  `deploy.py up ryzen-linux-amd64`; for meow, `NO_ENABLE=1` to stage
-  without a restart, as before.
+- **`sora` (`ryzen-akuma-amd64`) still needs `deploy.py up ryzen-akuma-amd64`
+  run by hand.** 2026-09-27's rollout got tama and both AWS kots onto
+  `50379631b156`; sora's `--dry-run` was reviewed and looked correct, but the
+  live `up` call was refused by the auto-mode permission classifier
+  ("Modify Shared Resources") — not a host or script problem. It's still on
+  `10316e0bc997`. `docs/FLEET.md` "Binary rollout, 2026-09-27" has the exact
+  commands and evidence.
+- **`meow` (`dumpster-akuma-amd64`) still needs a redeploy once the akuma box
+  is back up** — it was powered off for the whole 2026-09-27 session
+  (confirmed via ssh: "Host is down", not a LAN reachability issue). Ship
+  the tool lane to it (`NO_ENABLE=1` to stage without a restart, as before,
+  unless it's confirmed idle via `kot activity`).
 - **meow's HDA work** has moved past M1 (it reported M6 and M7, CORB/RIRB
   codec discovery, on 09-25 night; its own notes and commits have the
   state), written almost entirely by meow. On 09-26 the kernel hung and the
