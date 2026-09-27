@@ -105,7 +105,18 @@ async function registerPasskey() {
   if (!(ext.prf && ext.prf.enabled)) {
     throw new Error('this passkey can\'t make a PRF secret, so it can\'t lock keys. Use iCloud Keychain or Google Password Manager on a current phone.');
   }
-  return { credId: new Uint8Array(cred.rawId), salt, createdAt: Date.now() };
+  // Some authenticators evaluate PRF at creation; then the first unlock is free.
+  const first = ext.prf.results && ext.prf.results.first;
+  return { vault: { credId: new Uint8Array(cred.rawId), salt, createdAt: Date.now() }, secret: first || null };
+}
+
+// The one setup step: a passkey, then the key locked under it.
+async function setup(seed) {
+  const { vault, secret } = await registerPasskey();
+  await putVault(vault);
+  state.vault = vault;
+  if (secret) state.wrapKey = await deriveWrapKey(secret, vault.salt);
+  return setKey(seed);
 }
 
 async function unlock() {
@@ -249,13 +260,15 @@ async function showAskStatus(k) {
     const st = await patronStatus(k.account);
     if (seq !== askStatusSeq) return;
     $('#askform').hidden = st !== 'none';
+    $('#accesslede').hidden = st !== 'none';
+    $('#accesstitle').textContent = { none: 'Request access', pending: 'Access requested', approved: 'Signed in' }[st] || 'Access';
     if (st === 'none') el.textContent = 'The teahouse doesn\'t know this key yet.';
     else if (st === 'pending') el.textContent = 'Approval pending.';
     else if (!state.wrapKey) el.textContent = 'Approved. Unlock to sign in.';
     else {
       const name = await myName();
       if (seq !== askStatusSeq) return;
-      el.textContent = name ? `Signed in as ${name}.` : 'Approved, but the teahouse lists no nickname for this key.';
+      el.textContent = name ? `You are ${name}.` : 'Approved, but the teahouse lists no nickname for this key.';
       $('#keycard .name').textContent = name || '';
     }
   } catch (e) {
@@ -318,6 +331,7 @@ async function render() {
     $('#keycard').replaceChildren(...(k ? [keyCard(k)] : []));
     $('#keymake').hidden = !!k;
     if (!k) $('#importform').hidden = true;
+    $('#keys .lede').hidden = !!k;
     $('#passkeystate').textContent = `Set up ${new Date(state.vault.createdAt).toLocaleString()} on this phone. Every unlock asks it for the secret the seed is encrypted with.`;
   }
   if (k) showAskStatus(k);
@@ -325,7 +339,7 @@ async function render() {
   const ll = $('#lockline');
   ll.classList.toggle('open', !!state.wrapKey);
   ll.replaceChildren();
-  if (has) {
+  if (k) {
     const dot = document.createElement('span'); dot.className = 'dot';
     const txt = document.createElement('span'); txt.textContent = state.wrapKey ? 'unlocked' : 'locked';
     const btn = document.createElement('button'); btn.textContent = state.wrapKey ? 'Lock' : 'Unlock';
@@ -352,10 +366,17 @@ async function main() {
   document.querySelectorAll('[data-cancel]').forEach((b) => (b.onclick = () => toggle(b.closest('form'), false)));
 
   $('#setuppasskey').onclick = failing(async () => {
-    const vault = await registerPasskey();
-    await putVault(vault);
-    state.vault = vault;
-    status('passkey set up; now make your key');
+    const account = await setup(await newSeed());
+    status(`your key is ${account.slice(0, 8)}…; locked with the passkey`);
+  });
+  $('#setupimport').onclick = () => toggle($('#setupimportform'), true);
+  $('#setupimportform').onsubmit = failing(async (e) => {
+    e.preventDefault();
+    const text = $('#setupseed').value.trim().replace(/^0x/, '');
+    if (!/^[0-9a-fA-F]{64}$/.test(text)) throw new Error('a seed is exactly 64 hex characters');
+    const account = await setup(unhex(text.toLowerCase()));
+    $('#setupseed').value = '';
+    status(`imported ${account.slice(0, 8)}…; locked with the passkey`);
   });
 
   $('#newkey').onclick = failing(async () => {

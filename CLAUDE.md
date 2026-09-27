@@ -133,6 +133,10 @@ read that first, it is kept current and this file does not repeat it.
 - `docs/HTTPAPI.md` — `httpapi`, the plain-HTTP API for browsers and
   would-be patrons: every route, the call allowlist on `/submit`, CSRF,
   and why browser mTLS against the mesh port wasn't the answer. 2026-09-27.
+- `docs/WEBUI.md` — the browser side (`public/`, static, no build, iPhone
+  first): the passkey is the lock, the Ed25519 seed is the account. Three
+  diagrams: what the person sees, what the phone stores vs holds in memory,
+  and how a passkey PRF secret turns into a signed request. 2026-09-27.
 - `docs/KEY_MANAGEMENT.md` — what one account's key now backs (chain writes,
   every read, the TLS connection itself), the dev-seed footgun in `kot`'s own
   CLI defaults, and the genesis-generation procedure (`deploy.py`/`deploy.sh
