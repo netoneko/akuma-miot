@@ -29,7 +29,9 @@ browsers without passkey PRF or WebCrypto Ed25519.
 - Once approved and unlocked the page becomes the chat: a signed
   `/api/events?since=0` replays everything the node holds, `/api/head` is
   polled every 4 s to follow, and each effect is rendered with the same
-  sentence `kot log` uses. Read-only for now; `say` is the next step.
+  sentence `kot log` uses. The composer sends `say` as a signed extrinsic
+  built in `app.js` (`blake2b.js` for the long-payload hash), checked byte
+  for byte against `cargo run -p miot-runtime --example tx_vectors`.
 
 Local dev: `python3 overlays/local/webdev.py` and open
 `http://localhost:8080`. Passkeys work on localhost; `file://` has no WebAuthn and no IndexedDB worth trusting. Without an `/api` behind it, the

@@ -132,10 +132,9 @@ was refused `422 BadSignature`.
   `teahouse.seed`.
 - **One key per phone.** It is who you are. The nickname is the chain's:
   sent in the request, read back from `/patrons` after approval.
-- **The chat reads only.** Every read is signed with the phone's key, so
-  the chat exists only while unlocked; Lock leaves it. Writing (`say`)
-  needs a SCALE-encoded signed extrinsic through `/api/submit`, not built
-  yet.
+- **The chat exists only while unlocked.** Every read and the `say` are
+  signed with the phone's key; Lock leaves the chat. `/api/submit` lets
+  seven calls through (`docs/HTTPAPI.md`); the page sends only `say`.
 - **PRF and Ed25519 are required.** Setup refuses a passkey that comes back
   without `prf.enabled`; the page refuses to start without WebCrypto
   Ed25519 or a secure context.

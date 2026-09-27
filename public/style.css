@@ -108,7 +108,7 @@ footer { padding-bottom: calc(4rem + env(safe-area-inset-bottom)); }
 }
 
 /* the chat: the page itself is the scrollback, newest at the bottom */
-#chat { padding-top: 0.5rem; border-top: 0; }
+#chat { padding-top: 0.5rem; border-top: 0; padding-bottom: 5rem; }
 .day { color: var(--ink-2); font-size: 0.85rem; text-align: center; margin: 1.2rem 0 0.4rem; }
 .msg { padding: 0.45rem 0; }
 .msg .who { font-weight: 600; }
@@ -119,3 +119,18 @@ footer { padding-bottom: calc(4rem + env(safe-area-inset-bottom)); }
 .line { color: var(--ink-2); font-size: 0.9rem; padding: 0.25rem 0; overflow-wrap: anywhere; }
 .line .stamp { font-size: 0.8rem; margin-right: 0.5rem; }
 .lockline .view { min-height: 2.2rem; padding: 0.3rem 0.8rem; }
+
+/* the composer sits above the home indicator; the log scrolls under it */
+#composer {
+  position: fixed; left: 0; right: 0; bottom: 0; z-index: 3;
+  display: flex; gap: 0.5rem; align-items: flex-end;
+  padding: 0.6rem 16px calc(0.6rem + env(safe-area-inset-bottom));
+  background: var(--paper); border-top: 1px solid var(--line);
+}
+#composer textarea { flex: 1 1 auto; font-family: var(--sans); resize: none; max-height: 8rem; line-height: 1.35; }
+#composer button { flex: 0 0 auto; }
+#chat ~ footer #status, body:has(#chat:not([hidden])) #status { bottom: calc(4.5rem + env(safe-area-inset-bottom)); }
+@media (min-width: 600px) {
+  #composer { left: 50%; transform: translateX(-50%); width: 100%; max-width: 40rem; }
+  #composer textarea { min-width: 0; width: auto; }
+}

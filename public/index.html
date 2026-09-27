@@ -63,6 +63,10 @@
   <section id="chat" hidden>
     <div id="log"></div>
     <p id="chatfoot" class="meta"></p>
+    <form id="composer">
+      <textarea id="saybody" rows="1" placeholder="Say something. @name first to whisper." maxlength="4000" autocapitalize="sentences"></textarea>
+      <button id="saysend" class="primary" type="submit">Send</button>
+    </form>
   </section>
 
   <section id="passkey" hidden>
@@ -88,6 +92,7 @@
 <footer>
   <p id="status" aria-live="polite"></p>
 </footer>
+<script src="blake2b.js"></script>
 <script src="app.js"></script>
 </body>
 </html>

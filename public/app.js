@@ -258,7 +258,6 @@ const nameOf = (a) => (a ? names.get(a) || a.slice(0, 8) : '?');
 // render_effect), so the phone and the terminal agree on what happened.
 function describe(eff) {
   const t = eff.t || '';
-  if (eff.t === 'said' && eff.root && eff.from) names.set(eff.from, 'root');
   const n = (f) => nameOf(eff[f]);
   const task = () => eff.task || '?';
   const otr = eff.off_record ? ' (off the record)' : '';
@@ -292,12 +291,16 @@ function describe(eff) {
   }
 }
 
-const chat = { cursor: 0, timer: null, lastDay: null, me: null };
+// `replaying` is true only during the first pull. A live entry is served
+// before its block seals (node.rs pushes it with `at: None` and stamps it
+// at seal), so a followed event without `at` is stamped with now.
+const chat = { cursor: 0, timer: null, lastDay: null, me: null, hurry: 0, replaying: false };
 const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 const dayOf = (ms) => new Date(ms).toDateString();
 
 function appendEvent(e) {
   const log = $('#log');
+  if (!e.at && !chat.replaying) e = { ...e, at: Date.now() };
   if (e.at && dayOf(e.at) !== chat.lastDay) {
     chat.lastDay = dayOf(e.at);
     const d = document.createElement('div'); d.className = 'day';
@@ -331,6 +334,8 @@ async function pullEvents() {
   const { status, body } = await signedGet(`/events?${q}`, q);
   if (status !== 200) throw new Error(`events: ${status} ${body.error || ''}`);
   const nearBottom = window.innerHeight + window.scrollY >= document.body.scrollHeight - 120;
+  // Learn root before rendering, so its approvals earlier in the log read as root's.
+  for (const e of body) { const f = e.effect || {}; if (f.t === 'said' && f.root && f.from) names.set(f.from, 'root'); }
   for (const e of body) { appendEvent(e); chat.cursor = Math.max(chat.cursor, e.seq); }
   if (body.length && nearBottom) window.scrollTo(0, document.body.scrollHeight);
   return body.length;
@@ -348,14 +353,66 @@ async function enterChat() {
   chat.me = (await getKey()).account;
   chat.cursor = 0; chat.lastDay = null; $('#log').replaceChildren();
   await loadNames();
-  await pullEvents();
+  chat.replaying = true;
+  try { await pullEvents(); } finally { chat.replaying = false; }
   window.scrollTo(0, document.body.scrollHeight);
   await followOnce();
-  chat.timer = setInterval(() => followOnce().catch((e) => { $('#chatfoot').textContent = e.message; }), 4000);
+  chat.timer = setInterval(() => {
+    if (chat.hurry > 0) chat.hurry--; else if (Date.now() % 4000 >= 1000) return;
+    followOnce().catch((e) => { $('#chatfoot').textContent = e.message; });
+  }, 1000);
 }
 function leaveChat() {
   clearInterval(chat.timer); chat.timer = null;
   state.view = 'key';
+}
+
+// ---------------------------------------------------------------- sending
+
+// A `say` as the chain takes it: a signed extrinsic, legacy v4 layout, the
+// same bytes `miot_runtime::client::sign` produces (checked against
+// `cargo run -p miot-runtime --example tx_vectors`).
+//
+//   extrinsic  = compact(len) ‖ 0x84 ‖ account(32) ‖ 0x00 ‖ sig(64) ‖ extra ‖ call
+//   call       = 0x01 (Litter) ‖ 0x06 (say) ‖ Option<to> ‖ String body ‖ no_ack ‖ off_record
+//   extra      = 0x00 (immortal era) ‖ compact(nonce)
+//   signed     = call ‖ extra ‖ genesis(32) ‖ spec u32 LE ‖ tx u32 LE ‖ genesis(32)
+//                (blake2-256 of that when it is longer than 256 bytes)
+const u32le = (n) => Uint8Array.of(n & 0xff, (n >>> 8) & 0xff, (n >>> 16) & 0xff, (n >>> 24) & 0xff);
+function encodeSay(to, body, offRecord = false) {
+  return concat([Uint8Array.of(1, 6), to ? concat([Uint8Array.of(1), unhex(to)]) : Uint8Array.of(0), ...scaleBytes(enc.encode(body)), Uint8Array.of(0), Uint8Array.of(offRecord ? 1 : 0)]);
+}
+async function signExtrinsic(call, nonce, meta) {
+  const { account } = await getKey();
+  const extra = concat([Uint8Array.of(0), compact(nonce)]);
+  const genesis = unhex(meta.genesis_hash.replace(/^0x/, ''));
+  const payload = concat([call, extra, genesis, u32le(meta.spec_version), u32le(meta.tx_version), genesis]);
+  const signedOver = payload.length > 256 ? blake2b(payload, 32) : payload;
+  const sig = new Uint8Array(await crypto.subtle.sign(ED, await privateKey(), signedOver));
+  const inner = concat([Uint8Array.of(0x84), unhex(account), Uint8Array.of(0), sig, extra, call]);
+  return concat([compact(inner.length), inner]);
+}
+async function say(body, to) {
+  const { account } = await getKey();
+  const meta = (await signedGet('/meta')).body;
+  if (!meta.genesis_hash) throw new Error('the API gave no chain meta');
+  const acct = (await signedGet(`/account/${account}`)).body;
+  if (typeof acct.nonce !== 'number') throw new Error(`no nonce for this key: ${acct.error || 'not on chain'}`);
+  const xt = await signExtrinsic(encodeSay(to, body), acct.nonce, meta);
+  const { status, body: r } = await api('/submit', {
+    method: 'POST', headers: { 'content-type': 'application/octet-stream', 'x-miot-request': '1' }, body: xt,
+  });
+  if (!r.ok) throw new Error(`refused (${status}): ${r.error || JSON.stringify(r)}`);
+  return r;
+}
+
+// "@name the rest" whispers to name; the reverse of the names map.
+function parseAddress(text) {
+  const m = /^@([a-z0-9_-]+)\s+([\s\S]+)$/i.exec(text);
+  if (!m) return { to: null, body: text };
+  const want = m[1].toLowerCase();
+  for (const [account, name] of names) if (name.toLowerCase() === want) return { to: account, body: m[2] };
+  throw new Error(`nobody here is called ${m[1]}`);
 }
 
 // ---------------------------------------------------------------- view
@@ -523,6 +580,24 @@ async function main() {
     const account = await setKey(unhex(text.toLowerCase()));
     toggle($('#importform'), false); $('#importseed').value = '';
     status(`imported ${account.slice(0, 8)}…`);
+  });
+
+  const composer = $('#composer');
+  const bodyEl = $('#saybody');
+  bodyEl.oninput = () => { bodyEl.style.height = 'auto'; bodyEl.style.height = Math.min(bodyEl.scrollHeight, 128) + 'px'; };
+  bodyEl.onkeydown = (e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); composer.requestSubmit(); } };
+  composer.onsubmit = failing(async (e) => {
+    e.preventDefault();
+    const text = bodyEl.value.trim();
+    if (!text) return;
+    const { to, body } = parseAddress(text);
+    $('#saysend').disabled = true;
+    try {
+      const r = await say(body, to);
+      bodyEl.value = ''; bodyEl.style.height = 'auto';
+      chat.hurry = 12;
+      status(r.status === 'applied' ? 'sent' : 'sent; queued until a primary takes it');
+    } finally { $('#saysend').disabled = false; }
   });
 
   $('#startover').onclick = failing(async () => {
