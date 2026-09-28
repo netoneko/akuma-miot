@@ -152,6 +152,21 @@ pub const LOCAL_TASK_NAG_AFTER: Duration = Duration::from_secs(150);
 /// model starts a query again (mirrors `max_nudges`: "resets whenever the
 /// holder acts").
 pub const MAX_LOCAL_TASK_NUDGES: u32 = 3;
+/// Idle this long with results held back ([`MAX_FOLLOWUPS`] spent) and the
+/// held results are released on their own, as a wake. Found 2026-09-28: meow
+/// read a 33 KB source file eight pages at a time, the ninth page was held
+/// "until the next message", and it sat idle for 2m34s until the local-task
+/// nudge happened to fire — which needs an open local task and an unspent
+/// nudge budget. A cat with neither had no way back at all: held results
+/// waited for a wake nothing would ever send.
+pub const HELD_RELEASE_AFTER: Duration = Duration::from_secs(30);
+/// Releases in a row, with nobody else writing, before the held results are
+/// left until someone does — the follow-up cap exists so a model can't loop
+/// on its own results forever, and releasing without a bound would undo it
+/// (just slower). Same bound and reason as [`MAX_LOCAL_TASK_NUDGES`]. Reset
+/// by any real wake, so a cat someone is talking to never runs out. At most
+/// `MAX_FOLLOWUPS × (1 + MAX_HELD_RELEASES)` turns on its own results.
+pub const MAX_HELD_RELEASES: u32 = 3;
 /// A turn whose model call fails (the provider unreachable, not the model
 /// answering badly) is tried again this many more times, waiting
 /// [`Host::llm_retry_after`] and then three times longer each time: 5 s,
@@ -251,6 +266,11 @@ pub trait Host: Send + Sync + 'static {
     /// shortens it.
     fn local_nag_after(&self) -> Duration {
         LOCAL_TASK_NAG_AFTER
+    }
+    /// Idle this long with results held back releases them
+    /// ([`HELD_RELEASE_AFTER`]). A test shortens it.
+    fn held_release_after(&self) -> Duration {
+        HELD_RELEASE_AFTER
     }
     /// The first wait before retrying a failed model call ([`LLM_RETRIES`]).
     /// A test shortens it.
@@ -600,6 +620,12 @@ struct AgentStateMachine<H: Host> {
     /// bounded by [`MAX_LOCAL_TASK_NUDGES`], reset by [`AgentStateMachine::turn`]
     /// the moment a turn actually starts one.
     local_nudges: u32,
+    /// Automatic releases of held results since anyone else wrote — bounded
+    /// by [`MAX_HELD_RELEASES`], reset by a real wake.
+    held_releases: u32,
+    /// Wakes the loop queued for itself (a nudge, a release) and hasn't yet
+    /// folded into a batch — so a real wake can be told from them.
+    synthetic_wakes: usize,
     /// Set by [`AgentStateMachine::maybe_nag`] right when it sends a nudge;
     /// read and cleared by the very next [`AgentStateMachine::turn`]. Found
     /// live 2026-09-26: meow answered three nudges in a row with a promise
@@ -618,7 +644,7 @@ struct AgentStateMachine<H: Host> {
 
 /// Think until `inbox` closes and nothing is left in flight.
 pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mpsc::UnboundedReceiver<Inbound>) {
-    let window = llm.context_window().await;
+    let window = llm.compact_early().or(llm.context_window().await);
     let (back_tx, mut back_rx) = mpsc::unbounded_channel();
     let system = format!("{persona}{RULES}{}", host.rules());
     let mut transcript = host.transcript().map(Transcript::open);
@@ -682,6 +708,8 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         notices: Vec::new(),
         idle_since: None,
         local_nudges: 0,
+        held_releases: 0,
+        synthetic_wakes: 0,
         awaiting_nudge_reply: false,
         last_unfulfilled_promise: None,
         restart_note: None,
@@ -707,7 +735,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
     // in the live record — and, the same way, catches an idle cat with open
     // local tasks within a quarter of its nag threshold. Never more than
     // every 5 s.
-    let every = (m.host.stall_after().min(m.host.local_nag_after()) / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
+    let every = (m.host.stall_after().min(m.host.local_nag_after()).min(m.host.held_release_after()) / 4).clamp(Duration::from_millis(50), Duration::from_secs(5));
     let mut watchdog = tokio::time::interval(every);
     watchdog.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     m.publish();
@@ -783,6 +811,11 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
             }
         }
 
+        // A wake the loop made for itself (a nudge, a release) isn't anyone
+        // writing: only a real one gives the release budget back.
+        if wakes.len() > std::mem::take(&mut m.synthetic_wakes) {
+            m.held_releases = 0;
+        }
         if wakes.is_empty() && results.is_empty() && m.notices.is_empty() {
             continue;
         }
@@ -884,6 +917,8 @@ impl<H: Host> AgentStateMachine<H> {
                 self.check_armed = false;
                 self.check_ins = 0;
                 self.local_nudges = 0;
+                self.held_releases = 0;
+                self.synthetic_wakes = 0;
                 self.awaiting_nudge_reply = false;
                 self.last_unfulfilled_promise = None;
                 self.idle_since = None;
@@ -935,7 +970,11 @@ impl<H: Host> AgentStateMachine<H> {
     /// — once per silence — and nudge a cat that's gone idle with open
     /// local tasks.
     fn watch(&mut self) {
-        self.maybe_nag();
+        // One self-made wake a tick: a release already carries the held
+        // results, and a nudge on top of it would just be a second turn.
+        if !self.maybe_release_held() {
+            self.maybe_nag();
+        }
         if self.act.running.is_empty() {
             return;
         }
@@ -1009,10 +1048,50 @@ impl<H: Host> AgentStateMachine<H> {
         self.host.show(ui::note(&format!("nudging {} on its open local tasks — idle {}", self.host.name(), ui::human(since.elapsed().as_secs()))));
         let kind = self.kinds.last().copied().unwrap_or("said");
         self.pending.push_back(Inbound::Wake { text, kind, ctx: self.ctx.clone() });
+        self.synthetic_wakes += 1;
         self.awaiting_nudge_reply = true;
         // Restart the clock: if this nudge also gets nothing back, the next
         // one waits a full interval again rather than firing right away.
         self.idle_since = Some(Instant::now());
+    }
+
+    /// Results are held ([`MAX_FOLLOWUPS`] spent), nothing is running, and
+    /// it's been quiet for [`Host::held_release_after`]: queue a wake so
+    /// they're fed. Without this they waited for "the next message", and
+    /// the only thing that ever sent one on its own was the local-task
+    /// nudge, which needs an open local task (see [`HELD_RELEASE_AFTER`]).
+    /// Bounded by [`MAX_HELD_RELEASES`]. Off where `check_before_idle` is
+    /// (`kot chat`): its operator is right there and the notice says as much.
+    /// Returns whether it queued one.
+    fn maybe_release_held(&mut self) -> bool {
+        if self.held.is_empty() || self.queries != 0 || self.records != 0 || !self.host.check_before_idle() {
+            return false;
+        }
+        if self.held_releases >= MAX_HELD_RELEASES || !self.pending.is_empty() {
+            return false;
+        }
+        let Some(since) = self.idle_since else { return false };
+        if since.elapsed() < self.host.held_release_after() {
+            return false;
+        }
+        self.held_releases += 1;
+        let last = self.held_releases >= MAX_HELD_RELEASES;
+        let tail = if last {
+            " This is the last time they're released without someone writing to you: if you're in the middle of something, SendMessage whoever asked now."
+        } else {
+            ""
+        };
+        let text = format!(
+            "(Nobody has written for a while, and {} of your tool result(s) were held back after {MAX_FOLLOWUPS} follow-up turns in a row. They're attached — carry on.{tail})",
+            self.held.len()
+        );
+        self.host.show(ui::note(&format!("releasing {} held result(s) — idle {}", self.held.len(), ui::human(since.elapsed().as_secs()))));
+        self.log(serde_json::json!({"t": "released", "n": self.held.len(), "release": self.held_releases}));
+        let kind = self.kinds.last().copied().unwrap_or("said");
+        self.pending.push_back(Inbound::Wake { text, kind, ctx: self.ctx.clone() });
+        self.synthetic_wakes += 1;
+        self.idle_since = Some(Instant::now());
+        true
     }
 
     /// The queries still out — what the model can look at or cancel.

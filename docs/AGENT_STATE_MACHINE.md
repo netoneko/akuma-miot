@@ -8,7 +8,7 @@ state machine", has the history. This file shows how the loop works now and
 what changed on 2026-09-24 after meow's kernel build stalled.
 
 Tests: `crates/kot/tests/agent_state_machine.rs` runs the real loop against a
-scripted fake model server, 30 tests.
+scripted fake model server, 82 tests (30 when this was first written).
 
 ## Vocabulary
 
@@ -44,7 +44,9 @@ scripted fake model server, 30 tests.
        │               ▼                                        ▼
        │     followups := 0                         followups < 8 ? ──no──► HELD
        │     held results go in                          │ yes             queued, not dropped;
-       │     first (oldest)                              │ followups += 1   fed with the next wake
+       │     first (oldest)                              │ followups += 1   fed with the next wake,
+       │                                                 │                  or released after 30 s idle
+       │                                                 │                  (a cat, ≤ 3 times, below)
        │               │                                 │ (8th says: "last
        │               │                                 │  one, report now")
        │               └───────────────┬─────────────────┘
@@ -226,6 +228,63 @@ correctly from the reminder alone. Two bugs came out of that run and are
 fixed: a GLM cat never showed up in `/activity` (its loop published before
 the POST task subscribed to the watch channel), and an idle cat's record
 read as stale (no heartbeat).
+
+## Held results that nothing releases (2026-09-28)
+
+**What was seen.** meow read a 33 KB source file (`hda.rs`) with `Inspect`,
+2700 characters a page. Eight result-only turns in a row is the cap
+(`MAX_FOLLOWUPS`), so the ninth page was *held*: "fed with the next
+message". Nobody wrote. It sat idle for 2m34s, until the local-task nudge
+(150 s, `maybe_nag`) fired, and only then read the page and went on to write
+its fix.
+
+**What it was, and what it wasn't.** It was not a permanent deadlock in
+that case, and a first reading of the log wrongly called it one: meow had an
+open local task, so the nudge was the way out. The gap is that the nudge is
+the *only* way out and it has conditions of its own. It needs an open
+`LocalTask` (`Host::reminder`), and it has a budget of 3
+(`MAX_LOCAL_TASK_NUDGES`, reset only when a query starts). A cat with no
+local list, or one whose nudges were answered with words, had held results
+waiting for a wake nothing would ever send. Even the rescued case cost
+2½ minutes of a cat sitting on a result it hadn't read.
+
+**The fix.** Idle for `HELD_RELEASE_AFTER` (30 s, `Host::held_release_after`)
+with results held and nothing running: the watchdog (`maybe_release_held`)
+queues a wake that carries them, so they're fed. The wake says what it is
+("Nobody has written for a while, and N of your tool results were held
+back… carry on"), and the third one adds that it's the last:
+"SendMessage whoever asked now". Bounded, on purpose, like the nudge:
+`MAX_HELD_RELEASES` (3) in a row, and the follow-up cap is what stops a
+model looping on its own results, so releasing without a bound would only
+make the loop slower. A cat can therefore take at most
+`MAX_FOLLOWUPS × (1 + MAX_HELD_RELEASES)` = 32 turns on its own results
+before it waits for a person. Any real wake gives the budget back
+(`synthetic_wakes` tells the loop's own nudges and releases apart from
+someone writing), and a `Reset` clears it.
+
+- **Where it's off:** hosts with `check_before_idle` false (`kot chat`).
+  The operator is at the keyboard, and held results there really do wait
+  for their next line, as before.
+- **One self-made wake a tick.** A release already carries the held
+  results, so the nudge is skipped that tick rather than piling a second
+  turn on top.
+- **Still not covered:** after the third release with nobody writing, held
+  results wait for a real message again, and a cat with no local task has no
+  other way back. That is the bound doing its job, not a gap to close: what
+  the cap protects against is a cat spending turns on nobody.
+
+Tests (`crates/kot/tests/agent_state_machine.rs`):
+`held_results_are_released_when_nobody_writes` (no local task, no reminder:
+only the release could bring it back),
+`held_releases_are_bounded` (exactly 3, the last one says so, no fourth),
+`a_real_wake_gives_the_release_budget_back`,
+`nothing_is_released_where_the_operator_is_present`. Run with the release
+disabled, the first three fail.
+
+Not measured: how often a live cat lands here. The one sighting is meow's.
+The 30 s is a guess, short enough to be worth having and long enough that a
+result which is merely slow to arrive (the batch deadline is 10 s) isn't
+mistaken for a stall.
 
 ## Why it changed: meow's kernel build, 2026-09-24
 

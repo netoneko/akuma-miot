@@ -104,6 +104,10 @@ class Agent:
     # llama-server reports its own). Without it a GLM cat never got a budget
     # warning or a force-compaction, and meow re-sent ~75k tokens a turn.
     context_window: int | None = None
+    # MIOT_COMPACT_EARLY: force-compact against this many tokens instead of
+    # the real context window — for GLM's 1M, where waiting for the loop's
+    # usual 98%-of-window force-compaction means a very large, slow turn.
+    compact_early: int | None = None
     # `Host::reboot_tool` (docs/TOOLING.md) — compacts, then actually
     # reboots the host. Off by default; on only for meow below, since it's
     # the one cat whose own workflow already reboots the box it runs on
@@ -129,7 +133,7 @@ GLM_CONTEXT_WINDOW = 1_000_000
 
 
 AGENTS: list[Agent] = [
-    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW, reboot_tool=True, cwd="/src/github.com/netoneko/akuma"),
+    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW, compact_early=256_000, reboot_tool=True, cwd="/src/github.com/netoneko/akuma"),
     Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW),
     Agent("mac-linux-aarch64", "lima", "fc", "aarch64", "kuro", "http://192.168.5.2:11434", "gemma4-yolo-4b"),
     Agent("ryzen-akuma-amd64", "fcguest", "ryzen", "x86_64", "sora", "http://192.168.1.49:8082", "qwen3-4b"),
@@ -323,6 +327,45 @@ def _port_free(port: int, bind: str) -> bool:
         s.close()
 
 
+def _wget_detached(a: Agent, dst: str, frm: str, want: str) -> None:
+    """The akuma box's ssh exec channel has been observed dropping (exit
+    255) at a consistent ~256s mark regardless of transfer progress — the
+    wget itself keeps running server-side (the `GET /f` 200 in the http
+    log proves that), so the channel dying isn't a transfer failure, it's
+    the channel. Detach the download from any single ssh session with
+    nohup+background, disconnect immediately, and poll a marker file with
+    short-lived connections instead of holding one connection open for the
+    whole transfer (2026-09-28, found deploying `compact_early`)."""
+    marker = f"{dst}.new.done"
+    # `disown` is a bash builtin the akuma box's /bin/sh (not bash) doesn't
+    # have (exit 127, found live 2026-09-28) — unneeded anyway: `nohup`
+    # alone is what keeps the child alive past this ssh session's own HUP.
+    on(a, f"rm -f {dst}.new {marker}; nohup sh -c 'wget -q -O {dst}.new http://{frm}:{HTTP_PORT}/f "
+          f"&& md5sum {dst}.new > {marker}' >/tmp/put-akuma.log 2>&1 &")
+    # Measured live 2026-09-28: ~15 KB/s on this box tonight (worse than the
+    # ~100-150 KB/s measured 2026-09-25 in `on()`'s own comment — a real,
+    # variable link, not a fixed number), so a 14 MB kot needs ~1000s. 1800s
+    # leaves real margin rather than timing out at 90% like the first fixed
+    # attempt did at 900s.
+    deadline = time.monotonic() + 1800
+    got = None
+    while time.monotonic() < deadline:
+        time.sleep(10)
+        if DRY_RUN:
+            return
+        r = subprocess.run(
+            ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", "akuma", f"cat {marker} 2>/dev/null"],
+            capture_output=True, text=True, timeout=30,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            got = r.stdout
+            break
+    if got is None:
+        die(f"{a.name}: transfer of {dst} timed out waiting for {marker}")
+    if want not in got:
+        die(f"transfer to {a.name} failed or corrupted: {marker} says {got.strip()!r}, wanted md5 {want}")
+
+
 def _put_via_http(a: Agent, src: Path, dst: str) -> None:
     # HTTP only: no SFTP subsystem, and an ssh exec channel stalls at
     # exactly 1 MiB. Serve a staging dir holding just this file. The guest
@@ -348,9 +391,12 @@ def _put_via_http(a: Agent, src: Path, dst: str) -> None:
         httpd_thread = threading.Thread(target=httpd.serve_forever, daemon=True)
         httpd_thread.start()
         try:
-            out = on(a, f"wget -q -O {dst}.new http://{frm}:{HTTP_PORT}/f && md5sum {dst}.new")
-            if not DRY_RUN and want not in out:
-                die(f"transfer of {src} to {a.name} failed or corrupted")
+            if a.shape == "akuma":
+                _wget_detached(a, dst, frm, want)
+            else:
+                out = on(a, f"wget -q -O {dst}.new http://{frm}:{HTTP_PORT}/f && md5sum {dst}.new")
+                if not DRY_RUN and want not in out:
+                    die(f"transfer of {src} to {a.name} failed or corrupted")
         finally:
             httpd.shutdown()
             httpd.server_close()
@@ -553,6 +599,8 @@ def env_for(name: str) -> str:
         lines.append(f"MIOT_LLM={a.llm}")
     if a.context_window:
         lines.append(f"MIOT_CONTEXT_WINDOW={a.context_window}")
+    if a.compact_early:
+        lines.append(f"MIOT_COMPACT_EARLY={a.compact_early}")
     if a.reboot_tool:
         lines.append("MIOT_REBOOT_TOOL=true")
     lines += [

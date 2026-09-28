@@ -6,7 +6,7 @@
 //! must be folded into the next one, and nothing may loop forever.
 
 use kot::activity::Activity;
-use kot::agent_state_machine::{self, Dispatch, Host, Inbound, CHECK_IN, MAX_CHECK_INS, MAX_FOLLOWUPS};
+use kot::agent_state_machine::{self, Dispatch, Host, Inbound, CHECK_IN, MAX_CHECK_INS, MAX_FOLLOWUPS, MAX_HELD_RELEASES};
 use kot::ui::ToolOut;
 use miot_llm::{Call, Llm, Tool};
 use serde_json::{json, Value};
@@ -156,6 +156,9 @@ struct Seen {
     stall: Option<Duration>,
     /// `Host::local_nag_after` — the default (minutes) unless a test is about it.
     local_nag: Option<Duration>,
+    /// `Host::held_release_after` — the default (half a minute) unless a
+    /// test is about it.
+    held_release: Option<Duration>,
     /// `Host::llm_retry_after` — shortened for every test by default
     /// ([`Seen::default`]), so one that trips on a failed call doesn't wait
     /// the real 5 s.
@@ -265,6 +268,9 @@ impl Host for TestHost {
     }
     fn local_nag_after(&self) -> Duration {
         self.0.lock().unwrap().local_nag.unwrap_or(agent_state_machine::LOCAL_TASK_NAG_AFTER)
+    }
+    fn held_release_after(&self) -> Duration {
+        self.0.lock().unwrap().held_release.unwrap_or(agent_state_machine::HELD_RELEASE_AFTER)
     }
     fn llm_retry_after(&self) -> Duration {
         self.0.lock().unwrap().llm_retry.unwrap_or(Duration::from_millis(1))
@@ -926,6 +932,83 @@ async fn held_results_are_fed_with_the_next_wake() {
     let n = 1 + MAX_FOLLOWUPS as usize;
     let fed = fake.fed(n);
     assert!(fed.contains("status?") && fed.contains(&format!("[#{} Bash]", MAX_FOLLOWUPS)) && fed.contains("held-one"), "{fed}");
+}
+
+/// A cat with results held back and nobody writing has to get them
+/// eventually. Found 2026-09-28, meow: eight pages of a source file read
+/// with `Inspect`, the ninth held "until the next message", and only the
+/// local-task nudge — which needs an open local task — happened to fire.
+/// Here there is no local task and no reminder, so nothing else could:
+/// only the release brings the loop back.
+#[tokio::test]
+async fn held_results_are_released_when_nobody_writes() {
+    let r = rig_seen(vec![], Seen { check: true, held_release: Some(Duration::from_millis(80)), ..Seen::default() }).await;
+    *r.fake.forever.lock().unwrap() = Some(calls(vec![("Bash", json!({"command": "echo held-one"}))]));
+    r.wake("loop");
+    r.until("cap", |_, s| s.shown.iter().any(|l| l.contains("held back"))).await;
+    *r.fake.forever.lock().unwrap() = None;
+    *r.fake.script.lock().unwrap() = vec![say("caught up"), text("")].into();
+    // No wake from anyone — the loop has to bring itself back.
+    r.until("released turn answered", |_, s| s.sent.iter().any(|b| b == "caught up")).await;
+    let (fake, seen) = r.finish().await;
+    let n = 1 + MAX_FOLLOWUPS as usize;
+    let fed = fake.fed(n);
+    assert!(fed.contains("held back") && fed.contains("carry on"), "the release says what it is: {fed}");
+    assert!(fed.contains(&format!("[#{} Bash]", MAX_FOLLOWUPS)) && fed.contains("held-one"), "and carries the held result: {fed}");
+    assert!(!fed.contains("last time"), "the first release isn't the last: {fed}");
+    assert!(seen.lock().unwrap().shown.iter().any(|l| l.contains("releasing 1 held result")));
+}
+
+/// The cap is there so a model can't loop on its own results for ever, and
+/// a release that never ran out would undo it. Three releases, then the
+/// results wait for a real message — and the last release says so.
+#[tokio::test]
+async fn held_releases_are_bounded() {
+    let r = rig_seen(vec![], Seen { check: true, held_release: Some(Duration::from_millis(60)), ..Seen::default() }).await;
+    *r.fake.forever.lock().unwrap() = Some(calls(vec![("Bash", json!({"command": "true"}))]));
+    r.wake("loop");
+    let releases = MAX_HELD_RELEASES as usize;
+    r.until("held after the last release", |_, s| s.shown.iter().filter(|l| l.contains("held back")).count() == 1 + releases).await;
+    // Give a fourth release every chance to fire.
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    let (fake, seen) = r.finish().await;
+    let rounds = 1 + releases;
+    assert_eq!(fake.requests().len(), rounds * (1 + MAX_FOLLOWUPS as usize), "a wake turn and the follow-ups it earns, per round");
+    assert_eq!(seen.lock().unwrap().shown.iter().filter(|l| l.contains("releasing")).count(), releases);
+    let last = MAX_FOLLOWUPS as usize + 1 + (releases - 1) * (1 + MAX_FOLLOWUPS as usize);
+    assert!(fake.fed(last).contains("last time they're released"), "{}", fake.fed(last));
+    assert!(!fake.fed(last - (1 + MAX_FOLLOWUPS as usize)).contains("last time they're released"));
+}
+
+/// Someone writing is what gives the release budget back: a cat that's
+/// being talked to never runs out of releases.
+#[tokio::test]
+async fn a_real_wake_gives_the_release_budget_back() {
+    let r = rig_seen(vec![], Seen { check: true, held_release: Some(Duration::from_millis(60)), ..Seen::default() }).await;
+    *r.fake.forever.lock().unwrap() = Some(calls(vec![("Bash", json!({"command": "true"}))]));
+    r.wake("loop");
+    let releases = MAX_HELD_RELEASES as usize;
+    let held = |n: usize| move |_: &Fake, s: &Seen| s.shown.iter().filter(|l| l.contains("held back")).count() == n;
+    r.until("spent", held(1 + releases)).await;
+    let spent = r.seen.lock().unwrap().shown.iter().filter(|l| l.contains("releasing")).count();
+    assert_eq!(spent, releases);
+    r.wake("still there?");
+    r.until("released again after someone wrote", |_, s| s.shown.iter().filter(|l| l.contains("releasing")).count() > releases).await;
+    r.finish().await;
+}
+
+/// `kot chat` (`check_before_idle` off) has its operator at the keyboard:
+/// nothing is released behind their back, however long it's been.
+#[tokio::test]
+async fn nothing_is_released_where_the_operator_is_present() {
+    let r = rig_seen(vec![], Seen { check: false, held_release: Some(Duration::from_millis(40)), ..Seen::default() }).await;
+    *r.fake.forever.lock().unwrap() = Some(calls(vec![("Bash", json!({"command": "true"}))]));
+    r.wake("loop");
+    r.until("cap", |_, s| s.shown.iter().any(|l| l.contains("held back"))).await;
+    tokio::time::sleep(Duration::from_millis(400)).await;
+    let (fake, seen) = r.finish().await;
+    assert_eq!(fake.requests().len(), 1 + MAX_FOLLOWUPS as usize, "still held: no turn without a message");
+    assert!(!seen.lock().unwrap().shown.iter().any(|l| l.contains("releasing")));
 }
 
 /// The last allowed follow-up says so, and only that one.

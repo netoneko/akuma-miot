@@ -309,6 +309,12 @@ struct LlmArgs {
     /// it; this overrides that too.
     #[arg(long, env = "MIOT_CONTEXT_WINDOW")]
     context_window: Option<u32>,
+    /// Force-compact against this many tokens instead of the real context
+    /// window — for a huge/imprecise window (`--glm`'s 1M) where waiting
+    /// until `miot_llm::FORCE_COMPACT_PCT` of the real thing risks a slow,
+    /// expensive turn.
+    #[arg(long, env = "MIOT_COMPACT_EARLY")]
+    compact_early: Option<u32>,
 }
 
 fn read_token(flag: &str, file: &str) -> String {
@@ -320,6 +326,9 @@ fn build_llm(a: &LlmArgs) -> Option<miot_llm::Llm> {
     let mut llm = build_llm_for(a)?;
     if let Some(n) = a.context_window {
         llm = llm.with_context_window(n);
+    }
+    if let Some(n) = a.compact_early {
+        llm = llm.with_compact_early(n);
     }
     Some(match &a.reasoning {
         Some(e) => llm.with_reasoning(e).unwrap_or_else(|e| die(format!("--reasoning: {e}"))),

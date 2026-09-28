@@ -98,6 +98,10 @@ pub struct Llm {
     base_url: Option<String>,
     http: reqwest::Client,
     context_window: tokio::sync::OnceCell<Option<u32>>,
+    /// Force-compact against this many tokens instead of the real context
+    /// window ([`Llm::with_compact_early`]) — `None` uses the real window
+    /// as-is.
+    compact_early: Option<u32>,
     /// A cap on one turn's output, when the provider needs one: OpenRouter
     /// checks a request's *worst case* (max output × price) against the key's
     /// remaining limit, and with no cap it assumes the model's maximum (65k
@@ -152,6 +156,7 @@ impl Llm {
             base_url: Some(base_url.trim_end_matches('/').to_string()),
             http: reqwest::Client::new(),
             context_window: tokio::sync::OnceCell::new(),
+            compact_early: None,
             max_tokens: None,
             reasoning: None,
         }
@@ -167,6 +172,7 @@ impl Llm {
             base_url: None,
             http: reqwest::Client::new(),
             context_window: tokio::sync::OnceCell::new(),
+            compact_early: None,
             max_tokens: None,
             reasoning: None,
         }
@@ -195,6 +201,7 @@ impl Llm {
             base_url: None,
             http: reqwest::Client::new(),
             context_window: tokio::sync::OnceCell::new(),
+            compact_early: None,
             max_tokens: None,
             reasoning: ReasoningEffort::from_keyword(GLM_REASONING),
         }
@@ -207,6 +214,16 @@ impl Llm {
     /// (2026-09-25).
     pub fn with_context_window(mut self, tokens: u32) -> Self {
         self.context_window = tokio::sync::OnceCell::new_with(Some(Some(tokens)));
+        self
+    }
+
+    /// Force-compact against `tokens` instead of the real context window —
+    /// for a huge/imprecise window (GLM's 1M) where waiting until
+    /// [`FORCE_COMPACT_PCT`] of the real thing risks a slow, expensive turn.
+    /// `256_000` keeps every turn cheap regardless of how big the model's
+    /// actual window is.
+    pub fn with_compact_early(mut self, tokens: u32) -> Self {
+        self.compact_early = Some(tokens);
         self
     }
 
@@ -247,6 +264,7 @@ impl Llm {
             base_url: None,
             http: reqwest::Client::new(),
             context_window: tokio::sync::OnceCell::new(),
+            compact_early: None,
             max_tokens: Some(OPENROUTER_MAX_TOKENS),
             reasoning: None,
         }
@@ -267,6 +285,12 @@ impl Llm {
                 v.get("data")?.as_array()?.first()?.get("meta")?.get("n_ctx")?.as_u64().map(|n| n as u32)
             })
             .await
+    }
+
+    /// The early-compaction override, if configured — see
+    /// [`Llm::with_compact_early`].
+    pub fn compact_early(&self) -> Option<u32> {
+        self.compact_early
     }
 
     pub fn label(&self) -> &str {

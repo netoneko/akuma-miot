@@ -169,6 +169,55 @@ kot --node https://kot.akuma.sh:9441 --theme ink   # the REPL
     the new herd started kot, and `herd start kot` answers "already
     running". Relaunch, if needed: in `fc`, as root,
     `firecracker --api-sock /tmp/fc.sock --config-file /tmp/akuma-fc.json`.
+  - **2026-09-28: mimi was down again, and getting it back took four
+    separate fixes.** Found while checking why the mesh was thin (meow, kuro
+    and mimi all out, exactly quorum). Everything below was observed;
+    causes are marked where they aren't known.
+    1. **`fc` was stopped.** That took kuro and mimi with it (both live in
+       it). Kuro's `kot.service` came back by itself on `limactl start fc`.
+       Mimi did not.
+    2. **`fc`'s `/tmp` is wiped on every restart, and mimi's whole launch
+       depends on it.** The kernel (`/tmp/akuma-fc.bin`), the Firecracker
+       config (`/tmp/akuma-fc.json`), tap0, dnsmasq's lease and the NAT
+       rules were all gone; only the disk survives, in `/var/tmp`. The
+       relaunch line above no longer works on its own after a restart.
+       What worked: `../akuma/overlays/devbox-firecracker/guest-setup.sh`,
+       `limactl copy akuma-fc.bin fc:/tmp/`, rewrite the config the way
+       `run.sh` does, then `firecracker` detached (`setsid nohup`, root).
+       Nothing starts the guest at boot; a systemd unit for it is not built.
+       Two traps in that script: `guest-setup.sh` printed "dnsmasq already
+       serving tap0" when none was running (its `pgrep -f` matches its own
+       `sh -c`), and dnsmasq wasn't installed in `fc` at all (why is
+       unknown). Check `pgrep -x dnsmasq`, not the script's message.
+    3. **A stale chain that can't be replayed.** The guest's ParityDB was
+       from before the mesh's last checkpoint: it held checkpoint 1590 and
+       15,367 blocks, the mesh was at 54182. The new kot started
+       `replaying 15367 block(s)`, logged nothing more for ~5 minutes, the
+       db files stopped changing, and it ignored SIGTERM (herd escalated to
+       SIGKILL). It stayed at term 12, following only kuro, and its own
+       submits came back `rejected: Invalid(Future)`. Why the replay never
+       finishes on the guest is unknown (not compared against a Linux node:
+       kuro only replayed 501 blocks that day), so treat a replay of
+       thousands of blocks on mimi as something that may not complete. Fix: move
+       `/root/kot/db/kot.db` aside, make an empty one, `herd start kot`; it
+       then took the *peer's* checkpoint (`adopted peer's checkpoint at
+       block 54182`) and only replayed 1,034 blocks. Nothing is lost: the
+       chain is a copy of what the mesh holds, and the cat's own state is
+       elsewhere (`~/.akuma/kot/`).
+    4. **After that, the node was up but the agent never connected.** The
+       mesh showed mimi at the leader's head, heard every second, but the
+       agent looped on `waiting for the node...` for ~20 minutes (the log
+       doesn't move, so it looks dead). One more `herd stop kot` / `start`
+       and it connected within seconds. Cause unknown; probably the
+       agent's first requests to its own node landing while the node was
+       still busy adopting the checkpoint, and never recovering. A restart
+       after the node has settled is the fix.
+    **Don't diagnose a node with plain `curl`.** Every mesh port needs a
+    client certificate, so `curl -k https://<node>:9944/...` fails the TLS
+    handshake (`000`, or `tls handshake eof` in the node's own log) from a
+    perfectly healthy node. Use `kot --node ... peers`, or read the node's
+    own log. This misled the first reading of mimi's state (it looked like a
+    hung listener; it was the agent, item 4).
   - herd's control port (`127.0.0.1:7117`) is reachable from the network on
     every Akuma member, because Akuma's `bind()` ignores the address.
     Anyone who can reach a box can `stop` its services.
