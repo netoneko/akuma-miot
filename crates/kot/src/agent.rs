@@ -764,6 +764,14 @@ impl Cat {
             // front of the wrong audience.
             "SendMessage" => {
                 let body = c.str("body").unwrap_or_default();
+                // A model that fills in `to`/`tags`/`no_ack` and leaves `body`
+                // out (glm-5.3-flash, live 2026-09-29: meow sent root two
+                // blank messages) used to post an empty message; tell it so
+                // it retries instead.
+                if body.trim().is_empty() {
+                    let to = c.str("to").unwrap_or_default();
+                    return refuse(format!("→ {to}"), "no body — nothing sent; call SendMessage again with `body` set to what you want to say");
+                }
                 let raw_to = c.str("to").map(|s| s.trim().to_string()).unwrap_or_default();
                 let to = match raw_to.as_str() {
                     "" => None,
@@ -1361,5 +1369,29 @@ async fn watch_chain(cat: Arc<Cat>, mut head: serde_json::Value, tx: tokio::sync
         }
 
         tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    /// glm-5.3-flash, live 2026-09-29: `to`/`no_ack`/`tags` filled in, `body`
+    /// left out, and meow posted root two blank messages. The node is
+    /// unreachable on purpose: the refusal has to come before any submit.
+    #[tokio::test]
+    async fn send_message_without_a_body_is_refused_not_posted() {
+        let root = Identity::from_seed(&[1u8; 32]);
+        let cat = new_cat("meow", root.clone(), "http://127.0.0.1:1".into(), Roster(vec![("root".into(), root.account())]), false);
+        for args in [
+            json!({"to": "root", "no_ack": true, "tags": ["hda-driver"]}),
+            json!({"to": "root", "body": ""}),
+            json!({"to": "root", "body": "  \n\t "}),
+        ] {
+            let out = cat.record(&miot_llm::Call { name: "SendMessage".into(), args: args.clone() }).await;
+            assert!(!out.ok, "{args} was accepted");
+            assert!(out.meta.iter().any(|m| m.contains("no body")), "{args}: {:?}", out.meta);
+        }
     }
 }
