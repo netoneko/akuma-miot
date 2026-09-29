@@ -204,10 +204,15 @@ write nothing.)";
 /// its history ([`Speaker::Called`]): the call went out, and its result —
 /// if it has one — arrives the way results always do, later, by id.
 pub const CALLED_ACK: &str = "(started — anything it returns comes back in a later message)";
-/// A string argument longer than this is cut, in history only, to its start
-/// and a note of its length — a `WriteFile`'s whole body must not ride along
-/// in every turn after it.
-const CALLED_ARG_CHARS: usize = 400;
+/// A string argument longer than this is left out of history — a
+/// `WriteFile`'s whole body must not ride along in every turn after it.
+/// Shorter ones, a message or a command, are kept whole. It is *left out*, not
+/// cut: the first version kept the first 400 characters and appended
+/// `… (N chars in all)`, and the model took that for its own writing. meow
+/// committed the marker into `hda.rs` twice and sent it in a message,
+/// 2026-09-29 — a call in history is something a model imitates, so an
+/// elision must not look like the end of a text.
+const CALLED_ARG_CHARS: usize = 2000;
 /// Check-ins in a row answered with only more words before the loop stops
 /// asking and leaves it to the local-task nudge. Found in meow's Langfuse
 /// log, 2026-09-27: every one of its 55 no-call turns in 13½ hours was a
@@ -2266,7 +2271,7 @@ pub fn load_history(path: &std::path::Path) -> Saved {
             .filter_map(|(who, said)| match who.as_str() {
                 "user" => Some((Speaker::User, said)),
                 "assistant" => Some((Speaker::Assistant, said)),
-                "called" => Some((Speaker::Called, said)),
+                "called" => Some((Speaker::Called, drop_old_clip_marker(&said))),
                 _ => None,
             })
             .collect()
@@ -2278,6 +2283,33 @@ pub fn load_history(path: &std::path::Path) -> Saved {
     let mut history = parse(rows);
     let (trimmed, max_id) = trim_legacy(&mut history);
     Saved { history, fresh: Vec::new(), turns: 0, next_id: max_id.map_or(0, |m| m + 1), trimmed }
+}
+
+/// A saved call from before 2026-09-29 has its long strings as their first 400
+/// characters plus `… (N chars in all)` — the very thing [`short_args`] no
+/// longer writes, because the model copied it. Restored as it was, a cat would
+/// keep seeing it for as long as the history lives, so it is turned into the
+/// new note (the prefix is dropped with it). Anything that isn't a call row
+/// with such a string comes back unchanged.
+fn drop_old_clip_marker(said: &str) -> String {
+    fn fix(v: &serde_json::Value) -> serde_json::Value {
+        match v {
+            serde_json::Value::String(s) => match s.strip_suffix(" chars in all)").and_then(|h| h.rsplit_once("… (")) {
+                Some((_, n)) if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() => {
+                    serde_json::Value::String(format!("<{n} characters were sent here. History leaves them out; this note is not part of what was sent, so never write it into a file or a message.>"))
+                }
+                _ => v.clone(),
+            },
+            serde_json::Value::Object(m) => serde_json::Value::Object(m.iter().map(|(k, v)| (k.clone(), fix(v))).collect()),
+            serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(fix).collect()),
+            v => v.clone(),
+        }
+    }
+    let Some(mut rows) = miot_llm::called_rows(said) else { return said.to_string() };
+    for r in rows.iter_mut() {
+        r.args = fix(&r.args);
+    }
+    miot_llm::called(&rows)
 }
 
 /// Cut each old-format results block to one line per row (`[#3 Bash] $ make
@@ -2349,14 +2381,15 @@ pub fn save_history(path: &std::path::Path, saved: &Saved) {
     }
 }
 
-/// `args` with every string longer than [`CALLED_ARG_CHARS`] cut to its
-/// start and its length.
+/// `args` with every string longer than [`CALLED_ARG_CHARS`] replaced whole by
+/// a note saying so. Never a prefix of the text, and nothing appended to it:
+/// see [`CALLED_ARG_CHARS`].
 fn short_args(args: &serde_json::Value) -> serde_json::Value {
     match args {
-        serde_json::Value::String(s) if s.chars().count() > CALLED_ARG_CHARS => {
-            let head: String = s.chars().take(CALLED_ARG_CHARS).collect();
-            serde_json::Value::String(format!("{head}… ({} chars in all)", s.chars().count()))
-        }
+        serde_json::Value::String(s) if s.chars().count() > CALLED_ARG_CHARS => serde_json::Value::String(format!(
+            "<{} characters were sent here. History leaves them out; this note is not part of what was sent, so never write it into a file or a message.>",
+            s.chars().count()
+        )),
         serde_json::Value::Object(m) => serde_json::Value::Object(m.iter().map(|(k, v)| (k.clone(), short_args(v))).collect()),
         serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(short_args).collect()),
         v => v.clone(),

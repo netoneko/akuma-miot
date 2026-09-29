@@ -1575,6 +1575,29 @@ fn an_old_format_history_is_trimmed_on_load() {
     assert_eq!(saved.history[0].1, "root said: build it");
 }
 
+/// A saved call still carrying the old `… (N chars in all)` tail is turned
+/// into the new note on load, prefix and all — a restored cat must not keep
+/// being shown the thing that taught meow to write it into `hda.rs`.
+#[test]
+fn an_old_clip_marker_in_a_saved_call_is_replaced_on_load() {
+    use kot::agent_state_machine::load_history;
+    use miot_llm::Speaker;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("meow.history.1.json");
+    let calls = json!([
+        {"name": "WriteFile", "args": {"path": "a.rs", "content": format!("{}… (5000 chars in all)", "y".repeat(400))}, "ack": "(started)"},
+        {"name": "SendMessage", "args": {"body": "kept: 3 chars in all)"}, "ack": "(started)"}
+    ]);
+    let file = json!({"history": [["called", calls.to_string()]], "fresh": [], "turns": 1, "next_id": 0});
+    std::fs::write(&path, file.to_string()).unwrap();
+    let saved = load_history(&path);
+    assert_eq!(saved.history[0].0, Speaker::Called);
+    let said = &saved.history[0].1;
+    assert!(said.contains("5000 characters were sent here"), "{said}");
+    assert!(!said.contains("yyy") && !said.contains("… ("), "{said}");
+    assert!(said.contains("kept: 3 chars in all)"), "a string that only resembles it is left alone: {said}");
+}
+
 // ── one lane for the host's files (meow, 2026-09-25: shredded hda.rs) ──
 
 /// Two calls in one response run in order, the second after the first has
@@ -1847,10 +1870,12 @@ async fn own_calls_are_in_history_as_tool_calls() {
     assert_eq!(msgs.iter().filter(|m| m["role"] == "assistant").count(), 1, "text and call are one message, not two");
 }
 
-/// A call's long string argument is cut in history — the whole body of a
-/// `WriteFile` mustn't ride along in every turn after it.
+/// A call's long string argument is left out of history — the whole body of a
+/// `WriteFile` mustn't ride along in every turn after it — and left out
+/// whole: no prefix of it, and no `… (N chars in all)` tail for the model to
+/// copy into its next file or message (meow did, 2026-09-29).
 #[tokio::test]
-async fn a_long_call_argument_is_cut_in_history() {
+async fn a_long_call_argument_is_left_out_of_history() {
     let long: &'static str = Box::leak("y".repeat(5000).into_boxed_str());
     let r = rig(vec![say(long), say("again")]).await;
     r.wake("one");
@@ -1860,7 +1885,22 @@ async fn a_long_call_argument_is_cut_in_history() {
     let (fake, seen) = r.finish().await;
     assert_eq!(seen.lock().unwrap().sent[0].len(), 5000, "the call itself got the whole argument");
     let args = fake.requests()[1]["messages"].as_array().unwrap().iter().find_map(|m| m["tool_calls"][0]["function"]["arguments"].as_str().map(str::to_string)).unwrap();
-    assert!(args.len() < 1000 && args.contains("5000 chars in all"), "{args}");
+    assert!(args.len() < 1000 && args.contains("5000 characters"), "{args}");
+    assert!(!args.contains("yyy") && !args.contains("chars in all") && !args.contains('…'), "no prefix of it, no tail to imitate: {args}");
+}
+
+/// A message or a command is kept whole, not summarised.
+#[tokio::test]
+async fn a_short_call_argument_stays_whole_in_history() {
+    let mid: &'static str = Box::leak(format!("{}END", "m".repeat(1500)).into_boxed_str());
+    let r = rig(vec![say(mid), say("again")]).await;
+    r.wake("one");
+    r.until("first", |_, s| s.sent.len() == 1).await;
+    r.wake("two");
+    r.until("second", |_, s| s.sent.len() == 2).await;
+    let (fake, _seen) = r.finish().await;
+    let args = fake.requests()[1]["messages"].as_array().unwrap().iter().find_map(|m| m["tool_calls"][0]["function"]["arguments"].as_str().map(str::to_string)).unwrap();
+    assert!(args.contains("mmmEND"), "{}", &args[args.len().saturating_sub(80)..]);
 }
 
 /// Its calls survive a restart with the rest of the conversation.
