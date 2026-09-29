@@ -1575,27 +1575,35 @@ fn an_old_format_history_is_trimmed_on_load() {
     assert_eq!(saved.history[0].1, "root said: build it");
 }
 
-/// A saved call still carrying the old `… (N chars in all)` tail is turned
-/// into the new note on load, prefix and all — a restored cat must not keep
-/// being shown the thing that taught meow to write it into `hda.rs`.
+/// A saved call carrying either marker — the `… (N chars in all)` tail, or the
+/// `<N characters were sent here…>` note that replaced it for a few hours — has
+/// that field taken out on load and noted on its `tool` message. A restored cat
+/// must not keep being shown what taught meow to write it into `hda.rs` and into
+/// a message.
 #[test]
-fn an_old_clip_marker_in_a_saved_call_is_replaced_on_load() {
+fn an_old_clip_marker_in_a_saved_call_is_left_out_on_load() {
     use kot::agent_state_machine::load_history;
     use miot_llm::Speaker;
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("meow.history.1.json");
     let calls = json!([
         {"name": "WriteFile", "args": {"path": "a.rs", "content": format!("{}… (5000 chars in all)", "y".repeat(400))}, "ack": "(started)"},
+        {"name": "SendMessage", "args": {"body": "<421 characters were sent here. History leaves them out; this note is not part of what was sent, so never write it into a file or a message.>", "to": "root"}, "ack": "(started)"},
         {"name": "SendMessage", "args": {"body": "kept: 3 chars in all)"}, "ack": "(started)"}
     ]);
     let file = json!({"history": [["called", calls.to_string()]], "fresh": [], "turns": 1, "next_id": 0});
     std::fs::write(&path, file.to_string()).unwrap();
     let saved = load_history(&path);
     assert_eq!(saved.history[0].0, Speaker::Called);
-    let said = &saved.history[0].1;
-    assert!(said.contains("5000 characters were sent here"), "{said}");
-    assert!(!said.contains("yyy") && !said.contains("… ("), "{said}");
-    assert!(said.contains("kept: 3 chars in all)"), "a string that only resembles it is left alone: {said}");
+    let rows = miot_llm::called_rows(&saved.history[0].1).unwrap();
+    assert!(rows[0].args.get("content").is_none() && rows[0].args["path"] == "a.rs", "{:?}", rows[0].args);
+    assert!(rows[0].ack.contains("content (5000 chars)"), "{}", rows[0].ack);
+    assert!(rows[1].args.get("body").is_none() && rows[1].args["to"] == "root", "{:?}", rows[1].args);
+    assert!(rows[1].ack.contains("body (421 chars)"), "{}", rows[1].ack);
+    assert_eq!(rows[2].args["body"], "kept: 3 chars in all)", "a string that only resembles it is left alone");
+    assert_eq!(rows[2].ack, "(started)");
+    let all = &saved.history[0].1;
+    assert!(!all.contains("yyy") && !all.contains("… (") && !all.contains("sent here"), "{all}");
 }
 
 // ── one lane for the host's files (meow, 2026-09-25: shredded hda.rs) ──
@@ -1871,9 +1879,10 @@ async fn own_calls_are_in_history_as_tool_calls() {
 }
 
 /// A call's long string argument is left out of history — the whole body of a
-/// `WriteFile` mustn't ride along in every turn after it — and left out
-/// whole: no prefix of it, and no `… (N chars in all)` tail for the model to
-/// copy into its next file or message (meow did, 2026-09-29).
+/// `WriteFile` mustn't ride along in every turn after it — and left out of the
+/// call altogether: no prefix, no `… (N chars in all)` tail, and no note in its
+/// place, because a model copies whatever it sees there into its next file or
+/// message (meow did both, 2026-09-29). It is said on the `tool` message.
 #[tokio::test]
 async fn a_long_call_argument_is_left_out_of_history() {
     let long: &'static str = Box::leak("y".repeat(5000).into_boxed_str());
@@ -1884,9 +1893,11 @@ async fn a_long_call_argument_is_left_out_of_history() {
     r.until("second", |_, s| s.sent.len() == 2).await;
     let (fake, seen) = r.finish().await;
     assert_eq!(seen.lock().unwrap().sent[0].len(), 5000, "the call itself got the whole argument");
-    let args = fake.requests()[1]["messages"].as_array().unwrap().iter().find_map(|m| m["tool_calls"][0]["function"]["arguments"].as_str().map(str::to_string)).unwrap();
-    assert!(args.len() < 1000 && args.contains("5000 characters"), "{args}");
-    assert!(!args.contains("yyy") && !args.contains("chars in all") && !args.contains('…'), "no prefix of it, no tail to imitate: {args}");
+    let msgs = fake.requests()[1]["messages"].as_array().unwrap().clone();
+    let args = msgs.iter().find_map(|m| m["tool_calls"][0]["function"]["arguments"].as_str().map(str::to_string)).unwrap();
+    assert!(!args.contains("yyy") && !args.contains("chars") && !args.contains('…') && !args.contains("sent here"), "nothing in the arguments to imitate: {args}");
+    let ack = msgs.iter().filter(|m| m["role"] == "tool").find_map(|m| m["content"].as_str().filter(|c| c.contains("5000 chars")).map(str::to_string));
+    assert!(ack.is_some(), "the tool message says what was left out: {msgs:?}");
 }
 
 /// A message or a command is kept whole, not summarised.

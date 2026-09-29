@@ -206,12 +206,15 @@ write nothing.)";
 pub const CALLED_ACK: &str = "(started — anything it returns comes back in a later message)";
 /// A string argument longer than this is left out of history — a
 /// `WriteFile`'s whole body must not ride along in every turn after it.
-/// Shorter ones, a message or a command, are kept whole. It is *left out*, not
-/// cut: the first version kept the first 400 characters and appended
-/// `… (N chars in all)`, and the model took that for its own writing. meow
-/// committed the marker into `hda.rs` twice and sent it in a message,
-/// 2026-09-29 — a call in history is something a model imitates, so an
-/// elision must not look like the end of a text.
+/// Shorter ones, a message or a command, are kept whole. It is *left out* of
+/// the recorded call altogether, and said once on the call's `tool` message
+/// ([`called_ack`]) — never cut to a prefix, and never replaced by a note in
+/// the argument. The first version kept 400 characters and appended
+/// `… (N chars in all)`; the second put `<N characters were sent here…>` in
+/// its place. Both were copied: meow committed the first into `hda.rs` twice
+/// and sent it in a message (2026-09-29), and sent the second in a message
+/// within minutes of it going out. A model imitates what it sees in its own
+/// calls, so nothing that stands in for a text may sit where the text was.
 const CALLED_ARG_CHARS: usize = 2000;
 /// Check-ins in a row answered with only more words before the loop stops
 /// asking and leaves it to the local-task nudge. Found in meow's Langfuse
@@ -1520,7 +1523,14 @@ impl<H: Host> AgentStateMachine<H> {
         // Its calls, as calls — see `Speaker::Called` for why they're here
         // at all. A compaction just replaced the history they'd go in.
         if !turn.calls.is_empty() && !compacted {
-            let rows: Vec<miot_llm::CalledRow> = turn.calls.iter().map(|c| miot_llm::CalledRow { name: c.name.clone(), args: short_args(&c.args), ack: CALLED_ACK.to_string() }).collect();
+            let rows: Vec<miot_llm::CalledRow> = turn
+                .calls
+                .iter()
+                .map(|c| {
+                    let (args, left_out) = short_args(&c.args);
+                    miot_llm::CalledRow { name: c.name.clone(), args, ack: called_ack(&left_out) }
+                })
+                .collect();
             self.history.push((Speaker::Called, miot_llm::called(&rows)));
         }
         // Worked on results, then only wrote things (a message, a task
@@ -2285,29 +2295,29 @@ pub fn load_history(path: &std::path::Path) -> Saved {
     Saved { history, fresh: Vec::new(), turns: 0, next_id: max_id.map_or(0, |m| m + 1), trimmed }
 }
 
-/// A saved call from before 2026-09-29 has its long strings as their first 400
-/// characters plus `… (N chars in all)` — the very thing [`short_args`] no
-/// longer writes, because the model copied it. Restored as it was, a cat would
-/// keep seeing it for as long as the history lives, so it is turned into the
-/// new note (the prefix is dropped with it). Anything that isn't a call row
-/// with such a string comes back unchanged.
+/// A saved call from before the clip was fixed has a long string cut to its
+/// first 400 characters plus `… (N chars in all)`, or — for the few hours the
+/// second version was out, 2026-09-29 — replaced by `<N characters were sent
+/// here. …>`. Both taught a model to write them (see [`CALLED_ARG_CHARS`]), and
+/// a restored history keeps showing them for as long as it lives. Each such
+/// field is taken out of the call and noted on its `tool` message, the same
+/// way [`short_args`] now does it. Anything else comes back unchanged.
 fn drop_old_clip_marker(said: &str) -> String {
-    fn fix(v: &serde_json::Value) -> serde_json::Value {
-        match v {
-            serde_json::Value::String(s) => match s.strip_suffix(" chars in all)").and_then(|h| h.rsplit_once("… (")) {
-                Some((_, n)) if n.chars().all(|c| c.is_ascii_digit()) && !n.is_empty() => {
-                    serde_json::Value::String(format!("<{n} characters were sent here. History leaves them out; this note is not part of what was sent, so never write it into a file or a message.>"))
-                }
-                _ => v.clone(),
-            },
-            serde_json::Value::Object(m) => serde_json::Value::Object(m.iter().map(|(k, v)| (k.clone(), fix(v))).collect()),
-            serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(fix).collect()),
-            v => v.clone(),
-        }
+    fn old_marker(s: &str) -> Option<usize> {
+        let (_, n) = s.strip_suffix(" chars in all)")?.rsplit_once("… (")?;
+        (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then(|| n.parse().ok()).flatten()
+    }
+    fn second_marker(s: &str) -> Option<usize> {
+        let n = s.strip_prefix('<')?.split_once(" characters were sent here.")?.0;
+        (!n.is_empty() && n.chars().all(|c| c.is_ascii_digit())).then(|| n.parse().ok()).flatten()
     }
     let Some(mut rows) = miot_llm::called_rows(said) else { return said.to_string() };
     for r in rows.iter_mut() {
-        r.args = fix(&r.args);
+        let mut left_out = Vec::new();
+        r.args = leave_out(&r.args, &|s| old_marker(s).or_else(|| second_marker(s)), &mut left_out);
+        if !left_out.is_empty() {
+            r.ack = called_ack(&left_out);
+        }
     }
     miot_llm::called(&rows)
 }
@@ -2381,18 +2391,50 @@ pub fn save_history(path: &std::path::Path, saved: &Saved) {
     }
 }
 
-/// `args` with every string longer than [`CALLED_ARG_CHARS`] replaced whole by
-/// a note saying so. Never a prefix of the text, and nothing appended to it:
-/// see [`CALLED_ARG_CHARS`].
-fn short_args(args: &serde_json::Value) -> serde_json::Value {
-    match args {
-        serde_json::Value::String(s) if s.chars().count() > CALLED_ARG_CHARS => serde_json::Value::String(format!(
-            "<{} characters were sent here. History leaves them out; this note is not part of what was sent, so never write it into a file or a message.>",
-            s.chars().count()
-        )),
-        serde_json::Value::Object(m) => serde_json::Value::Object(m.iter().map(|(k, v)| (k.clone(), short_args(v))).collect()),
-        serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(short_args).collect()),
+/// `args` without the fields whose string is longer than [`CALLED_ARG_CHARS`],
+/// and a note for each field taken out (`content (5000 chars)`) for
+/// [`called_ack`]. See [`CALLED_ARG_CHARS`] for why they are removed, not
+/// shortened or replaced.
+fn short_args(args: &serde_json::Value) -> (serde_json::Value, Vec<String>) {
+    let mut left_out = Vec::new();
+    let kept = leave_out(args, &|s| (s.chars().count() > CALLED_ARG_CHARS).then(|| s.chars().count()), &mut left_out);
+    (kept, left_out)
+}
+
+/// `v` with every object field whose string `gone` gives a length for taken
+/// out, at any depth; `left_out` collects `field (N chars)` for each.
+fn leave_out(v: &serde_json::Value, gone: &dyn Fn(&str) -> Option<usize>, left_out: &mut Vec<String>) -> serde_json::Value {
+    match v {
+        serde_json::Value::Object(m) => {
+            let mut kept = serde_json::Map::new();
+            for (k, x) in m {
+                match x {
+                    serde_json::Value::String(s) => match gone(s) {
+                        Some(n) => left_out.push(format!("{k} ({n} chars)")),
+                        None => {
+                            kept.insert(k.clone(), x.clone());
+                        }
+                    },
+                    _ => {
+                        kept.insert(k.clone(), leave_out(x, gone, left_out));
+                    }
+                }
+            }
+            serde_json::Value::Object(kept)
+        }
+        serde_json::Value::Array(a) => serde_json::Value::Array(a.iter().map(|x| leave_out(x, gone, left_out)).collect()),
         v => v.clone(),
+    }
+}
+
+/// [`CALLED_ACK`], and — when [`short_args`] took fields out of the call — a
+/// line saying which, on the `tool` message: a place the model reads and never
+/// writes.
+fn called_ack(left_out: &[String]) -> String {
+    if left_out.is_empty() {
+        CALLED_ACK.to_string()
+    } else {
+        format!("{CALLED_ACK} Left out of this history to keep it short (all of it was sent, whole): {}.", left_out.join(", "))
     }
 }
 

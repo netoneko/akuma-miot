@@ -433,13 +433,15 @@ saying `CALLED_ACK` ("started — anything it returns comes back in a
 later message"). Results still come back as a user message, later, by id,
 exactly as before. These are structured calls, not text, so there's
 nothing for a model to type back the way qwen3-4b did. A string argument
-longer than 2000 characters is replaced whole in history by a note of its
-length (a `WriteFile` body mustn't ride along forever). It used to be cut to
-its first 400 characters with `… (N chars in all)` appended, and that was
-wrong: the model copies what it sees in its own calls, and meow committed the
-marker into `hda.rs` twice and sent it in a message (2026-09-29). Anything
-in history is something a model may imitate — an elision must not look like
-the end of a text. The compaction summary is asked for without them,
+longer than 2000 characters is left out of the recorded call altogether and
+named once on its `tool` message (`content (5000 chars)`) — a `WriteFile` body
+mustn't ride along forever. It used to be cut to its first 400 characters with
+`… (N chars in all)` appended, then (for a few hours) replaced by a
+`<N characters were sent here…>` note, and a model copied both: meow committed
+the first into `hda.rs` twice and sent each in a message (2026-09-29). Anything
+in a model's own calls is something it may imitate, so nothing that stands in
+for a text may sit where the text was; a saved history is migrated the same way
+on load. The compaction summary is asked for without them,
 since it's asked with no tools. Saved as `"called"` rows, so they survive
 a restart. Verified end to end with `kot chat` against the same local
 model: two chained `Bash` calls and an answer, the second and third
