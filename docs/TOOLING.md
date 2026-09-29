@@ -172,6 +172,90 @@ live Langfuse instance.
 
 Test: `langfuse_log_records_a_trace_generation_and_spans`.
 
+Since 2026-09-29 a `trace-create` also carries the build as Langfuse's own
+`version` field (`crate::version::VERSION`, `<crate>+<sha>`, `-dirty` if the
+tree was uncommitted) and `metadata.reasoning` next to `model` and
+`context_window`, so runs from different builds/settings can be grouped and
+compared. Traces written before that have neither — treat them as one
+unversioned baseline.
+
+### First real numbers (meow, the trashcan, 2026-09-29)
+
+Pulled from `~/.akuma/kot/dumpster-akuma-amd64.langfuse.jsonl` (2.4 MB,
+md5-checked): 2026-09-26 19:12 → 09-28 23:37, `zai-coding::glm-5.3-flash`,
+69 traces, 505 generations, 467 tool spans. **No version in these** (see
+above). All figures are this one cat on one workload (Intel HDA audio bring-up
+in `../akuma`), so read them as leads, not constants.
+
+| | |
+|---|---|
+| Prompt tokens | 62.8M: 43.5M cached, 19.3M not — **69.3% hit** |
+| Output tokens | 437k; 18 turns over 8k tokens make up 263k (60%) |
+| Prompt size | median 69k, max 269k |
+| Turn latency | median 17 s, mean 33 s, p90 51 s, max 617 s; 4.6 h total |
+| Output speed | median 8.4 tok/s (latency-bound, not generation-bound) |
+| Tools (467) | Bash 338 (72%), Inspect 31, SendMessage 29, ReadFile 24, LocalTask 12, MultiEdit 12, Edit 4, Grep 3, Glob 2 |
+| Tool failures | Bash 13/338 (mostly `sleep`/`while ps` polling that timed out, a `grep` exit 1), MultiEdit 1, Edit 1 — both `old_string not found` |
+| Traces | 69, of which 55 on 09-27 alone; 22 have ≤12 turns |
+
+What the numbers say:
+
+- **Restarts are not where the cache goes.** First turns of a trace hit 47%
+  but are only ~9% of uncached tokens (1.8M of 19.3M).
+- **Mid-session collapses are.** 123 of 483 consecutive same-trace turns
+  (25%) reused under half of the previous turn's prompt (prompts >8k), and
+  they account for roughly 85% of the uncached tokens. Only 1 of those 123
+  had a prompt that *shrank* by >2k tokens, so it's not compaction. By gap
+  from one turn's end to the next's start: <5 s 18% collapse (n=358), 30–120 s
+  29%, **2–5 min 60%** (n=80). Two candidates, not yet separated: the
+  provider's prefix cache expiring during long tool waits, and our own
+  history rewriting (a fed tool result shrinks to a stub after 6 turns —
+  `Inspect` — which edits the middle of the prefix). The 18% with no wait at
+  all points at the second.
+- **Tools:** Bash is nearly everything and Grep/Glob are barely used, same
+  navigation-through-Bash pattern as the earlier transcript analysis; the
+  same 375 s `wavplay` command ran 4 times rather than being read back from
+  its log; one `**/*.wav` Glob took 262 s on that box.
+- **Caveat:** 267 of 505 generations have empty `output`. Probably
+  tool-call-only turns (tool calls aren't in `output`), unconfirmed.
+
+### Changes made from those numbers (2026-09-29)
+
+- **Batched aging** (`age()`, `AGE_BATCH`). A fed result used to become a
+  stub exactly `RESULT_TURNS` (6) turns later, one row at a time — which
+  rewrites an already-sent message and misses the provider's prefix cache from
+  there on, nearly every busy turn. Now the rewrite waits until the oldest row
+  is 6 turns *past* due and stubs every due row at once, sooner if the due rows
+  hold 40k chars (`AGE_FORCE_CHARS`) or the last turn was 5+ minutes ago
+  (`CACHE_COLD` — the cache is probably gone anyway, so it's free). A result now
+  stays in full for 6–12 turns, not 6. **Not yet measured**: whether this
+  moves the 69% — compare versioned traces after a redeploy. z.ai documents no
+  cache TTL and a [public measurement](https://github.com/deepseek-ai/deepseek-harness/discussions/5227)
+  of the Coding Plan found misses even with a stable prefix (no session
+  affinity, cats sharing a key evicting each other), so some of the 25% may not
+  be ours to fix.
+- **Each generation now says why its cache held or didn't** (`metadata`):
+  `prefix_kept` of `prev_msgs` (how much of the last request this one repeated
+  byte for byte, system prompt counted first), `aged` (rows stubbed this turn),
+  `system_changed` (a context-budget warning rides in the system prompt),
+  `gap_ms` since the last turn, `tool_calls`, `reasoning_chars`. A miss with
+  `prefix_kept == prev_msgs` and `aged == 0` is the provider's, not ours.
+  A trace also carries `metadata.started_by` (`start`, or a reset's reason).
+  No finish reason yet: `miot_llm::Turn` doesn't carry one.
+- **`Bash {"background": true}`.** Skips the one-at-a-time lane and isn't part
+  of any turn's batch, so a `sleep`/`while ps` poll or an unrelated build no
+  longer holds up edits or delays other results (results used to wait for
+  every outstanding query, up to 10 s); it lands as its own turn when done and
+  still counts as "something is running" for the check-in. The model opts in;
+  the system prompt says never for something a later call needs.
+- **A failed `Edit`/`MultiEdit` says what was close:** "does match if
+  whitespace is ignored" (tabs/indentation/trailing space) or "closest line
+  is N: …" (character-pair similarity ≥ 0.5). Meow's failures were 2 of 16
+  edit calls, so this is small.
+- **Not done:** a cap on output tokens per turn (GLM's thinking is easy to cut
+  off into an empty answer — [OpenCode issue](https://github.com/redhat-et/pricetag/issues/12));
+  skipping a repeated identical Bash command.
+
 ## The `Reboot` tool
 
 Compacts (same mechanism as the model's own `Compact` call — history

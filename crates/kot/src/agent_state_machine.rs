@@ -122,6 +122,19 @@ const INSPECT_CHARS: usize = 2700;
 /// replaced by a stub ([`AgentStateMachine::age`]). The full text stays in the
 /// tool log for `Inspect`.
 pub const RESULT_TURNS: u64 = 6;
+/// Aging rewrites a message already sent, so everything after it misses the
+/// provider's prefix cache. Doing it a row per turn (meow's Langfuse log,
+/// 2026-09-29: a quarter of turns reused under half the previous prompt)
+/// pays that every turn; so it waits until the oldest row is this many turns
+/// past [`RESULT_TURNS`], then ages every due row in one rewrite.
+pub const AGE_BATCH: u64 = 6;
+/// ...unless the rows already due hold this many characters (~10k tokens):
+/// then it's cheaper to rewrite now than to keep sending them.
+const AGE_FORCE_CHARS: usize = 40_000;
+/// A gap this long since the last turn and the provider's cache is probably
+/// gone anyway (z.ai documents no TTL; meow's log had 60% collapses after a
+/// 2–5 minute gap), so aging is free — do it.
+const CACHE_COLD: Duration = Duration::from_secs(5 * 60);
 /// A fed row this short is left alone: its stub would save next to nothing.
 const AGE_MIN_CHARS: usize = 400;
 /// How much of a result's first line (its call and outcome) a stub keeps.
@@ -355,7 +368,9 @@ already comes back as its start and end, and Inspect reads the rest.\n\
 - Bash, ReadFile, WriteFile, Edit, MultiEdit, LS, Glob and Grep run one at a time, in the \
 order you call them — across responses too: one waits for the one before it to finish, so a \
 later edit never races an earlier script. Running shows a waiting one as queued. Put a long \
-build last, or it holds up everything after it.\n\
+build last, or it holds up everything after it — or give that Bash background: true, which \
+runs it alongside the rest (use it for waits and polls like sleep or `while ps`, and for a build \
+nothing after it depends on; never for a command a later edit or read needs the result of).\n\
 - Edit changes one exact stretch of text in a file — old_string must match the file exactly \
 once (whitespace and all) unless you pass replace_all. It fails, saying why, rather than \
 guess: ReadFile first to get the text exact, or use WriteFile for a full rewrite. MultiEdit is \
@@ -566,12 +581,22 @@ struct AgentStateMachine<H: Host> {
     /// Turns taken, over this conversation's whole life (restarts included) —
     /// the clock [`RESULT_TURNS`] counts on.
     turns_fed: u64,
+    /// When the last model turn finished — [`CACHE_COLD`]'s clock.
+    last_turn_end: Option<Instant>,
+    /// Hashes of the last request's system prompt and each message, to say
+    /// how much of it this one shares (Langfuse `metadata`).
+    prev_sent: Vec<u64>,
+    /// How many rows the last [`AgentStateMachine::age`] stubbed.
+    aged_last: usize,
     warned_tier: u32,
     pending_warning: Option<String>,
     kinds: Vec<&'static str>,
     ctx: serde_json::Value,
     back_tx: mpsc::UnboundedSender<Back>,
     queries: usize,
+    /// Flights of `Bash {"background": true}` calls still running — out of
+    /// `queries`, so nothing waits on them, but still "something is running".
+    bg: std::collections::HashSet<u64>,
     records: usize,
     followups: u32,
     /// Results that arrived past [`MAX_FOLLOWUPS`], oldest first — fed with
@@ -661,7 +686,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
     if let Some(lf) = &mut langfuse {
         if lf.is_open() {
             host.show(ui::note(&format!("langfuse log: {}", trace_id)));
-            lf.trace_create(&trace_id, &format!("{} session", host.name()), llm.label(), window, llm.reasoning());
+            lf.trace_create(&trace_id, &format!("{} session", host.name()), llm.label(), window, llm.reasoning(), "start");
         } else {
             host.show(ui::note("langfuse log: can't open — not writing one"));
         }
@@ -685,12 +710,16 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
         tool_base: 0,
         fresh: Vec::new(),
         turns_fed: 0,
+        last_turn_end: None,
+        prev_sent: Vec::new(),
+        aged_last: 0,
         warned_tier: 0,
         pending_warning: None,
         kinds: Vec::new(),
         ctx: serde_json::Value::Null,
         back_tx,
         queries: 0,
+        bg: Default::default(),
         records: 0,
         followups: 0,
         held: Vec::new(),
@@ -873,12 +902,23 @@ impl<H: Host> AgentStateMachine<H> {
     }
 
     /// Replace every row fed [`RESULT_TURNS`] or more turns ago with its
-    /// stub, in the message it went out in. A row whose message is gone (a
-    /// failed turn's prompt, popped) is just forgotten.
+    /// stub, in the message it went out in — but in batches, since each
+    /// rewrite costs the provider's prefix cache from that message on
+    /// ([`AGE_BATCH`]). A row whose message is gone (a failed turn's
+    /// prompt, popped) is just forgotten.
     fn age(&mut self) {
         let now = self.turns_fed;
-        let (old, keep): (Vec<Fresh>, Vec<Fresh>) = std::mem::take(&mut self.fresh).into_iter().partition(|f| now.saturating_sub(f.turn) >= RESULT_TURNS);
+        let cold = self.last_turn_end.is_some_and(|t| t.elapsed() >= CACHE_COLD);
+        let due = |f: &Fresh| now.saturating_sub(f.turn) >= RESULT_TURNS;
+        let oldest = self.fresh.iter().map(|f| now.saturating_sub(f.turn)).max().unwrap_or(0);
+        let due_chars: usize = self.fresh.iter().filter(|f| due(f)).map(|f| f.chars).sum();
+        self.aged_last = 0;
+        if !should_age(oldest, due_chars, cold) {
+            return;
+        }
+        let (old, keep): (Vec<Fresh>, Vec<Fresh>) = std::mem::take(&mut self.fresh).into_iter().partition(|f| due(f));
         self.fresh = keep;
+        self.aged_last = old.len();
         for f in old {
             let stub = if f.id >= self.tool_base {
                 format!("[#{} {}] {} — {} chars, out of the conversation now; Inspect {{\"id\": {}}} reads it again.", f.id, f.name, f.head, f.chars, f.id)
@@ -903,7 +943,7 @@ impl<H: Host> AgentStateMachine<H> {
                 self.session += 1;
                 self.trace_id = format!("trace-{}-{}", self.host.name(), activity::unix_ms());
                 if let Some(lf) = &mut self.langfuse {
-                    lf.trace_create(&self.trace_id, &format!("{} session", self.host.name()), self.llm.label(), self.window, self.llm.reasoning());
+                    lf.trace_create(&self.trace_id, &format!("{} session", self.host.name()), self.llm.label(), self.window, self.llm.reasoning(), &why);
                 }
                 self.history.clear();
                 self.fresh.clear();
@@ -943,7 +983,9 @@ impl<H: Host> AgentStateMachine<H> {
                 }
             }
             Back::Result(name, out, session, flight) => {
-                self.queries = self.queries.saturating_sub(1);
+                if !flight.is_some_and(|f| self.bg.remove(&f)) {
+                    self.queries = self.queries.saturating_sub(1);
+                }
                 self.host.show(ui::tool(self.host.name(), &name, &out));
                 let (_, _, ms) = self.land(flight, &name, &out.arg, out.ok, out.meta.join(" · "));
                 if let Some(lf) = &mut self.langfuse {
@@ -1013,7 +1055,7 @@ impl<H: Host> AgentStateMachine<H> {
     /// forever otherwise. `Host::check_before_idle` off (`kot chat`) means
     /// no unattended cat to answer for, so it's skipped there too.
     fn maybe_nag(&mut self) {
-        if self.queries != 0 || self.records != 0 || !self.host.check_before_idle() {
+        if self.queries != 0 || !self.bg.is_empty() || self.records != 0 || !self.host.check_before_idle() {
             return;
         }
         if self.local_nudges >= MAX_LOCAL_TASK_NUDGES {
@@ -1288,6 +1330,9 @@ impl<H: Host> AgentStateMachine<H> {
             Some(w) => format!("{}\n\n{w}", self.system),
             None => self.system.clone(),
         };
+        let sent = request_hashes(&system_now, &self.history);
+        let prefix_kept = shared_prefix(&self.prev_sent, &sent);
+        let gap_ms = self.last_turn_end.map(|t| t.elapsed().as_millis() as u64);
         let mut attempt = 0;
         let turn = loop {
             let e = match self.llm.converse(&system_now, &self.history, self.tools()).await {
@@ -1341,8 +1386,27 @@ impl<H: Host> AgentStateMachine<H> {
         }));
         if let Some(lf) = &mut self.langfuse {
             let gen_id = format!("gen-{}-{}", self.session, self.turns_fed);
-            lf.generation_create(&gen_id, &self.trace_id, self.llm.label(), turn.ms, &prompt, &turn.text, turn.prompt_tokens, turn.cached_tokens, turn.tokens, turn.total_tokens);
+            let calls: Vec<serde_json::Value> = turn.calls.iter().map(|c| serde_json::json!({"name": c.name, "args": activity::short(&gist(c), 300)})).collect();
+            // Why a turn's cache did or didn't hold, without guessing: how
+            // much of the last request this one repeated byte for byte
+            // (`prefix_kept` of `prev_msgs`, the system prompt counting as
+            // the first), and whether aging or a changed system prompt is
+            // what broke it. Nothing rewritten and a miss anyway is the
+            // provider's.
+            let meta = serde_json::json!({
+                "tool_calls": calls,
+                "reasoning_chars": turn.reasoning.as_ref().map(|r| r.chars().count()),
+                "sent_msgs": sent.len(),
+                "prev_msgs": self.prev_sent.len(),
+                "prefix_kept": prefix_kept,
+                "aged": self.aged_last,
+                "system_changed": self.prev_sent.first().is_some_and(|h| Some(h) != sent.first()),
+                "gap_ms": gap_ms,
+            });
+            lf.generation_create(&gen_id, &self.trace_id, self.llm.label(), turn.ms, &prompt, &turn.text, turn.prompt_tokens, turn.cached_tokens, turn.tokens, turn.total_tokens, meta);
         }
+        self.prev_sent = sent;
+        self.last_turn_end = Some(Instant::now());
         let messages = turn.calls.iter().filter(|c| c.name == "SendMessage").count();
         let cost = TurnCost {
             prompt: turn.prompt_tokens,
@@ -1535,6 +1599,7 @@ impl<H: Host> AgentStateMachine<H> {
         let started = Instant::now();
         let timed = move |out: ToolOut| out.meta(ui::millis(started.elapsed().as_millis() as u64));
         let live = Arc::new(Live::new());
+        let background = c.name == "Bash" && c.args.get("background").and_then(|v| v.as_bool()) == Some(true);
         let d = match local_tool(c, live.clone()) {
             Some(q) => {
                 // Into the lane: the call doesn't start (no child spawned, no
@@ -1545,6 +1610,17 @@ impl<H: Host> AgentStateMachine<H> {
                 // so poll it once now. Cancelling a queued call drops it out of
                 // the queue; whatever is running keeps the lane.
                 use futures_util::FutureExt as _;
+                // `Bash {"background": true}` opts out of the lane: a wait or
+                // poll (`sleep 120`, `while ps | grep …`) that gates no edit
+                // shouldn't hold every file call behind it — 8 of meow's 13
+                // failed Bash calls were exactly those timing out in the lane.
+                if background {
+                    let live = live.clone();
+                    Dispatch::Query(Box::pin(async move {
+                        live.begin();
+                        q.await
+                    }))
+                } else {
                 let mut ticket = Box::pin(self.lane.clone().lock_owned());
                 let got = (&mut ticket).now_or_never();
                 live.queued.store(got.is_none(), std::sync::atomic::Ordering::Relaxed);
@@ -1557,6 +1633,7 @@ impl<H: Host> AgentStateMachine<H> {
                     live.begin();
                     q.await
                 }))
+                }
             }
             None => self.host.dispatch(c),
         };
@@ -1575,7 +1652,13 @@ impl<H: Host> AgentStateMachine<H> {
         self.publish();
         match d {
             Dispatch::Query(q) => {
-                self.queries += 1;
+                // A background call isn't part of any turn's batch: results
+                // don't wait for it, and it lands as its own turn.
+                if background {
+                    self.bg.insert(id);
+                } else {
+                    self.queries += 1;
+                }
                 self.live.insert(id, live.clone());
                 let tx = self.back_tx.clone();
                 let name = c.name.clone();
@@ -1990,12 +2073,50 @@ fn local_tool(c: &Call, live: Arc<Live>) -> Option<Query> {
 fn apply_edit(content: &str, old: &str, new: &str, replace_all: bool) -> Result<String, String> {
     let n = content.matches(old).count();
     if n == 0 {
-        return Err("old_string not found".to_string());
+        return Err(format!("old_string not found{}", near_miss(content, old)));
     }
     if n > 1 && !replace_all {
         return Err(format!("old_string matches {n} times"));
     }
     Ok(if replace_all { content.replace(old, new) } else { content.replacen(old, new, 1) })
+}
+
+/// What to add to "old_string not found": the usual reason (the same text
+/// with different whitespace) or else the file's line most like `old`'s
+/// first, so the retry can copy it instead of re-reading the file. Empty if
+/// nothing is close.
+fn near_miss(content: &str, old: &str) -> String {
+    let squash = |t: &str| t.split_whitespace().collect::<Vec<_>>().join(" ");
+    if !old.trim().is_empty() && squash(content).matches(&squash(old)).count() >= 1 {
+        return " — but it does match if whitespace is ignored: tabs vs spaces, indentation, or a trailing space differ".to_string();
+    }
+    let Some(first) = old.lines().map(str::trim).find(|l| !l.is_empty()) else { return String::new() };
+    // Dice coefficient over character pairs: crude, but a mistyped
+    // identifier in an otherwise right line still scores high.
+    let pairs = |t: &str| -> Vec<(char, char)> {
+        let c: Vec<char> = t.chars().collect();
+        c.windows(2).map(|w| (w[0], w[1])).collect()
+    };
+    let want = pairs(first);
+    if want.is_empty() {
+        return String::new();
+    }
+    let dice = |line: &str| -> f64 {
+        let mut have = pairs(line);
+        let mut shared = 0;
+        for p in &want {
+            if let Some(i) = have.iter().position(|q| q == p) {
+                have.swap_remove(i);
+                shared += 1;
+            }
+        }
+        2.0 * shared as f64 / (want.len() + pairs(line).len()).max(1) as f64
+    };
+    let best = content.lines().enumerate().map(|(i, l)| (dice(l.trim()), i, l)).filter(|(d, ..)| *d >= 0.5).max_by(|a, b| a.0.total_cmp(&b.0).then(b.1.cmp(&a.1)));
+    match best {
+        Some((_, i, l)) => format!(" — closest line is {}: {}", i + 1, l.chars().take(160).collect::<String>()),
+        None => String::new(),
+    }
 }
 
 fn edit_meta(content: &str, old: &str, replace_all: bool) -> String {
@@ -2059,6 +2180,34 @@ fn pct_used(total_tokens: u32, window: Option<u32>) -> Option<u32> {
 const RESTARTED: &str = "(You were restarted. The conversation above is from before it. \
     Anything you started then that was still running is gone, and anything that \
     needed a restart — a reboot, a reinstall — has happened. Check before redoing it.)";
+
+/// Whether [`AgentStateMachine::age`] rewrites now: the oldest row has
+/// waited out [`AGE_BATCH`] on top of [`RESULT_TURNS`], the rows already due
+/// are [`AGE_FORCE_CHARS`] worth, or the provider's cache is cold anyway.
+pub fn should_age(oldest_turns: u64, due_chars: usize, cache_cold: bool) -> bool {
+    if oldest_turns < RESULT_TURNS {
+        return false;
+    }
+    cache_cold || oldest_turns >= RESULT_TURNS + AGE_BATCH || due_chars >= AGE_FORCE_CHARS
+}
+
+fn hash_of(x: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher as _;
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    x.hash(&mut h);
+    h.finish()
+}
+
+/// `[system, message…]` hashes of a request.
+fn request_hashes(system: &str, history: &[(Speaker, String)]) -> Vec<u64> {
+    std::iter::once(hash_of(system)).chain(history.iter().map(|(who, said)| hash_of((format!("{who:?}"), said)))).collect()
+}
+
+/// How many leading entries of the last request this one repeats exactly —
+/// all of `prev` if nothing already sent was rewritten.
+fn shared_prefix(prev: &[u64], now: &[u64]) -> usize {
+    prev.iter().zip(now).take_while(|(a, b)| a == b).count()
+}
 
 /// A row still in the conversation in full, and what its stub needs.
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]

@@ -1450,18 +1450,21 @@ async fn no_history_path_keeps_nothing() {
 
 // ── old results age out (meow, 2026-09-25: ~75k tokens re-sent a turn) ──
 
-/// A long result is in the conversation in full for `RESULT_TURNS` turns,
-/// then only as a one-line stub that says how to get it back.
+/// A long result is in the conversation in full for `RESULT_TURNS` turns
+/// plus one `AGE_BATCH` (aging is batched so it rewrites the sent prefix
+/// once, not every turn), then only as a one-line stub that says how to get
+/// it back.
 #[tokio::test]
 async fn an_old_result_shrinks_to_a_stub() {
-    use kot::agent_state_machine::RESULT_TURNS;
+    use kot::agent_state_machine::{AGE_BATCH, RESULT_TURNS};
+    let due = RESULT_TURNS + AGE_BATCH;
     let mut script = vec![calls(vec![("Bash", json!({"command": "head -c 900 /dev/zero | tr '\\0' Q"}))])];
-    script.extend((0..RESULT_TURNS + 1).map(|_| say("ok")));
+    script.extend((0..due + 1).map(|_| say("ok")));
     let r = rig(script).await;
     r.wake("make a long line");
     r.until("result fed", |f, _| f.requests().len() == 2).await;
     // Turn 2 was fed it; each wake after that is one more turn.
-    for i in 0..RESULT_TURNS {
+    for i in 0..due {
         r.wake(&format!("wake {i}"));
         let n = 3 + i as usize;
         r.until("turn", move |f, _| f.requests().len() == n).await;
@@ -1469,7 +1472,7 @@ async fn an_old_result_shrinks_to_a_stub() {
     let (fake, _) = r.finish().await;
     let payload = "Q".repeat(900);
     let last = fake.requests().len() - 1;
-    assert!(fake.all(last - 1).contains(&payload), "still in full {} turns after it was fed", RESULT_TURNS - 1);
+    assert!(fake.all(last - 1).contains(&payload), "still in full {} turns after it was fed", due - 1);
     let aged = fake.all(last);
     assert!(!aged.contains(&payload), "aged out: {aged}");
     assert!(aged.contains("[#0 Bash] $ head -c 900") && aged.contains("Inspect {\"id\": 0}"), "a stub in its place: {aged}");
@@ -1503,7 +1506,7 @@ async fn a_restart_alone_keeps_the_prefix_a_cache_could_still_hit() {
     // Restart. `turns_fed` (3) is restored from the same file, so the aging
     // clock keeps running rather than resetting.
     let fed_at_turn = 2u64;
-    let age_turn = fed_at_turn + RESULT_TURNS;
+    let age_turn = fed_at_turn + RESULT_TURNS + kot::agent_state_machine::AGE_BATCH;
     let turns_needed = age_turn - 3;
     let r = rig_seen(vec![say("ok"); turns_needed as usize], with_history(&path)).await;
     r.wake("still alive?");
@@ -1877,4 +1880,86 @@ async fn own_calls_survive_a_restart() {
     let (fake, _) = r.finish().await;
     let msgs = fake.requests()[0]["messages"].as_array().unwrap().clone();
     assert!(msgs.iter().any(|m| m["tool_calls"][0]["function"]["arguments"].as_str().is_some_and(|a| a.contains("first-life"))), "{msgs:?}");
+}
+
+// ── cache-friendlier aging, and what the log now says about it ──────────
+
+#[test]
+fn aging_waits_for_a_batch_unless_forced_or_cold() {
+    use kot::agent_state_machine::{should_age, AGE_BATCH, RESULT_TURNS};
+    assert!(!should_age(RESULT_TURNS - 1, 1_000_000, true), "nothing is due yet");
+    assert!(!should_age(RESULT_TURNS, 1_000, false), "due, but not worth a rewrite alone");
+    assert!(should_age(RESULT_TURNS + AGE_BATCH, 1_000, false), "a full batch has waited");
+    assert!(should_age(RESULT_TURNS, 1_000_000, false), "so much due that sending it costs more");
+    assert!(should_age(RESULT_TURNS, 1_000, true), "the provider's cache is cold anyway");
+}
+
+/// A trace says which build and setting it ran under and why it started; a
+/// generation says what it called and how much of the last request it
+/// repeated, so a cache miss can be told from our own rewrite.
+#[tokio::test]
+async fn langfuse_log_carries_version_and_cache_diagnostics() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("t/tama.langfuse.jsonl");
+    let r = rig_seen(
+        vec![calls(vec![("Bash", json!({"command": "echo hi"}))]), say("done")],
+        Seen { langfuse: Some(path.clone()), ..Seen::default() },
+    )
+    .await;
+    r.wake("do a thing");
+    r.until("reply", |_, s| !s.sent.is_empty()).await;
+    r.finish().await;
+    let lines: Vec<Value> = std::fs::read_to_string(&path).unwrap().lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let trace = &lines[0]["body"];
+    assert_eq!(trace["version"], kot::version::VERSION);
+    assert_eq!(trace["metadata"]["started_by"], "start");
+    let (g0, g1) = (&lines[1]["body"]["metadata"], &lines[3]["body"]["metadata"]);
+    assert_eq!(g0["tool_calls"][0]["name"], "Bash");
+    assert_eq!(g0["prefix_kept"], 0, "nothing before the first request");
+    // The second request repeats the whole first one (system + its message).
+    assert_eq!(g1["prefix_kept"], g1["prev_msgs"], "{g1}");
+    assert_eq!(g1["aged"], 0);
+    assert_eq!(g1["system_changed"], false);
+}
+
+/// `background: true` skips the lane: a call made while a slow background
+/// one runs comes back promptly instead of queueing behind it.
+#[tokio::test]
+async fn a_background_bash_does_not_hold_the_lane() {
+    let r = rig(vec![
+        calls(vec![("Bash", json!({"command": "sleep 4", "timeout": 10, "background": true}))]),
+        calls(vec![("Bash", json!({"command": "echo quick-one"}))]),
+        say("ok"),
+        say("ok"),
+    ])
+    .await;
+    r.wake("start the wait");
+    r.until("first turn", |f, _| f.requests().len() == 1).await;
+    let t0 = std::time::Instant::now();
+    r.wake("meanwhile, something quick");
+    r.until("the quick result fed", |f, _| f.requests().len() >= 3).await;
+    assert!(t0.elapsed() < Duration::from_secs(3), "queued behind the sleep: {:?}", t0.elapsed());
+    let (fake, _) = r.finish().await;
+    assert!(fake.fed(2).contains("quick-one"), "{}", fake.fed(2));
+}
+
+#[tokio::test]
+async fn a_failed_edit_says_what_was_close() {
+    let dir = tempfile::tempdir().unwrap();
+    let f = dir.path().join("a.rs");
+    std::fs::write(&f, "fn main() {\n\tlet total = 1;\n    println!(\"{total}\");\n}\n").unwrap();
+    let r = rig(vec![
+        calls(vec![
+            ("Edit", json!({"file_path": f, "old_string": "    let total = 1;", "new_string": "let total = 2;"})),
+            ("Edit", json!({"file_path": f, "old_string": "println!(\"{sum}\");", "new_string": "x"})),
+        ]),
+        say("ok"),
+    ])
+    .await;
+    r.wake("edit it");
+    r.until("results", |f, _| f.requests().len() == 2).await;
+    let (fake, _) = r.finish().await;
+    let fed = fake.fed(1);
+    assert!(fed.contains("whitespace"), "the tab-vs-spaces case is named: {fed}");
+    assert!(fed.contains("closest line is 3"), "and the nearest line otherwise: {fed}");
 }

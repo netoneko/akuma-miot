@@ -114,6 +114,14 @@ EOF) drains every query and record still in flight, then returns.
   handled meanwhile. On timeout the shell is killed (`kill_on_drop`) and the
   model is told it can ask for longer. A child the shell forked may outlive
   it.
+- **Background Bash** (2026-09-29): `Bash {"background": true}` is the one
+  exception to the lane and to aggregation. It runs beside the lane, is not
+  counted in `queries` (so a result-only turn doesn't wait for it, where it
+  would otherwise wait up to `RESULTS_DEADLINE`), and lands as its own turn.
+  `bg` holds its flight ids; it still suppresses the check-in before idling.
+  Aging is batched too (`should_age`): rows stub in one rewrite per
+  `AGE_BATCH` turns, not one per turn, to keep the provider's prefix cache.
+  `docs/TOOLING.md`, "Changes made from those numbers".
 - **One lane** (2026-09-26): every tool that touches this host's
   filesystem — `Bash`, `ReadFile`, `WriteFile`, `Edit`, `MultiEdit`, `LS`,
   `Glob`, `Grep` — runs one at a time, in the order it was called, across

@@ -579,7 +579,9 @@ pub fn local_tools() -> Vec<Tool> {
                 "properties": {
                     "command": {"type": "string"},
                     "timeout": {"type": "integer",
-                                "description": "seconds to let it run before it's killed — default 30, at most 3600; give a build plenty"}
+                                "description": "seconds to let it run before it's killed — default 30, at most 3600; give a build plenty"},
+                    "background": {"type": "boolean",
+                                   "description": "run alongside your other file/shell calls instead of waiting for the one before it — for waits, polls and builds nothing after it depends on"}
                 },
                 "required": ["command"]
             })),

@@ -79,12 +79,15 @@ impl LangfuseLog {
         }
     }
 
+    /// `started_by`: `"start"` for a process starting, or the reason a
+    /// reset gave (`/clear`, compaction, ...).
+    ///
     /// `version` is the build (`crate::version::VERSION`, crate version plus
     /// commit, `-dirty` if uncommitted) — Langfuse's own trace field, so runs
     /// from different builds can be grouped and compared. `reasoning` rides
     /// along in `metadata` for the same reason: it changes latency and
     /// output length as much as a code change does.
-    pub fn trace_create(&mut self, trace_id: &str, name: &str, model: &str, window: Option<u32>, reasoning: Option<&str>) {
+    pub fn trace_create(&mut self, trace_id: &str, name: &str, model: &str, window: Option<u32>, reasoning: Option<&str>, started_by: &str) {
         self.write(
             "trace-create",
             json!({
@@ -92,7 +95,7 @@ impl LangfuseLog {
                 "name": name,
                 "timestamp": now_iso(),
                 "version": crate::version::VERSION,
-                "metadata": {"model": model, "context_window": window, "reasoning": reasoning},
+                "metadata": {"model": model, "context_window": window, "reasoning": reasoning, "started_by": started_by},
             }),
         );
     }
@@ -114,6 +117,7 @@ impl LangfuseLog {
         cached_tokens: u32,
         out_tokens: u32,
         total_tokens: u32,
+        metadata: Value,
     ) {
         let start = now_iso_minus_ms(started_ms_ago);
         let end = now_iso();
@@ -128,6 +132,7 @@ impl LangfuseLog {
                 "endTime": end,
                 "input": input,
                 "output": output,
+                "metadata": metadata,
                 "usageDetails": {
                     "input": prompt_tokens.saturating_sub(cached_tokens),
                     "output": out_tokens,
