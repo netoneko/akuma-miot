@@ -661,7 +661,7 @@ pub async fn run<H: Host>(host: Arc<H>, llm: Llm, persona: String, mut inbox: mp
     if let Some(lf) = &mut langfuse {
         if lf.is_open() {
             host.show(ui::note(&format!("langfuse log: {}", trace_id)));
-            lf.trace_create(&trace_id, &format!("{} session", host.name()), llm.label(), window);
+            lf.trace_create(&trace_id, &format!("{} session", host.name()), llm.label(), window, llm.reasoning());
         } else {
             host.show(ui::note("langfuse log: can't open — not writing one"));
         }
@@ -903,7 +903,7 @@ impl<H: Host> AgentStateMachine<H> {
                 self.session += 1;
                 self.trace_id = format!("trace-{}-{}", self.host.name(), activity::unix_ms());
                 if let Some(lf) = &mut self.langfuse {
-                    lf.trace_create(&self.trace_id, &format!("{} session", self.host.name()), self.llm.label(), self.window);
+                    lf.trace_create(&self.trace_id, &format!("{} session", self.host.name()), self.llm.label(), self.window, self.llm.reasoning());
                 }
                 self.history.clear();
                 self.fresh.clear();

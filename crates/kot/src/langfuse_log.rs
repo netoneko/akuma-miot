@@ -79,14 +79,20 @@ impl LangfuseLog {
         }
     }
 
-    pub fn trace_create(&mut self, trace_id: &str, name: &str, model: &str, window: Option<u32>) {
+    /// `version` is the build (`crate::version::VERSION`, crate version plus
+    /// commit, `-dirty` if uncommitted) — Langfuse's own trace field, so runs
+    /// from different builds can be grouped and compared. `reasoning` rides
+    /// along in `metadata` for the same reason: it changes latency and
+    /// output length as much as a code change does.
+    pub fn trace_create(&mut self, trace_id: &str, name: &str, model: &str, window: Option<u32>, reasoning: Option<&str>) {
         self.write(
             "trace-create",
             json!({
                 "id": trace_id,
                 "name": name,
                 "timestamp": now_iso(),
-                "metadata": {"model": model, "context_window": window},
+                "version": crate::version::VERSION,
+                "metadata": {"model": model, "context_window": window, "reasoning": reasoning},
             }),
         );
     }
