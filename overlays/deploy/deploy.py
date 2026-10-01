@@ -172,9 +172,12 @@ EXTERNAL: dict[str, tuple[str, str]] = {
 }
 
 # The litter leader (who plans), by roster name. Genesis: changing it is a new
-# chain. yuki since 2026-09-23 — the chain started on AWS with yuki and shiro
-# alone, the home agents joining it later (docs/runbooks/deploy-aws-node.md).
-LEADER = "yuki"
+# chain. tama since 2026-10-01 (fresh chain for the console experiment,
+# ../akuma docs/archive/AKUMA_TEAHOUSE_CONSOLE_EXPERIMENT.md): yuki is asleep
+# and the AWS pair had died of memory starvation (no memory discipline for the
+# agents on a 406 MiB box; Kirill, 2026-10-01). Before that yuki, since 2026-09-23 — the chain
+# started on AWS with yuki and shiro alone, the home agents joining it later (docs/runbooks/deploy-aws-node.md).
+LEADER = "tama"
 
 # agent -> (gguf path on its host, port, threads, bind address, slots)
 #
