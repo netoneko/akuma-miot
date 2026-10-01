@@ -98,7 +98,7 @@ class Agent:
     host: str
     arch: str  # x86_64 | aarch64
     persona: str
-    llm: str  # a base URL, "glm", or "asleep" (no model, answers DMs "*… is currently asleep*")
+    llm: str  # a base URL, "glm", "kimi", or "asleep" (no model, answers DMs "*… is currently asleep*")
     model: str
     # MIOT_CONTEXT_WINDOW, for a hosted model the loop can't ask (a
     # llama-server reports its own). Without it a GLM cat never got a budget
@@ -132,9 +132,19 @@ GLM_REASONING = "low"
 GLM_CONTEXT_WINDOW = 1_000_000
 
 
+# The Kimi cats' model, since 2026-10-01 (Kirill: the teahouse console
+# experiment, docs/archive/AKUMA_TEAHOUSE_CONSOLE_EXPERIMENT.md in ../akuma).
+# `kimi-for-coding` is Kimi Code's one alias; what it serves is unmeasured.
+# The window is an ASSUMPTION (256k), not read from the service; compact_early
+# keeps each turn well inside it.
+KIMI_MODEL = "kimi-for-coding"
+KIMI_CONTEXT_WINDOW = 262_144
+KIMI_COMPACT_EARLY = 128_000
+
+
 AGENTS: list[Agent] = [
-    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW, compact_early=256_000, reboot_tool=True, cwd="/src/github.com/netoneko/akuma"),
-    Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "glm", GLM_MODEL, GLM_CONTEXT_WINDOW),
+    Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "kimi", KIMI_MODEL, KIMI_CONTEXT_WINDOW, compact_early=KIMI_COMPACT_EARLY, reboot_tool=True, cwd="/src/github.com/netoneko/akuma"),
+    Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "kimi", KIMI_MODEL, KIMI_CONTEXT_WINDOW, compact_early=KIMI_COMPACT_EARLY),
     Agent("mac-linux-aarch64", "lima", "fc", "aarch64", "kuro", "http://192.168.5.2:11434", "gemma4-yolo-4b"),
     Agent("ryzen-akuma-amd64", "fcguest", "ryzen", "x86_64", "sora", "http://192.168.1.49:8082", "qwen3-4b"),
     Agent("mac-akuma-aarch64", "fcguest", "fc", "aarch64", "mimi", "http://192.168.5.2:8084", "qwen3:4b"),
@@ -184,7 +194,7 @@ PATRONS: dict[str, str] = {
 # patron only keeps up while the node it pulls from lists it, so this
 # covers the replicas it can reach and anything that might be primary but
 # meow/tama. The AWS pair's own list is kotctl's /etc/kot/patrons.
-PATRONS_ON = [a for a in LIVE if AGENTS_BY_NAME[a].llm != "glm"]
+PATRONS_ON = [a for a in LIVE if AGENTS_BY_NAME[a].llm not in ("glm", "kimi")]
 
 
 LLAMAS: dict[str, tuple[str, int, int, str, int]] = {
@@ -405,12 +415,17 @@ def _put_via_http(a: Agent, src: Path, dst: str) -> None:
     on(a, f"chmod +x {dst}.new 2>/dev/null; mv {dst}.new {dst}")
 
 
-def put(a: Agent, src: Path, dst: str) -> None:
-    """Copy local file `src` to `dst` on `a`'s host, atomically (via `dst.new` + rename)."""
+def put(a: Agent, src: Path, dst: str, via_http: bool = False) -> None:
+    """Copy local file `src` to `dst` on `a`'s host, atomically (via `dst.new` + rename).
+    `via_http`: for the `linux` shape, have the host `wget` it from the mac
+    instead of `scp` (measured ~120 KB/s, 2026-09-25) — for a big binary,
+    never a secret."""
     if DRY_RUN:
         say(f"[dry-run] put {a.name}: {src} -> {dst}")
         return
-    if a.shape == "linux":
+    if a.shape == "linux" and via_http:
+        _put_via_http(a, src, dst)
+    elif a.shape == "linux":
         r = _run_retrying(["scp", "-q", str(src), f"{a.host}:{dst}.new"], capture_output=True, text=True, timeout=PUT_TIMEOUT)
         if r.returncode != 0:
             die(f"{a.name}: scp {src} failed: {r.stderr.strip()}")
@@ -433,7 +448,7 @@ def ship_binary(a: Agent) -> None:
     if not DRY_RUN and not (kot_bin.exists() and kot_bin.stat().st_mode & 0o111):
         die(f"no dist/{a.arch}/kot — overlays/local/build.sh {a.arch}")
     on(a, "mkdir -p /root/kot/bin /root/kot/db")
-    put(a, kot_bin, "/root/kot/bin/kot")
+    put(a, kot_bin, "/root/kot/bin/kot", via_http=True)
     on(a, "chmod 755 /root/kot/bin/kot")
     persona = ROOT / "crates/kot/personas" / f"{a.persona}.md"
     put(a, persona, "/root/kot/persona.md")
@@ -592,6 +607,9 @@ def env_for(name: str) -> str:
     ]
     if a.llm == "glm":
         lines += ["MIOT_GLM=true", "MIOT_GLM_TOKEN_FILE=/root/kot/zai.token", f"MIOT_REASONING={GLM_REASONING}"]
+    elif a.llm == "kimi":
+        # Kimi Code; no MIOT_REASONING (the endpoint's field is unverified).
+        lines += ["MIOT_KIMI=true", "MIOT_KIMI_TOKEN_FILE=/root/kot/kimi.token"]
     elif a.llm == "asleep":
         # No model: every DM or @name gets "*<name> is currently asleep*".
         lines.append("MIOT_ASLEEP=true")
@@ -641,6 +659,11 @@ def cmd_up(name: str) -> None:
     if a.llm == "glm":
         put(a, Path.home() / ".akuma/z.ai/token", "/root/kot/zai.token")
         on(a, "chmod 600 /root/kot/zai.token")
+
+    if a.llm == "kimi":
+        # put_secret, not put: for an Akuma shape `put` serves the file over
+        # plain HTTP on the LAN.
+        put_secret(a, (Path.home() / ".akuma/kimi/token").read_text().strip() + "\n", "/root/kot/kimi.token")
 
     if a.shape == "fcguest":
         # Its identity was generated once on the mac (`ids`); move it in,

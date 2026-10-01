@@ -126,6 +126,15 @@ pub const GLM_REASONING: &str = "low";
 /// $1-a-week key.
 pub const OPENROUTER_MAX_TOKENS: u32 = 4096;
 
+/// [`Llm::kimi`]'s model when none is given: Kimi Code's one public alias,
+/// which the service maps to whatever it currently serves. Not measured
+/// here — `kot chat --kimi` is how to see what answers.
+pub const KIMI_MODEL: &str = "kimi-for-coding";
+
+/// [`Llm::kimi`]'s per-turn output cap. A thinking model spends output tokens
+/// on reasoning before the tool call; a tight cap truncates the call itself.
+pub const KIMI_MAX_TOKENS: u32 = 16_384;
+
 impl Llm {
     /// `base_url` is a server root — `http://127.0.0.1:8081` for a
     /// `llama-server`, `http://localhost:11434` for ollama. Both get `/v1/`
@@ -266,6 +275,37 @@ impl Llm {
             context_window: tokio::sync::OnceCell::new(),
             compact_early: None,
             max_tokens: Some(OPENROUTER_MAX_TOKENS),
+            reasoning: None,
+        }
+    }
+
+    /// Kimi Code (`api.kimi.com/coding/v1`), key handed in like
+    /// [`Llm::glm`]'s so a service unit reads it from a token file. The
+    /// endpoint speaks the OpenAI chat-completions dialect, so this is
+    /// genai's OpenAI adapter pointed at it, the way [`Llm::openrouter`] is.
+    /// No `reasoning_effort` is sent: the model thinks on its own and the
+    /// field is not known to be accepted.
+    pub fn kimi(token: &str, model: &str) -> Self {
+        let token = token.trim().to_string();
+        let endpoint = Endpoint::from_static("https://api.kimi.com/coding/v1/");
+        let resolver = ServiceTargetResolver::from_resolver_fn(
+            move |target: ServiceTarget| -> Result<ServiceTarget, genai::resolver::Error> {
+                Ok(ServiceTarget {
+                    endpoint: endpoint.clone(),
+                    auth: AuthData::from_single(token.clone()),
+                    model: ModelIden::new(AdapterKind::OpenAI, target.model.model_name),
+                })
+            },
+        );
+        Llm {
+            client: Client::builder().with_service_target_resolver(resolver).build(),
+            model: model.to_string(),
+            label: format!("{model} @ kimi-code"),
+            base_url: None,
+            http: reqwest::Client::new(),
+            context_window: tokio::sync::OnceCell::new(),
+            compact_early: None,
+            max_tokens: Some(KIMI_MAX_TOKENS),
             reasoning: None,
         }
     }

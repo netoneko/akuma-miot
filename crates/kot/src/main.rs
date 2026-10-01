@@ -240,7 +240,7 @@ struct RunArgs {
     httpapi_origins: Vec<String>,
     /// No agent loop: this cat's node runs, but no model is called, and every
     /// DM or @name tag is answered "*<name> is currently asleep*". Overrides
-    /// --llm/--glm/--openrouter.
+    /// --llm/--glm/--openrouter/--kimi.
     #[arg(long, env = "MIOT_ASLEEP")]
     asleep: bool,
     /// Run as a patron: pull the chain, never campaign or vote, never
@@ -281,19 +281,25 @@ fn with_context(persona: String, spec: &str, name: &str) -> String {
 #[derive(Args)]
 struct LlmArgs {
     /// A llama-server (or any OpenAI-compatible, keyless) base URL.
-    #[arg(long, env = "MIOT_LLM", conflicts_with_all = ["glm", "openrouter"])]
+    #[arg(long, env = "MIOT_LLM", conflicts_with_all = ["glm", "openrouter", "kimi"])]
     llm: Option<String>,
     /// GLM on z.ai, key read from --glm-token-file.
-    #[arg(long, env = "MIOT_GLM", conflicts_with = "openrouter")]
+    #[arg(long, env = "MIOT_GLM", conflicts_with_all = ["openrouter", "kimi"])]
     glm: bool,
     #[arg(long, env = "MIOT_GLM_TOKEN_FILE", default_value = "~/.akuma/z.ai/token")]
     glm_token_file: String,
     /// Any OpenRouter model (--model is required: `moonshotai/kimi-k2`, …),
     /// key read from --openrouter-token-file.
-    #[arg(long, env = "MIOT_OPENROUTER")]
+    #[arg(long, env = "MIOT_OPENROUTER", conflicts_with = "kimi")]
     openrouter: bool,
     #[arg(long, env = "MIOT_OPENROUTER_TOKEN_FILE", default_value = "~/.akuma/openrouter/token")]
     openrouter_token_file: String,
+    /// Kimi Code (`api.kimi.com/coding/v1`), key read from --kimi-token-file.
+    /// Model defaults to `miot_llm::KIMI_MODEL`.
+    #[arg(long, env = "MIOT_KIMI")]
+    kimi: bool,
+    #[arg(long, env = "MIOT_KIMI_TOKEN_FILE", default_value = "~/.akuma/kimi/token")]
+    kimi_token_file: String,
     /// Default: qwen3:4b, or glm-5.3 (z.ai coding plan) with --glm. No
     /// default with --openrouter: an OpenRouter model is a spending choice.
     #[arg(long, env = "MIOT_MODEL")]
@@ -304,7 +310,7 @@ struct LlmArgs {
     #[arg(long, env = "MIOT_REASONING")]
     reasoning: Option<String>,
     /// The model's context window in tokens, for a hosted model that can't
-    /// be asked (`--glm`, `--openrouter`) — what the loop's budget warnings
+    /// be asked (`--glm`, `--openrouter`, `--kimi`) — what the loop's budget warnings
     /// and force-compaction measure against. A llama-server's is read from
     /// it; this overrides that too.
     #[arg(long, env = "MIOT_CONTEXT_WINDOW")]
@@ -343,6 +349,9 @@ fn build_llm_for(a: &LlmArgs) -> Option<miot_llm::Llm> {
     }
     if a.glm {
         return Some(miot_llm::Llm::glm(&read_token("--glm", &a.glm_token_file), model.unwrap_or("glm-5.3")));
+    }
+    if a.kimi {
+        return Some(miot_llm::Llm::kimi(&read_token("--kimi", &a.kimi_token_file), model.unwrap_or(miot_llm::KIMI_MODEL)));
     }
     if a.openrouter {
         let model = model.unwrap_or_else(|| die("--openrouter needs --model (an OpenRouter model id, e.g. qwen/qwen3-coder)"));
