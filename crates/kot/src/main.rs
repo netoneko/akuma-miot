@@ -253,6 +253,11 @@ struct RunArgs {
     /// this is actually set for.
     #[arg(long, env = "MIOT_REBOOT_TOOL")]
     reboot_tool: bool,
+    /// No idle nudge about a cat's open `LocalTask`s (a model call each, up
+    /// to 3 per idle spell). The chain's own task nudges are consensus
+    /// config and are not affected.
+    #[arg(long, env = "MIOT_NO_LOCAL_NAG")]
+    no_local_nag: bool,
 }
 
 #[derive(Args)]
@@ -509,6 +514,7 @@ async fn run(cli: &Cli, a: &RunArgs) {
                 persona,
                 roster: Roster::parse(&cli.roster).unwrap_or_else(|e| die(e)),
                 reboot_tool: a.reboot_tool,
+                no_local_nag: a.no_local_nag,
             };
             tokio::spawn(agent::run(cfg));
         }

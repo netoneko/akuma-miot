@@ -124,6 +124,10 @@ pub struct AgentConfig {
     /// on (`docs/TOOLING.md`; `overlays/deploy/deploy.py`'s `Agent.
     /// reboot_tool`, meow only as of 2026-09-26).
     pub reboot_tool: bool,
+    /// `Host::local_nag` off — no idle nudge about open `LocalTask`s
+    /// (`--no-local-nag`). Each nudge is a model call; added 2026-10-01 while
+    /// the Kimi quota was the scarce thing.
+    pub no_local_nag: bool,
 }
 
 #[derive(Debug, Deserialize, Clone)]
@@ -166,6 +170,8 @@ struct Cat {
     local: std::sync::Mutex<LocalTasks>,
     /// `Host::reboot_tool` — see `AgentConfig::reboot_tool`.
     reboot_tool: bool,
+    /// `Host::local_nag`, inverted — see `AgentConfig::no_local_nag`.
+    no_local_nag: bool,
 }
 
 #[derive(Default, Clone, Copy)]
@@ -909,6 +915,10 @@ impl Host for CatHost {
         self.0.reboot_tool
     }
 
+    fn local_nag(&self) -> bool {
+        !self.0.no_local_nag
+    }
+
     /// Fire-and-forget: the box going down means there's no exit status
     /// worth waiting for. busybox first (what meow already runs by hand on
     /// the akuma box today), a plain `reboot -f` as a fallback on any
@@ -1052,7 +1062,7 @@ impl Host for CatHost {
 }
 
 /// A cat's connection to its own node, before any loop runs on it.
-fn new_cat(name: &str, identity: Identity, node: String, roster: Roster, reboot_tool: bool) -> Arc<Cat> {
+fn new_cat(name: &str, identity: Identity, node: String, roster: Roster, reboot_tool: bool, no_local_nag: bool) -> Arc<Cat> {
     // mTLS pinned to the roster's accounts (`crate::tls`) — same trust
     // boundary as `client.rs`'s `Client`, since a cat's node connection is
     // just another caller of a node, not a special case.
@@ -1074,6 +1084,7 @@ fn new_cat(name: &str, identity: Identity, node: String, roster: Roster, reboot_
         activity: tokio::sync::watch::channel(None).0,
         local: std::sync::Mutex::new(LocalTasks::default()),
         reboot_tool,
+        no_local_nag,
     })
 }
 
@@ -1145,7 +1156,7 @@ pub fn asleep_owes_reply(name: &str, me: &str, effect: &serde_json::Value, wakes
 /// switched off (yuki and shiro, 2026-09-25: their OpenRouter key ran dry)
 /// without leaving the litter wondering why it says nothing.
 pub async fn run_asleep(name: String, identity: Identity, node: String, roster: Roster) {
-    let cat = new_cat(&name, identity, node, roster, false);
+    let cat = new_cat(&name, identity, node, roster, false, false);
     let me = miot_keys::to_hex(&cat.account);
     println!("{}", ui::note(&format!("{name} id={} node={} asleep: no model; DMs and @{name} get \"{}\"", miot_keys::short(&cat.account), cat.node, asleep_reply(&name))));
     let mut cursor = loop {
@@ -1187,7 +1198,7 @@ pub async fn run_asleep(name: String, identity: Identity, node: String, roster: 
 
 pub async fn run(cfg: AgentConfig) {
     let account = cfg.identity.account();
-    let cat = new_cat(&cfg.name, cfg.identity, cfg.node, cfg.roster, cfg.reboot_tool);
+    let cat = new_cat(&cfg.name, cfg.identity, cfg.node, cfg.roster, cfg.reboot_tool, cfg.no_local_nag);
     let name = cat.name.clone();
     let reasoning = cfg.llm.reasoning().map(|e| format!(" reasoning={e}")).unwrap_or_default();
     println!("{}", ui::note(&format!("{name} id={} node={} llm={}{reasoning}", miot_keys::short(&account), cat.node, cfg.llm.label())));
@@ -1383,7 +1394,7 @@ mod tests {
     #[tokio::test]
     async fn send_message_without_a_body_is_refused_not_posted() {
         let root = Identity::from_seed(&[1u8; 32]);
-        let cat = new_cat("meow", root.clone(), "http://127.0.0.1:1".into(), Roster(vec![("root".into(), root.account())]), false);
+        let cat = new_cat("meow", root.clone(), "http://127.0.0.1:1".into(), Roster(vec![("root".into(), root.account())]), false, false);
         for args in [
             json!({"to": "root", "no_ack": true, "tags": ["hda-driver"]}),
             json!({"to": "root", "body": ""}),

@@ -283,6 +283,11 @@ pub trait Host: Send + Sync + 'static {
     fn stall_after(&self) -> Duration {
         STALL_AFTER
     }
+    /// Whether idling with open local tasks nudges the model at all
+    /// ([`Host::local_nag_after`]). Off saves the model call.
+    fn local_nag(&self) -> bool {
+        true
+    }
     /// Idle this long with open local tasks gets the model a nudge. A test
     /// shortens it.
     fn local_nag_after(&self) -> Duration {
@@ -1063,7 +1068,7 @@ impl<H: Host> AgentStateMachine<H> {
     /// forever otherwise. `Host::check_before_idle` off (`kot chat`) means
     /// no unattended cat to answer for, so it's skipped there too.
     fn maybe_nag(&mut self) {
-        if self.queries != 0 || !self.bg.is_empty() || self.records != 0 || !self.host.check_before_idle() {
+        if self.queries != 0 || !self.bg.is_empty() || self.records != 0 || !self.host.check_before_idle() || !self.host.local_nag() {
             return;
         }
         if self.local_nudges >= MAX_LOCAL_TASK_NUDGES {

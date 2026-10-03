@@ -126,9 +126,8 @@ pub const GLM_REASONING: &str = "low";
 /// $1-a-week key.
 pub const OPENROUTER_MAX_TOKENS: u32 = 4096;
 
-/// [`Llm::kimi`]'s model when none is given: Kimi Code's one public alias,
-/// which the service maps to whatever it currently serves. Not measured
-/// here — `kot chat --kimi` is how to see what answers.
+/// [`Llm::kimi`]'s model when none is given. Per Kimi Code's model-ID docs
+/// (read 2026-10-01) `kimi-for-coding` is K2.8 Preview, 1,048,576-token window.
 pub const KIMI_MODEL: &str = "kimi-for-coding";
 
 /// [`Llm::kimi`]'s per-turn output cap. A thinking model spends output tokens
@@ -283,8 +282,11 @@ impl Llm {
     /// [`Llm::glm`]'s so a service unit reads it from a token file. The
     /// endpoint speaks the OpenAI chat-completions dialect, so this is
     /// genai's OpenAI adapter pointed at it, the way [`Llm::openrouter`] is.
-    /// No `reasoning_effort` is sent: the model thinks on its own and the
-    /// field is not known to be accepted.
+    /// No `reasoning_effort` is sent. Kimi's own client (MoonshotAI/kimi-code)
+    /// does not send that field either: it sends `thinking: {type, effort}` in
+    /// the body, with `low`/`high`/`max` valid for `kimi-for-coding` and `max`
+    /// the default (`GET /models`). Effort does not touch the quota, which is
+    /// **100 requests per 5 hours** (`GET /usages`), so it is left alone.
     pub fn kimi(token: &str, model: &str) -> Self {
         let token = token.trim().to_string();
         let endpoint = Endpoint::from_static("https://api.kimi.com/coding/v1/");

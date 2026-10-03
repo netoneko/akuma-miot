@@ -114,6 +114,10 @@ class Agent:
     # (kernel builds) with, per its real transcript, zero `Compact` calls
     # across 87 of its own reboots.
     reboot_tool: bool = False
+    # `Host::local_nag` off (kot --no-local-nag): no idle nudge about open
+    # LocalTasks, a model call each. Off for every cat since 2026-10-01 while
+    # the Kimi quota is scarce; set False per Agent to turn it back on.
+    no_local_nag: bool = True
     # The process's own working directory, so ReadFile/WriteFile/Edit/
     # MultiEdit/LS/Glob/Grep's cwd-default (a bare relative path, or no
     # path at all — `docs/TOOLING.md`, the qwen3:4b LS finding, 2026-09-26)
@@ -134,11 +138,13 @@ GLM_CONTEXT_WINDOW = 1_000_000
 
 # The Kimi cats' model, since 2026-10-01 (Kirill: the teahouse console
 # experiment, docs/archive/AKUMA_TEAHOUSE_CONSOLE_EXPERIMENT.md in ../akuma).
-# `kimi-for-coding` is Kimi Code's one alias; what it serves is unmeasured.
-# The window is an ASSUMPTION (256k), not read from the service; compact_early
-# keeps each turn well inside it.
+# `kimi-for-coding` is K2.8 Preview with a 1,048,576-token window (Kimi Code
+# model-ID docs, read 2026-10-01; the 262,144 first assumed here is the
+# k3-256k / highspeed window). Not read from the service. compact_early keeps
+# each turn far inside it. The quota is NOT tokens: GET /usages says 100
+# requests per 5 h, shared by every cat on the token (2026-10-01).
 KIMI_MODEL = "kimi-for-coding"
-KIMI_CONTEXT_WINDOW = 262_144
+KIMI_CONTEXT_WINDOW = 1_048_576
 KIMI_COMPACT_EARLY = 128_000
 
 
@@ -611,7 +617,8 @@ def env_for(name: str) -> str:
     if a.llm == "glm":
         lines += ["MIOT_GLM=true", "MIOT_GLM_TOKEN_FILE=/root/kot/zai.token", f"MIOT_REASONING={GLM_REASONING}"]
     elif a.llm == "kimi":
-        # Kimi Code; no MIOT_REASONING (the endpoint's field is unverified).
+        # Kimi Code; no MIOT_REASONING — the endpoint's field is `thinking.effort`,
+        # not reasoning_effort, and the quota is requests (100 per 5 h), not tokens.
         lines += ["MIOT_KIMI=true", "MIOT_KIMI_TOKEN_FILE=/root/kot/kimi.token"]
     elif a.llm == "asleep":
         # No model: every DM or @name gets "*<name> is currently asleep*".
@@ -624,6 +631,8 @@ def env_for(name: str) -> str:
         lines.append(f"MIOT_COMPACT_EARLY={a.compact_early}")
     if a.reboot_tool:
         lines.append("MIOT_REBOOT_TOOL=true")
+    if a.no_local_nag:
+        lines.append("MIOT_NO_LOCAL_NAG=true")
     lines += [
         f'MIOT_ROOT_PUBKEY="{mesh["MIOT_ROOT_PUBKEY"]}"',
         f'MIOT_LEADER={mesh["MIOT_LEADER"]}',
