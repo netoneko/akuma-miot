@@ -150,6 +150,10 @@ KIMI_COMPACT_EARLY = 128_000
 
 AGENTS: list[Agent] = [
     Agent("dumpster-akuma-amd64", "akuma", "akuma", "x86_64", "meow", "kimi", KIMI_MODEL, KIMI_CONTEXT_WINDOW, compact_early=KIMI_COMPACT_EARLY, reboot_tool=True, cwd="/src/github.com/netoneko/akuma"),
+    # meow's other half: the SAME identity (persona meow, same seed, same roster key) on the
+    # trashcan's Ubuntu, systemd. The box is dual-boot, so only one of the two runs at a time and
+    # both answer at the same LAN address. Each OS keeps its own db: wipe both on a new genesis.
+    Agent("dumpster-linux-amd64", "linux", "root@trashcan-linux", "x86_64", "meow", "kimi", KIMI_MODEL, KIMI_CONTEXT_WINDOW, compact_early=KIMI_COMPACT_EARLY, reboot_tool=True, cwd="/src/github.com/netoneko/akuma"),
     Agent("ryzen-linux-amd64", "linux", "ryzen", "x86_64", "tama", "kimi", KIMI_MODEL, KIMI_CONTEXT_WINDOW, compact_early=KIMI_COMPACT_EARLY),
     Agent("mac-linux-aarch64", "lima", "fc", "aarch64", "kuro", "http://192.168.5.2:11434", "gemma4-yolo-4b"),
     Agent("ryzen-akuma-amd64", "fcguest", "ryzen", "x86_64", "sora", "http://192.168.1.49:8082", "qwen3-4b"),
@@ -161,7 +165,10 @@ AGENTS_BY_NAME = {a.name: a for a in AGENTS}
 # fresh redeploy, 2026-09-23 — stayed up as a replica for several minutes,
 # agent loop ran real turns. Not root-caused, not proven fixed, just back in
 # rotation on the strength of that run; watch for a recurrence.
-LIVE = ["dumpster-akuma-amd64", "ryzen-linux-amd64", "mac-linux-aarch64", "mac-akuma-aarch64", "ryzen-akuma-amd64"]
+# 2026-10-09: three seats. The ryzen/mac rows stay in AGENTS but are out of LIVE (and the roster)
+# until they are re-admitted; dumpster-linux-amd64 is meow's twin, not a seat of its own, so it is
+# deployed by name and is not in LIVE (`ids` would list meow's key twice).
+LIVE = ["dumpster-akuma-amd64"]
 
 # Members this script never ships to: deployed by something else, but in the
 # genesis roster and every live agent's peer list all the same. The AWS kot
@@ -183,7 +190,7 @@ EXTERNAL: dict[str, tuple[str, str]] = {
 # and the AWS pair had died of memory starvation (no memory discipline for the
 # agents on a 406 MiB box; Kirill, 2026-10-01). Before that yuki, since 2026-09-23 — the chain
 # started on AWS with yuki and shiro alone, the home agents joining it later (docs/runbooks/deploy-aws-node.md).
-LEADER = "tama"
+LEADER = "yuki"  # since 2026-10-09 (3-seat fresh chain; tama is out of the roster)
 
 # agent -> (gguf path on its host, port, threads, bind address, slots)
 #
@@ -240,7 +247,7 @@ def route(frm: str, to: str) -> str:
     }
     if (frm, to) in special:
         return special[(frm, to)]
-    if to == "dumpster-akuma-amd64":
+    if to in ("dumpster-akuma-amd64", "dumpster-linux-amd64"):
         # .123 until 2026-09-24, when DHCP moved the box to .120 (ARP:
         # vaporwave.lan). No reservation yet, so check `arp -a` if it moves again.
         return "https://192.168.1.120:9944"
@@ -598,7 +605,8 @@ def _read_mesh_env() -> dict[str, str]:
 def env_for(name: str) -> str:
     """The agent's env file: genesis + its own row + peers from its vantage."""
     a = agent(name)
-    peers = ",".join([route(name, p) for p in LIVE if p != name] + [url for _, url in EXTERNAL.values()])
+    # Not a peer of itself: meow's two launchers share one persona (and one URL).
+    peers = ",".join([route(name, p) for p in LIVE if AGENTS_BY_NAME[p].persona != a.persona] + [url for _, url in EXTERNAL.values()])
     mesh = _read_mesh_env()
 
     lines = [
@@ -676,6 +684,17 @@ def cmd_up(name: str) -> None:
         # put_secret, not put: for an Akuma shape `put` serves the file over
         # plain HTTP on the LAN.
         put_secret(a, (Path.home() / ".akuma/kimi/token").read_text().strip() + "\n", "/root/kot/kimi.token")
+
+    if a.shape in ("akuma", "linux"):
+        # An identity kept on the mac (`~/.akuma/kot/<persona>.seed`, e.g. meow's, shared by
+        # both of the trashcan's OSes): move it in once, never over one already there.
+        seed = Path.home() / ".akuma/kot" / f"{a.persona}.seed"
+        if seed.exists():
+            has_seed = True
+            if not DRY_RUN:
+                has_seed = on(a, "test -s /root/kot/id_ed25519.seed && echo yes || echo no").strip() == "yes"
+            if not has_seed:
+                put_secret(a, seed.read_text(), "/root/kot/id_ed25519.seed")
 
     if a.shape == "fcguest":
         # Its identity was generated once on the mac (`ids`); move it in,
